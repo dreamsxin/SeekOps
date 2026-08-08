@@ -199,11 +199,11 @@ func writeUsageCSV(w http.ResponseWriter, events []RequestStats) error {
 	w.Header().Set("Content-Disposition", `attachment; filename="seekops-usage.csv"`)
 	_, _ = w.Write([]byte{0xEF, 0xBB, 0xBF})
 	writer := csv.NewWriter(w)
-	if err := writer.Write([]string{"created_at", "request_id", "tenant_id", "virtual_key_id", "account_id", "model", "path", "status", "duration_ms", "first_byte_ms", "prompt_tokens", "cache_hit_tokens", "cache_miss_tokens", "completion_tokens", "reasoning_tokens", "total_tokens", "usage_status", "estimated_cost_cny"}); err != nil {
+	if err := writer.Write([]string{"created_at", "request_id", "tenant_id", "virtual_key_id", "account_id", "attempts", "model", "path", "status", "duration_ms", "first_byte_ms", "prompt_tokens", "cache_hit_tokens", "cache_miss_tokens", "completion_tokens", "reasoning_tokens", "total_tokens", "usage_status", "estimated_cost_cny"}); err != nil {
 		return err
 	}
 	for _, event := range events {
-		values := []string{event.CreatedAt.UTC().Format(time.RFC3339), csvText(event.RequestID), csvText(event.TenantID), csvText(event.VirtualKeyID), csvText(event.AccountID), csvText(event.Model), csvText(event.Path), strconv.Itoa(event.Status), strconv.FormatInt(event.DurationMS, 10), strconv.FormatInt(event.FirstByteMS, 10), strconv.FormatInt(event.Usage.PromptTokens, 10), strconv.FormatInt(event.Usage.CacheHitTokens, 10), strconv.FormatInt(event.Usage.CacheMissTokens, 10), strconv.FormatInt(event.Usage.CompletionTokens, 10), strconv.FormatInt(event.Usage.ReasoningTokens, 10), strconv.FormatInt(event.Usage.TotalTokens, 10), csvText(event.UsageStatus), strconv.FormatFloat(event.EstimatedCostCNY, 'f', 8, 64)}
+		values := []string{event.CreatedAt.UTC().Format(time.RFC3339), csvText(event.RequestID), csvText(event.TenantID), csvText(event.VirtualKeyID), csvText(event.AccountID), strconv.Itoa(event.Attempts), csvText(event.Model), csvText(event.Path), strconv.Itoa(event.Status), strconv.FormatInt(event.DurationMS, 10), strconv.FormatInt(event.FirstByteMS, 10), strconv.FormatInt(event.Usage.PromptTokens, 10), strconv.FormatInt(event.Usage.CacheHitTokens, 10), strconv.FormatInt(event.Usage.CacheMissTokens, 10), strconv.FormatInt(event.Usage.CompletionTokens, 10), strconv.FormatInt(event.Usage.ReasoningTokens, 10), strconv.FormatInt(event.Usage.TotalTokens, 10), csvText(event.UsageStatus), strconv.FormatFloat(event.EstimatedCostCNY, 'f', 8, 64)}
 		if err := writer.Write(values); err != nil {
 			return err
 		}

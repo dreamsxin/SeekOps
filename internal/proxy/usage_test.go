@@ -18,7 +18,7 @@ func TestUsageSummaryFilteringAndCSVExport(t *testing.T) {
 	server := NewServer(Config{PlatformAPIKey: "platform", AdminAPIKey: "admin", DB: db})
 	events := []RequestStats{
 		{RequestID: "req-a", TenantID: "tenant-a", VirtualKeyID: "vk-a", AccountID: "acct-a", Model: "deepseek-chat", Path: "/chat/completions", Status: 200, DurationMS: 120, FirstByteMS: 30, Usage: Usage{PromptTokens: 10, CacheHitTokens: 4, CacheMissTokens: 6, CompletionTokens: 5, TotalTokens: 15, UsagePresent: true}, UsageStatus: "complete", EstimatedCostCNY: 0.01, CreatedAt: time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)},
-		{RequestID: "req-b", TenantID: "tenant-b", VirtualKeyID: "vk-b", AccountID: "acct-a", Model: "=spreadsheet", Path: "/responses", Status: 503, DurationMS: 250, FirstByteMS: 250, Usage: Usage{PromptTokens: 20, CompletionTokens: 0, TotalTokens: 20, UsagePresent: true}, UsageStatus: "complete", EstimatedCostCNY: 0.02, CreatedAt: time.Date(2026, 8, 1, 18, 0, 0, 0, time.UTC)},
+		{RequestID: "req-b", TenantID: "tenant-b", VirtualKeyID: "vk-b", AccountID: "acct-a", Attempts: 2, Model: "=spreadsheet", Path: "/responses", Status: 503, DurationMS: 250, FirstByteMS: 250, Usage: Usage{PromptTokens: 20, CompletionTokens: 0, TotalTokens: 20, UsagePresent: true}, UsageStatus: "complete", EstimatedCostCNY: 0.02, CreatedAt: time.Date(2026, 8, 1, 18, 0, 0, 0, time.UTC)},
 		{RequestID: "req-c", TenantID: "tenant-a", VirtualKeyID: "vk-a", AccountID: "acct-b", Model: "deepseek-chat", Path: "/chat/completions", Status: 200, Usage: Usage{PromptTokens: 30, CompletionTokens: 10, TotalTokens: 40, UsagePresent: true}, UsageStatus: "complete", EstimatedCostCNY: 0.03, CreatedAt: time.Date(2026, 8, 2, 8, 0, 0, 0, time.UTC)},
 	}
 	for _, event := range events {
@@ -54,7 +54,7 @@ func TestUsageSummaryFilteringAndCSVExport(t *testing.T) {
 	listRecorder := httptest.NewRecorder()
 	server.ServeHTTP(listRecorder, listRequest)
 	var listed []RequestStats
-	if listRecorder.Code != http.StatusOK || json.Unmarshal(listRecorder.Body.Bytes(), &listed) != nil || len(listed) != 1 || listed[0].RequestID != "req-c" {
+	if listRecorder.Code != http.StatusOK || json.Unmarshal(listRecorder.Body.Bytes(), &listed) != nil || len(listed) != 1 || listed[0].RequestID != "req-c" || listed[0].Attempts != 1 {
 		t.Fatalf("list status=%d body=%s", listRecorder.Code, listRecorder.Body.String())
 	}
 

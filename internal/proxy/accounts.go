@@ -1,9 +1,12 @@
 package proxy
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -27,6 +30,19 @@ type AccountView struct {
 	Balances         []BalanceInfo `json:"balances"`
 	BalanceUpdatedAt time.Time     `json:"balance_updated_at,omitempty"`
 	BalanceError     string        `json:"balance_error,omitempty"`
+}
+
+type AccountTestResult struct {
+	AccountID string    `json:"account_id"`
+	Mode      string    `json:"mode"`
+	OK        bool      `json:"ok"`
+	Status    int       `json:"status"`
+	LatencyMS int64     `json:"latency_ms"`
+	Models    []string  `json:"models,omitempty"`
+	Model     string    `json:"model,omitempty"`
+	Output    string    `json:"output,omitempty"`
+	Error     string    `json:"error,omitempty"`
+	TestedAt  time.Time `json:"tested_at"`
 }
 
 type accountInput struct {
@@ -290,6 +306,20 @@ func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 		s.checkAccount(w, r, id)
 		return
 	}
+	if strings.HasSuffix(id, "/test") {
+		id = strings.TrimSuffix(id, "/test")
+		if id == "" || strings.Contains(id, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		s.testAccountAPI(w, r, id)
+		return
+	}
 	if id == "" || strings.Contains(id, "/") {
 		http.NotFound(w, r)
 		return
@@ -384,13 +414,7 @@ func (s *Server) updateManagedAccount(w http.ResponseWriter, r *http.Request, id
 }
 
 func (s *Server) checkAccount(w http.ResponseWriter, r *http.Request, id string) {
-	var account *Account
-	for _, current := range s.accountsSnapshot() {
-		if current.ID == id {
-			account = current
-			break
-		}
-	}
+	account := s.findAccount(id)
 	if account == nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found"})
 		return
@@ -401,6 +425,172 @@ func (s *Server) checkAccount(w http.ResponseWriter, r *http.Request, id string)
 	}
 	s.pollAccountBalance(r.Context(), account)
 	writeJSON(w, http.StatusOK, accountView(account))
+}
+
+func (s *Server) findAccount(id string) *Account {
+	for _, account := range s.accountsSnapshot() {
+		if account != nil && account.ID == id {
+			return account
+		}
+	}
+	return nil
+}
+
+func (s *Server) testAccountAPI(w http.ResponseWriter, r *http.Request, id string) {
+	account := s.findAccount(id)
+	if account == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found"})
+		return
+	}
+	if account.Disabled {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "account is disabled"})
+		return
+	}
+	var input struct {
+		Mode  string `json:"mode"`
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&input); err != nil && err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid test payload"})
+		return
+	}
+	input.Mode = strings.TrimSpace(input.Mode)
+	if input.Mode == "" {
+		input.Mode = "models"
+	}
+	if input.Mode != "models" && input.Mode != "chat" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "mode must be models or chat"})
+		return
+	}
+	input.Model = strings.TrimSpace(input.Model)
+	if input.Mode == "chat" && input.Model == "" {
+		if len(account.Models) > 0 {
+			input.Model = account.Models[0]
+		} else {
+			input.Model = "deepseek-chat"
+		}
+	}
+
+	method, path := http.MethodGet, "/models"
+	var payload []byte
+	if input.Mode == "chat" {
+		method, path = http.MethodPost, "/chat/completions"
+		payload, _ = json.Marshal(map[string]any{
+			"model":       input.Model,
+			"messages":    []map[string]string{{"role": "user", "content": "Reply with exactly OK."}},
+			"max_tokens":  8,
+			"stream":      false,
+			"temperature": 0,
+		})
+	}
+	target, err := url.Parse(account.BaseURL)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "account base_url is invalid"})
+		return
+	}
+	target.Path = joinPath(target.Path, path)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, method, target.String(), bytes.NewReader(payload))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "create upstream test request failed"})
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+account.APIKey)
+	req.Header.Set("X-Proxy-Request-ID", "test-"+newID())
+	if len(payload) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	started := time.Now()
+	resp, requestErr := (&http.Client{Transport: s.transport}).Do(req)
+	result := AccountTestResult{AccountID: account.ID, Mode: input.Mode, Model: input.Model, LatencyMS: time.Since(started).Milliseconds(), TestedAt: time.Now()}
+	if requestErr != nil {
+		account.markTransportFailure()
+		result.Error = "upstream request failed: " + requestErr.Error()
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	defer resp.Body.Close()
+	result.Status = resp.StatusCode
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if readErr != nil {
+		account.markTransportFailure()
+		result.Error = "read upstream response failed"
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	account.markStatus(resp.StatusCode)
+	if len(body) > 1<<20 {
+		result.Error = "upstream response exceeds 1 MiB"
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		result.Error = upstreamErrorMessage(body, resp.StatusCode)
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	if input.Mode == "models" {
+		var response struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil {
+			result.Error = "upstream returned invalid models JSON"
+			writeJSON(w, http.StatusOK, result)
+			return
+		}
+		result.Models = make([]string, 0, len(response.Data))
+		for _, model := range response.Data {
+			if model.ID != "" {
+				result.Models = append(result.Models, model.ID)
+			}
+		}
+	} else {
+		var response struct {
+			Model   string `json:"model"`
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil {
+			result.Error = "upstream returned invalid chat JSON"
+			writeJSON(w, http.StatusOK, result)
+			return
+		}
+		if response.Model != "" {
+			result.Model = response.Model
+		}
+		if len(response.Choices) > 0 {
+			result.Output = truncateText(response.Choices[0].Message.Content, 200)
+		}
+	}
+	result.OK = true
+	writeJSON(w, http.StatusOK, result)
+}
+
+func upstreamErrorMessage(body []byte, status int) string {
+	var response struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &response) == nil && response.Error.Message != "" {
+		return truncateText(response.Error.Message, 300)
+	}
+	return fmt.Sprintf("upstream returned HTTP %d", status)
+}
+
+func truncateText(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + "..."
 }
 
 func (s *Server) removeManagedAccount(w http.ResponseWriter, _ *http.Request, id string) {

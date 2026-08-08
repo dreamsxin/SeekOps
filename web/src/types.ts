@@ -13,6 +13,7 @@ export interface RequestEvent {
   tenant_id: string;
   virtual_key_id: string;
   account_id: string;
+  attempts: number;
   model?: string;
   path: string;
   status: number;
@@ -120,6 +121,24 @@ export interface AccountInput {
   weight: number;
   models: string[];
   enabled: boolean;
+}
+
+export interface AccountTestInput {
+  mode: "models" | "chat";
+  model?: string;
+}
+
+export interface AccountTestResult {
+  account_id: string;
+  mode: "models" | "chat";
+  ok: boolean;
+  status: number;
+  latency_ms: number;
+  models?: string[];
+  model?: string;
+  output?: string;
+  error?: string;
+  tested_at: string;
 }
 
 export interface ClientConfig {

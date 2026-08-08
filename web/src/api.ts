@@ -1,4 +1,4 @@
-import type { Account, AccountInput, AdminSetupStatus, BalanceSnapshot, ClientConfig, RequestEvent, SecurityStatus, Stats, UsageSummary, VirtualKey, VirtualKeyInput } from "./types";
+import type { Account, AccountInput, AccountTestInput, AccountTestResult, AdminSetupStatus, BalanceSnapshot, ClientConfig, RequestEvent, SecurityStatus, Stats, UsageSummary, VirtualKey, VirtualKeyInput } from "./types";
 
 const keyName = "seekops.adminKey";
 
@@ -37,6 +37,7 @@ export const api = {
   createAccount: (body: AccountInput) => request<Account>("/admin/accounts", { method: "POST", body: JSON.stringify(body) }),
   updateAccount: (id: string, body: AccountInput) => request<Account>(`/admin/accounts/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(body) }),
   checkAccount: (id: string) => request<Account>(`/admin/accounts/${encodeURIComponent(id)}/check`, { method: "POST" }),
+  testAccount: (id: string, body: AccountTestInput) => request<AccountTestResult>(`/admin/accounts/${encodeURIComponent(id)}/test`, { method: "POST", body: JSON.stringify(body) }),
   deleteAccount: (id: string) => request<{ id: string; deleted: boolean }>(`/admin/accounts/${encodeURIComponent(id)}`, { method: "DELETE" }),
   keys: () => request<VirtualKey[]>("/admin/virtual-keys"),
   usage: (query = "") => request<RequestEvent[]>(`/admin/usage${query ? `?${query}` : ""}`),

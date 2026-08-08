@@ -102,7 +102,13 @@ func (a *Account) markStatus(status int) {
 		a.blocked.Store(time.Now().Add(3 * time.Second).Unix())
 	default:
 		a.fails.Store(0)
+		a.blocked.Store(0)
 	}
+}
+
+func (a *Account) markTransportFailure() {
+	a.fails.Add(1)
+	a.blocked.Store(time.Now().Add(3 * time.Second).Unix())
 }
 
 type Usage struct {
@@ -120,6 +126,7 @@ type RequestStats struct {
 	TenantID         string    `json:"tenant_id"`
 	VirtualKeyID     string    `json:"virtual_key_id"`
 	AccountID        string    `json:"account_id"`
+	Attempts         int       `json:"attempts"`
 	Model            string    `json:"model,omitempty"`
 	Path             string    `json:"path"`
 	Status           int       `json:"status"`
@@ -508,6 +515,9 @@ func NewRecorderWithDB(db *sql.DB) *Recorder {
 	return recorder
 }
 func (r *Recorder) Record(event RequestStats) {
+	if event.Attempts <= 0 {
+		event.Attempts = 1
+	}
 	r.mu.Lock()
 	r.stats.Requests++
 	if event.Status >= 200 && event.Status < 400 {
@@ -579,6 +589,7 @@ type requestMeta struct {
 	requestID string
 	principal *Principal
 	account   *Account
+	model     string
 	keys      *KeyStore
 	path      string
 	started   time.Time
@@ -588,8 +599,85 @@ type requestMeta struct {
 	priceOut  float64
 	firstByte atomic.Int64
 	status    atomic.Int64
+	attempts  atomic.Int64
 	usage     usageCollector
 	recorded  atomic.Bool
+}
+
+type failoverTransport struct {
+	server *Server
+	base   http.RoundTripper
+}
+
+func (t *failoverTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	meta, _ := r.Context().Value(requestMetaKey).(*requestMeta)
+	if meta == nil || meta.account == nil {
+		return t.base.RoundTrip(r)
+	}
+	resp, err := t.base.RoundTrip(r)
+	if !retryableUpstreamResult(resp, err) || !requestCanRetry(r) {
+		return resp, err
+	}
+	next := t.server.selectAccount(meta.model, meta.account.ID)
+	if next == nil {
+		return resp, err
+	}
+	retry, cloneErr := cloneRequestForRetry(r)
+	if cloneErr != nil {
+		return resp, err
+	}
+	previous := meta.account
+	if resp != nil {
+		previous.markStatus(resp.StatusCode)
+		_ = resp.Body.Close()
+	} else {
+		previous.markTransportFailure()
+	}
+	previous.active.Add(-1)
+	next.active.Add(1)
+	meta.account = next
+	meta.attempts.Add(1)
+	t.server.retargetRequest(retry, next, meta.path, meta.requestID)
+	return t.base.RoundTrip(retry)
+}
+
+func retryableUpstreamResult(resp *http.Response, err error) bool {
+	if err != nil {
+		return true
+	}
+	if resp == nil {
+		return false
+	}
+	switch resp.StatusCode {
+	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func requestCanRetry(r *http.Request) bool {
+	return r.Body == nil || r.Body == http.NoBody || r.GetBody != nil
+}
+
+func cloneRequestForRetry(r *http.Request) (*http.Request, error) {
+	retry := r.Clone(r.Context())
+	retry.Header = r.Header.Clone()
+	if r.URL != nil {
+		clonedURL := *r.URL
+		retry.URL = &clonedURL
+	}
+	if r.GetBody != nil {
+		body, err := r.GetBody()
+		if err != nil {
+			return nil, err
+		}
+		retry.Body = body
+	} else {
+		retry.Body = http.NoBody
+		retry.ContentLength = 0
+	}
+	return retry, nil
 }
 
 type usageCollector struct {
@@ -846,7 +934,7 @@ func NewServerChecked(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("load admin key: %w", err)
 	}
 	s := &Server{config: cfg, keys: keys, recorder: recorder, transport: http.DefaultTransport, adminKey: adminKey, accounts: accounts}
-	s.proxy = &httputil.ReverseProxy{Director: s.director, Transport: s.transport, ModifyResponse: s.modifyResponse, ErrorHandler: s.errorHandler, FlushInterval: -1}
+	s.proxy = &httputil.ReverseProxy{Director: s.director, Transport: &failoverTransport{server: s, base: s.transport}, ModifyResponse: s.modifyResponse, ErrorHandler: s.errorHandler, FlushInterval: -1}
 	s.server = &http.Server{Addr: cfg.ListenAddr, Handler: s, ReadHeaderTimeout: 10 * time.Second}
 	return s, nil
 }
@@ -898,15 +986,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProxyError(w, r, status, "invalid_request_error", err.Error(), nil)
 		return
 	}
-	account := s.selectAccount(r, model)
+	account := s.selectAccount(model, "")
 	if account == nil {
 		writeProxyError(w, r, http.StatusServiceUnavailable, "proxy_error", "no healthy upstream account available", nil)
 		return
 	}
-	account.active.Add(1)
-	defer account.active.Add(-1)
 	requestID := newID()
-	meta := &requestMeta{requestID: requestID, principal: principal, account: account, keys: s.keys, path: r.URL.Path, started: time.Now(), recorder: s.recorder, priceHit: s.config.PriceInputHit, priceMiss: s.config.PriceInputMiss, priceOut: s.config.PriceOutput}
+	meta := &requestMeta{requestID: requestID, principal: principal, account: account, model: model, keys: s.keys, path: r.URL.Path, started: time.Now(), recorder: s.recorder, priceHit: s.config.PriceInputHit, priceMiss: s.config.PriceInputMiss, priceOut: s.config.PriceOutput}
+	meta.attempts.Store(1)
+	account.active.Add(1)
+	defer func() { meta.account.active.Add(-1) }()
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
 	defer cancel()
 	ctx = context.WithValue(ctx, requestMetaKey, meta)
@@ -983,7 +1072,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) (*Principal, 
 	}
 	return principal, true
 }
-func (s *Server) selectAccount(r *http.Request, model string) *Account {
+func (s *Server) selectAccount(model, excludedID string) *Account {
 	now := time.Now()
 	accounts := s.accountsSnapshot()
 	var selected *Account
@@ -991,7 +1080,7 @@ func (s *Server) selectAccount(r *http.Request, model string) *Account {
 	start := int(s.sequence.Add(1) % uint64(max(1, len(accounts))))
 	for offset := 0; offset < len(accounts); offset++ {
 		a := accounts[(start+offset)%len(accounts)]
-		if a == nil || a.Disabled || a.APIKey == "" || !a.Healthy(now) || !a.SupportsModel(model) {
+		if a == nil || a.ID == excludedID || a.Disabled || a.APIKey == "" || !a.Healthy(now) || !a.SupportsModel(model) {
 			continue
 		}
 		weight := a.Weight
@@ -1026,8 +1115,6 @@ func (s *Server) prepareRequest(r *http.Request) (string, int, error) {
 		return "", http.StatusRequestEntityTooLarge, fmt.Errorf("request body exceeds the 32 MiB MVP limit")
 	}
 	r.Body.Close()
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return "", http.StatusBadRequest, fmt.Errorf("invalid JSON request body: %w", err)
@@ -1048,22 +1135,34 @@ func (s *Server) prepareRequest(r *http.Request) (string, int, error) {
 			if err != nil {
 				return model, http.StatusBadRequest, fmt.Errorf("encode streaming request: %w", err)
 			}
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			r.ContentLength = int64(len(body))
 		}
 	}
+	setReplayableBody(r, body)
 	return model, 0, nil
 }
+
+func setReplayableBody(r *http.Request, body []byte) {
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+}
+
 func (s *Server) director(r *http.Request) {
 	meta, _ := r.Context().Value(requestMetaKey).(*requestMeta)
 	if meta == nil || meta.account == nil {
 		return
 	}
-	target, err := url.Parse(meta.account.BaseURL)
+	s.retargetRequest(r, meta.account, meta.path, meta.requestID)
+}
+
+func (s *Server) retargetRequest(r *http.Request, account *Account, originalPath, requestID string) {
+	target, err := url.Parse(account.BaseURL)
 	if err != nil {
 		return
 	}
-	path := r.URL.Path
+	path := originalPath
 	if strings.HasPrefix(path, "/v1/") {
 		path = strings.TrimPrefix(path, "/v1")
 	}
@@ -1074,17 +1173,17 @@ func (s *Server) director(r *http.Request) {
 	r.URL.Path = joinPath(target.Path, path)
 	r.URL.RawPath = ""
 	r.Host = target.Host
-	if isAnthropicPath(meta.path) {
+	if isAnthropicPath(originalPath) {
 		r.Header.Del("Authorization")
-		r.Header.Set("X-Api-Key", meta.account.APIKey)
+		r.Header.Set("X-Api-Key", account.APIKey)
 	} else {
-		r.Header.Set("Authorization", "Bearer "+meta.account.APIKey)
+		r.Header.Set("Authorization", "Bearer "+account.APIKey)
 		r.Header.Del("X-Api-Key")
 	}
 	r.Header.Del("X-Proxy-API-Key")
 	r.Header.Del("X-Admin-Key")
 	r.Header.Del("X-Proxy-Model")
-	r.Header.Set("X-Proxy-Request-ID", meta.requestID)
+	r.Header.Set("X-Proxy-Request-ID", requestID)
 }
 func joinPath(base, path string) string {
 	return strings.TrimRight(base, "/") + "/" + strings.TrimLeft(path, "/")
@@ -1102,12 +1201,15 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	meta.account.markStatus(resp.StatusCode)
 	resp.Body = &trackingBody{body: resp.Body, meta: meta}
 	resp.Header.Set("X-Proxy-Request-ID", meta.requestID)
+	resp.Header.Set("X-Proxy-Attempts", strconv.FormatInt(meta.attempts.Load(), 10))
 	return nil
 }
 func (s *Server) errorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	meta, _ := r.Context().Value(requestMetaKey).(*requestMeta)
-	if meta != nil {
+	if meta != nil && meta.account != nil {
+		meta.account.markTransportFailure()
 		meta.status.Store(502)
+		w.Header().Set("X-Proxy-Attempts", strconv.FormatInt(meta.attempts.Load(), 10))
 		recordMeta(meta)
 	}
 	log.Printf("proxy request failed: %v", err)
@@ -1130,6 +1232,9 @@ func recordMeta(meta *requestMeta) {
 		return
 	}
 	usage, model := meta.usage.snapshot()
+	if model == "" {
+		model = meta.model
+	}
 	status := int(meta.status.Load())
 	if status == 0 {
 		status = 502
@@ -1148,7 +1253,7 @@ func recordMeta(meta *requestMeta) {
 		tenantID = meta.principal.TenantID
 		virtualKeyID = meta.principal.ID
 	}
-	meta.recorder.Record(RequestStats{RequestID: meta.requestID, TenantID: tenantID, VirtualKeyID: virtualKeyID, AccountID: meta.account.ID, Model: model, Path: meta.path, Status: status, DurationMS: time.Since(meta.started).Milliseconds(), FirstByteMS: first, Usage: usage, UsageStatus: usageStatus, EstimatedCostCNY: cost, CreatedAt: meta.started})
+	meta.recorder.Record(RequestStats{RequestID: meta.requestID, TenantID: tenantID, VirtualKeyID: virtualKeyID, AccountID: meta.account.ID, Attempts: int(meta.attempts.Load()), Model: model, Path: meta.path, Status: status, DurationMS: time.Since(meta.started).Milliseconds(), FirstByteMS: first, Usage: usage, UsageStatus: usageStatus, EstimatedCostCNY: cost, CreatedAt: meta.started})
 	if meta.keys != nil && meta.principal != nil {
 		meta.keys.RecordUsage(meta.principal.ID, usage.TotalTokens, cost, time.Now())
 	}
@@ -1357,6 +1462,7 @@ func (s *Server) pollAccountBalance(ctx context.Context, account *Account) {
 		account.setBalance(false, nil, fmt.Errorf("decode balance response: %w", err))
 		return
 	}
+	account.markStatus(resp.StatusCode)
 	account.setBalance(payload.IsAvailable, payload.BalanceInfos, nil)
 	if s.config.DB != nil {
 		if err := persistBalance(s.config.DB, account.ID, payload.IsAvailable, payload.BalanceInfos, time.Now()); err != nil {

@@ -88,6 +88,7 @@ func migrateSQLite(db *sql.DB) error {
 			tenant_id TEXT NOT NULL,
 			virtual_key_id TEXT NOT NULL,
 			account_id TEXT NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 1,
 			model TEXT NOT NULL DEFAULT '',
 			path TEXT NOT NULL,
 			status INTEGER NOT NULL,
@@ -126,6 +127,9 @@ func migrateSQLite(db *sql.DB) error {
 	if err := ensureVirtualKeySecretColumn(db); err != nil {
 		return fmt.Errorf("migrate sqlite virtual key secret: %w", err)
 	}
+	if err := ensureUsageAttemptsColumn(db); err != nil {
+		return fmt.Errorf("migrate sqlite usage attempts: %w", err)
+	}
 	return nil
 }
 
@@ -150,6 +154,30 @@ func ensureVirtualKeySecretColumn(db *sql.DB) error {
 		return err
 	}
 	_, err = db.Exec(`ALTER TABLE virtual_keys ADD COLUMN secret TEXT NOT NULL DEFAULT ''`)
+	return err
+}
+
+func ensureUsageAttemptsColumn(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(usage_events)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == "attempts" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec(`ALTER TABLE usage_events ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1`)
 	return err
 }
 
@@ -212,12 +240,16 @@ func boolInt(value bool) int {
 }
 
 func persistRequest(db *sql.DB, event RequestStats) error {
+	attempts := event.Attempts
+	if attempts <= 0 {
+		attempts = 1
+	}
 	_, err := db.Exec(`INSERT OR IGNORE INTO usage_events
-		(request_id, tenant_id, virtual_key_id, account_id, model, path, status, duration_ms, first_byte_ms,
+		(request_id, tenant_id, virtual_key_id, account_id, attempts, model, path, status, duration_ms, first_byte_ms,
 		 prompt_tokens, cache_hit_tokens, cache_miss_tokens, completion_tokens, reasoning_tokens, total_tokens,
 		 usage_present, usage_status, estimated_cost_cny, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		event.RequestID, event.TenantID, event.VirtualKeyID, event.AccountID, event.Model, event.Path, event.Status,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.RequestID, event.TenantID, event.VirtualKeyID, event.AccountID, attempts, event.Model, event.Path, event.Status,
 		event.DurationMS, event.FirstByteMS, event.Usage.PromptTokens, event.Usage.CacheHitTokens,
 		event.Usage.CacheMissTokens, event.Usage.CompletionTokens, event.Usage.ReasoningTokens, event.Usage.TotalTokens,
 		boolInt(event.Usage.UsagePresent), event.UsageStatus, event.EstimatedCostCNY, event.CreatedAt.UTC().Format(time.RFC3339Nano))
@@ -236,7 +268,7 @@ func (r *Recorder) loadSQLite(db *sql.DB) {
 	row = db.QueryRow(`SELECT COUNT(*) FROM usage_events WHERE status >= 200 AND status < 400`)
 	_ = row.Scan(&r.stats.Successes)
 	r.stats.Errors = r.stats.Requests - r.stats.Successes
-	rows, err := db.Query(`SELECT request_id, tenant_id, virtual_key_id, account_id, model, path, status,
+	rows, err := db.Query(`SELECT request_id, tenant_id, virtual_key_id, account_id, attempts, model, path, status,
 		duration_ms, first_byte_ms, prompt_tokens, cache_hit_tokens, cache_miss_tokens, completion_tokens,
 		reasoning_tokens, total_tokens, usage_present, usage_status, estimated_cost_cny, created_at
 		FROM usage_events ORDER BY id DESC LIMIT 50`)
@@ -248,13 +280,16 @@ func (r *Recorder) loadSQLite(db *sql.DB) {
 		var event RequestStats
 		var present int
 		var createdAt string
-		if err := rows.Scan(&event.RequestID, &event.TenantID, &event.VirtualKeyID, &event.AccountID, &event.Model, &event.Path,
+		if err := rows.Scan(&event.RequestID, &event.TenantID, &event.VirtualKeyID, &event.AccountID, &event.Attempts, &event.Model, &event.Path,
 			&event.Status, &event.DurationMS, &event.FirstByteMS, &event.Usage.PromptTokens, &event.Usage.CacheHitTokens,
 			&event.Usage.CacheMissTokens, &event.Usage.CompletionTokens, &event.Usage.ReasoningTokens, &event.Usage.TotalTokens,
 			&present, &event.UsageStatus, &event.EstimatedCostCNY, &createdAt); err != nil {
 			continue
 		}
 		event.Usage.UsagePresent = present != 0
+		if event.Attempts <= 0 {
+			event.Attempts = 1
+		}
 		event.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
 		r.latest = append(r.latest, event)
 	}
@@ -325,7 +360,7 @@ type UsageFilter struct {
 
 func queryUsage(db *sql.DB, filter UsageFilter) ([]RequestStats, error) {
 	query := strings.Builder{}
-	query.WriteString(`SELECT request_id, tenant_id, virtual_key_id, account_id, model, path, status,
+	query.WriteString(`SELECT request_id, tenant_id, virtual_key_id, account_id, attempts, model, path, status,
 		duration_ms, first_byte_ms, prompt_tokens, cache_hit_tokens, cache_miss_tokens, completion_tokens,
 		reasoning_tokens, total_tokens, usage_present, usage_status, estimated_cost_cny, created_at
 		FROM usage_events`)
@@ -350,13 +385,16 @@ func queryUsage(db *sql.DB, filter UsageFilter) ([]RequestStats, error) {
 		var event RequestStats
 		var present int
 		var createdAt string
-		if err := rows.Scan(&event.RequestID, &event.TenantID, &event.VirtualKeyID, &event.AccountID, &event.Model, &event.Path,
+		if err := rows.Scan(&event.RequestID, &event.TenantID, &event.VirtualKeyID, &event.AccountID, &event.Attempts, &event.Model, &event.Path,
 			&event.Status, &event.DurationMS, &event.FirstByteMS, &event.Usage.PromptTokens, &event.Usage.CacheHitTokens,
 			&event.Usage.CacheMissTokens, &event.Usage.CompletionTokens, &event.Usage.ReasoningTokens, &event.Usage.TotalTokens,
 			&present, &event.UsageStatus, &event.EstimatedCostCNY, &createdAt); err != nil {
 			return nil, err
 		}
 		event.Usage.UsagePresent = present != 0
+		if event.Attempts <= 0 {
+			event.Attempts = 1
+		}
 		event.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
 		result = append(result, event)
 	}

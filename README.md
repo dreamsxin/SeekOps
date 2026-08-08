@@ -98,6 +98,7 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `POST /admin/accounts`：创建 SQLite 托管的上游账号
 - `PUT /admin/accounts/{id}`：更新或启停托管账号，`api_key` 留空时保留原值
 - `POST /admin/accounts/{id}/check`：立即调用上游余额接口检测账号凭据和可用状态
+- `POST /admin/accounts/{id}/test`：测试上游 API；`{"mode":"models"}` 调用模型列表，`{"mode":"chat","model":"deepseek-v4-flash"}` 发送最小 Chat 请求
 - `DELETE /admin/accounts/{id}`：删除托管账号；环境变量账号为只读
 - `GET /admin/balance-history`：查询余额快照，支持 `account_id` 和 `limit` 参数
 - `GET /admin/virtual-keys`：列出租户虚拟 Key、可恢复密钥、配额和当前用量
@@ -113,6 +114,8 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 Chat、Responses 和 Anthropic Messages JSON 请求体在 MVP 中限制为 32 MiB；流式 Chat 请求会在转发前确保 `stream_options.include_usage=true`。Anthropic 非流式和 SSE 响应的 `input_tokens`、`output_tokens`、缓存读取/创建 Token 会写入同一用量账本。虚拟 Key、用量事件、统计恢复和余额快照会写入 SQLite。
 
 控制台创建或更新上游账号时会立即检测一次，后台还会按 `BALANCE_POLL_INTERVAL` 自动检测；账号列表也提供单账号手动检测。未完成检测的账号显示“待检测”，只有余额接口成功返回后才显示“健康”。控制台账号会立即加入代理池并写入 SQLite；环境变量账号继续作为只读基线。请求账本支持最近 7 天默认汇总、自定义日期、租户/模型筛选、每日趋势、用量排行和 CSV 导出。上游 API Key 和可恢复租户 Key 使用 AES-256-GCM 加密后写入 SQLite，认证索引仍使用摘要。历史版本中的明文凭据会在首次启用主密钥时自动迁移；只保存哈希的旧租户 Key 仍不可恢复，可通过轮换生成可查看的新密钥。
+
+账号列表的“测试 API”会直接向该账号的 `/models` 或 `/chat/completions` 发起请求，分别验证 Key、Base URL 和指定模型是否可用。代理请求在尚未返回数据时，遇到网络错误、429 或 500/502/503/504 会最多切换到另一个健康账号重试一次；401、402、422 不重试，流式响应开始后也不会重试。请求账本会保存最终上游账号和尝试次数。
 
 ## 备份与恢复
 
