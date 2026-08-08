@@ -51,6 +51,10 @@ const initialStats: Stats = {
   last_requests: [],
 };
 
+function BrandMark() {
+  return <div className="brand-mark" role="img" aria-label="SeekOps logo"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M25 8H11l-4 4 4 4h10l4 4-4 4H7" fill="none" stroke="currentColor" strokeWidth="2.75" strokeLinecap="square" strokeLinejoin="miter" /><circle cx="25" cy="8" r="1.75" fill="currentColor" /><circle cx="7" cy="24" r="1.75" fill="currentColor" /></svg></div>;
+}
+
 export function App() {
   const [adminKey, setAdminKey] = useState(auth.get());
   const [setup, setSetup] = useState<AdminSetupStatus | null>(null);
@@ -175,7 +179,7 @@ export function App() {
   return (
     <div className="shell">
       <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
-        <div className="brand"><div className="brand-mark">S</div><div><strong>SeekOps</strong><span>API Control Plane</span></div></div>
+        <div className="brand"><BrandMark /><div><strong>SeekOps</strong><span>API Control Plane</span></div></div>
         <nav>
           {navItems.map((item) => {
             const Icon = item.icon;
@@ -256,7 +260,7 @@ export function App() {
 }
 
 function Login({ setup, value, onChange, onSubmit, error, loading }: { setup: boolean; value: string; onChange: (v: string) => void; onSubmit: (e: FormEvent) => void; error: string; loading: boolean }) {
-  return <div className="login-page"><div className="login-panel"><div className="brand login-brand"><div className="brand-mark">S</div><div><strong>SeekOps</strong><span>DeepSeek API Control Plane</span></div></div><div className="login-copy"><ShieldCheck size={30} /><h1>{setup ? "初始化管理员 Key" : "管理控制台"}</h1><p>{setup ? "首次运行，请设置管理 API Key。默认值为 admin，生产环境建议改为长随机字符串。" : "使用管理员 API Key 进入本地控制台。"}</p></div><form onSubmit={onSubmit}><label>管理员 API Key<input autoFocus type="password" value={value} onChange={(e) => onChange(e.target.value)} placeholder="admin" autoComplete={setup ? "new-password" : "current-password"} required /></label>{error && <p className="form-error">{error}</p>}<button className="primary full" disabled={loading}>{loading ? (setup ? "正在初始化" : "正在验证") : (setup ? "保存并进入" : "进入控制台")}</button></form></div></div>;
+  return <div className="login-page"><div className="login-panel"><div className="brand login-brand"><BrandMark /><div><strong>SeekOps</strong><span>DeepSeek API Control Plane</span></div></div><div className="login-copy"><ShieldCheck size={30} /><h1>{setup ? "初始化管理员 Key" : "管理控制台"}</h1><p>{setup ? "首次运行，请设置管理 API Key。默认值为 admin，生产环境建议改为长随机字符串。" : "使用管理员 API Key 进入本地控制台。"}</p></div><form onSubmit={onSubmit}><label>管理员 API Key<input autoFocus type="password" value={value} onChange={(e) => onChange(e.target.value)} placeholder="admin" autoComplete={setup ? "new-password" : "current-password"} required /></label>{error && <p className="form-error">{error}</p>}<button className="primary full" disabled={loading}>{loading ? (setup ? "正在初始化" : "正在验证") : (setup ? "保存并进入" : "进入控制台")}</button></form></div></div>;
 }
 
 function SettingsPage({ security, onRotateAdmin, onRotateMaster }: { security: SecurityStatus | null; onRotateAdmin: (value: string) => Promise<void>; onRotateMaster: () => Promise<SecurityStatus> }) {

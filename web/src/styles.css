@@ -110,3 +110,86 @@ main { min-width: 0; flex: 1; }
 @media (max-width: 700px) { .access-content { padding: 16px; }.access-fields { grid-template-columns: 1fr; }.api-key-field { grid-column: auto; }.protocol-tabs { flex: 1; }.protocol-tabs button { flex: 1; min-width: 0; } }
 @media (max-width: 700px) { .key-modal-body > section, .key-form { padding-left: 19px; padding-right: 19px; }.key-usage-grid { grid-template-columns: 1fr 1fr; }.key-usage-grid > div:nth-child(2) { border-right: 0; }.key-usage-grid > div:nth-child(-n+2) { border-bottom: 1px solid var(--line); }.key-modal-actions { justify-content: stretch; }.key-modal-actions .secondary, .key-modal-actions .primary { flex: 1; }.modal-action-spacer { display: none; } }
 @media (max-width: 700px) { .usage-filters { align-items: stretch; padding: 14px 16px; }.usage-filters label { flex: 1 1 calc(50% - 5px); min-width: 0; }.usage-filters input { min-width: 0; width: 100%; }.usage-filters button { width: 100%; }.summary-grid { grid-template-columns: 1fr 1fr; gap: 9px; padding: 16px; }.summary-grid .metric { min-height: 105px; padding: 12px; }.usage-chart { margin: 0 16px 16px; }.ranking-grid { grid-template-columns: 1fr; gap: 12px; padding: 0 16px 16px; } }
+
+/* SeekOps monochrome identity: the route mark and hard-edged surfaces keep the console flat and operational. */
+:root {
+  color-scheme: light;
+  --ink: #111110;
+  --muted: #6e6e69;
+  --line: #deded9;
+  --panel: #ffffff;
+  --green: #111110;
+  --green-dark: #000000;
+  --pale-green: #ededeb;
+  --blue: #555550;
+  --pale-blue: #efefed;
+  --amber: #6f6f69;
+  --pale-amber: #f0f0ec;
+  --red: #9b4138;
+  --pale-red: #f3e8e6;
+}
+body { color: var(--ink); background: #f4f4f1; }
+.sidebar { background: #090909; color: #f2f2ef; box-shadow: none; }
+.brand { gap: 12px; }
+.brand-mark { width: 34px; height: 34px; border: 1px solid #d7d7d2; border-radius: 5px; background: #f2f2ef; color: #090909; }
+.brand-mark svg { width: 25px; height: 25px; display: block; }
+.brand strong { letter-spacing: .02em; }
+.brand span { color: #898984; }
+.sidebar nav button { color: #a2a29d; border-radius: 4px; }
+.sidebar nav button:hover, .sidebar nav button.active { color: #ffffff; background: #1d1d1b; }
+.sidebar nav button.active { box-shadow: inset 3px 0 #f2f2ef; }
+.sidebar-footer { color: #858580; border-top-color: #292927; }
+.status-dot { background: #f2f2ef; }
+.topbar { background: #ffffff; border-bottom-color: var(--line); }
+.metric, .panel, .modal, .usage-chart, .ranking { border-radius: 4px; box-shadow: none; }
+.metric-icon.green, .metric-icon.blue, .metric-icon.amber { color: #111110; background: #ededeb; }
+.metric-icon.red { color: var(--red); background: var(--pale-red); }
+.donut { background: conic-gradient(#111110 var(--value), #deded9 0); }
+.legend-dot.green, .legend-dot.blue { background: #111110; }
+.money, .status.ok, .source-tag.managed { color: #111110; }
+.legend-dot.red, .status.bad > span { background: var(--red); }
+.table-wrap th { color: #777772; background: #f8f8f6; }
+.table-wrap td { border-top-color: #ededeb; }
+.table-wrap tr:hover td { background: #fafaf8; }
+.icon-button { border-radius: 4px; color: #383834; }
+.icon-button:hover { color: #000000; border-color: #9b9b95; background: #f0f0ed; }
+.icon-button.danger-icon:hover { color: var(--red); border-color: #d5b3ae; background: var(--pale-red); }
+.status.ok > span { background: #111110; }
+.status.pending > span { background: #898984; }
+.source-tag.managed { background: #ededeb; }
+.source-tag.env { color: #555550; background: #efefed; }
+.switch span { background: #bdbdb7; }
+.switch input:checked + span { background: #111110; }
+.primary { color: #ffffff; background: #111110; border-color: #111110; border-radius: 4px; }
+.primary:hover { background: #333330; }
+.secondary { color: #22221f; background: #ffffff; border-color: #cfcfca; border-radius: 4px; }
+.secondary:hover { background: #f1f1ee; }
+.danger-action { color: var(--red); }
+.filters input, .filters select, label input, .settings-form input { border-radius: 4px; }
+.filters input:focus, .filters select:focus, label input:focus, .settings-form input:focus { border-color: #111110; box-shadow: 0 0 0 3px #e9e9e5; }
+.error-banner { border-color: #dcc0bc; color: #8e3b34; background: var(--pale-red); }
+.form-success { color: #111110; }
+.security-icon.ok { color: #111110; background: #ededeb; }
+.security-icon.bad { color: var(--red); background: var(--pale-red); }
+.security-details code, .access-command pre { color: #272724; }
+.access-value code, .key-credential-value code { color: #111110; background: #f7f7f4; }
+.access-command pre { background: #f4f4f1; }
+.protocol-tabs button.active { color: #ffffff; background: #111110; }
+.protocol-tabs button:focus-visible { outline-color: #111110; }
+.key-credential-value code { background: #f4f4f1; }
+.usage-filters { background: #f8f8f6; }
+.bar-column { background: #111110; }
+.usage-error { border-radius: 4px; }
+.login-page { background: #090909; }
+.login-panel { border-color: #2c2c29; border-radius: 5px; color: #f2f2ef; background: #111110; box-shadow: none; }
+.login-brand span { color: #898984; }
+.login-copy svg { color: #f2f2ef; }
+.login-copy p { color: #a6a6a0; }
+.login-panel label { color: #b9b9b2; }
+.login-panel label input { color: #f2f2ef; border-color: #4a4a45; background: #090909; }
+.spinner { border-color: #343430; border-top-color: #f2f2ef; }
+.modal-backdrop { background: rgba(0, 0, 0, .62); }
+.modal { border-color: #cfcfca; }
+.modal-head, .key-modal-body > section { border-bottom-color: var(--line); }
+.secret-result > div { border-color: #cfcfca; background: #f4f4f1; }
+.secret-result code { color: #111110; }
