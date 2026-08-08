@@ -128,6 +128,9 @@ func TestAccountAPITestModelsAndChat(t *testing.T) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		if r.Header.Get("Accept") != "application/json" {
+			t.Fatalf("accept header=%q", r.Header.Get("Accept"))
+		}
 		switch r.URL.Path {
 		case "/models":
 			w.Header().Set("Content-Type", "application/json")

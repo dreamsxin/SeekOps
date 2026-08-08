@@ -497,6 +497,7 @@ func (s *Server) testAccountAPI(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+account.APIKey)
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Proxy-Request-ID", "test-"+newID())
 	if len(payload) > 0 {
 		req.Header.Set("Content-Type", "application/json")
