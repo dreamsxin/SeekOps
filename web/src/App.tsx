@@ -6,6 +6,7 @@ import {
   Check,
   CircleDollarSign,
   Clipboard,
+  Download,
   Eye,
   EyeOff,
   Gauge,
@@ -23,7 +24,7 @@ import {
   X,
 } from "lucide-react";
 import { api, auth } from "./api";
-import type { Account, AccountInput, AdminSetupStatus, BalanceSnapshot, ClientConfig, QuotaPolicy, RequestEvent, SecurityStatus, Stats, VirtualKey, VirtualKeyInput } from "./types";
+import type { Account, AccountInput, AdminSetupStatus, BalanceSnapshot, ClientConfig, QuotaPolicy, RequestEvent, SecurityStatus, Stats, UsageBreakdown, UsageSummary, VirtualKey, VirtualKeyInput } from "./types";
 
 type View = "overview" | "accounts" | "access" | "keys" | "usage" | "balances" | "settings";
 
@@ -62,6 +63,7 @@ export function App() {
   const [clientConfig, setClientConfig] = useState<ClientConfig | null>(null);
   const [keys, setKeys] = useState<VirtualKey[]>([]);
   const [usage, setUsage] = useState<RequestEvent[]>([]);
+  const [usageSummary, setUsageSummary] = useState<UsageSummary | null>(null);
   const [balances, setBalances] = useState<BalanceSnapshot[]>([]);
   const [security, setSecurity] = useState<SecurityStatus | null>(null);
   const [loading, setLoading] = useState(false);
@@ -76,12 +78,14 @@ export function App() {
     setLoading(true);
     setError("");
     try {
-      const [nextStats, nextAccounts, nextConfig, nextKeys, nextUsage, nextBalances, nextSecurity] = await Promise.all([
+      const defaultUsageQuery = recentUsageQuery();
+      const [nextStats, nextAccounts, nextConfig, nextKeys, nextUsage, nextUsageSummary, nextBalances, nextSecurity] = await Promise.all([
         api.stats(),
         api.accounts(),
         api.clientConfig(),
         api.keys(),
-        api.usage("limit=100"),
+        api.usage(defaultUsageQuery),
+        api.usageSummary(defaultUsageQuery),
         api.balances("limit=100"),
         api.security(),
       ]);
@@ -90,6 +94,7 @@ export function App() {
       setClientConfig(nextConfig);
       setKeys(nextKeys);
       setUsage(nextUsage);
+      setUsageSummary(nextUsageSummary);
       setBalances(nextBalances);
       setSecurity(nextSecurity);
       if (!authorized && nextAccounts.length === 0) setView("accounts");
@@ -214,7 +219,7 @@ export function App() {
           />}
           {view === "access" && <AccessConfig config={clientConfig} />}
           {view === "keys" && <Keys keys={keys} onCreate={() => { setCreatedSecret(""); setCreateOpen(true); }} onEdit={setKeyEditor} />}
-          {view === "usage" && <Usage events={usage} onFilter={async (query) => { setLoading(true); try { setUsage(await api.usage(query)); } finally { setLoading(false); } }} />}
+          {view === "usage" && <Usage events={usage} summary={usageSummary} onApply={async (query) => { setLoading(true); setError(""); try { const [nextSummary, nextUsage] = await Promise.all([api.usageSummary(query), api.usage(query)]); setUsageSummary(nextSummary); setUsage(nextUsage); } catch (err) { setError(err instanceof Error ? err.message : "加载用量失败"); } finally { setLoading(false); } }} onExport={api.exportUsage} />}
           {view === "balances" && <Balances snapshots={balances} accounts={accounts} onFilter={async (query) => { setLoading(true); try { setBalances(await api.balances(query)); } finally { setLoading(false); } }} />}
           {view === "settings" && <SettingsPage security={security} onRotateAdmin={rotateAdminKey} onRotateMaster={async () => {
             const next = await api.rotateMasterKey();
@@ -435,11 +440,17 @@ function AccountModal({ account, onClose, onSave }: { account?: Account; onClose
   return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><div><h2>{account ? "编辑上游账号" : "添加上游账号"}</h2><p>{account ? "修改账号参数，API Key 留空则保持不变。" : "添加一个可参与请求转发和余额轮询的账号。"}</p></div><button className="icon-button" title="关闭" onClick={onClose}><X size={19} /></button></div><form onSubmit={submit} className="create-form"><div className="form-grid">{!account && <label>账号 ID<input value={id} onChange={(e) => setID(e.target.value)} placeholder="acct-prod" /></label>}<label>名称<input value={name} onChange={(e) => setName(e.target.value)} required placeholder="生产主账号" /></label><label>API Key<input type="password" value={apiKey} onChange={(e) => setAPIKey(e.target.value)} placeholder={account ? "留空保持不变" : "sk-..."} required={!account} autoComplete="new-password" /></label><label>Base URL<input value={baseURL} onChange={(e) => setBaseURL(e.target.value)} required placeholder="https://api.deepseek.com" /></label><label>权重<input type="number" min="1" max="1000" value={weight} onChange={(e) => setWeight(e.target.value)} /></label><label>支持模型<input value={models} onChange={(e) => setModels(e.target.value)} placeholder="deepseek-chat, deepseek-reasoner" /></label></div><label className="check-row"><input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />启用账号</label>{error && <p className="form-error">{error}</p>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={busy}>{busy ? "正在保存" : "保存账号"}</button></div></form></div></div>;
 }
 
-function Usage({ events, onFilter }: { events: RequestEvent[]; onFilter: (query: string) => void }) {
-  const [tenant, setTenant] = useState(""); const [model, setModel] = useState("");
-  const submit = (e: FormEvent) => { e.preventDefault(); const q = new URLSearchParams({ limit: "200" }); if (tenant) q.set("tenant_id", tenant); if (model) q.set("model", model); onFilter(q.toString()); };
-  return <div className="panel"><PanelHead title="请求事件" subtitle={`显示 ${events.length} 条记录`} action={<form className="filters" onSubmit={submit}><input value={tenant} onChange={(e) => setTenant(e.target.value)} placeholder="租户 ID" /><input value={model} onChange={(e) => setModel(e.target.value)} placeholder="模型" /><button className="secondary">筛选</button></form>} /><RequestTable events={events} /></div>;
+function Usage({ events, summary, onApply, onExport }: { events: RequestEvent[]; summary: UsageSummary | null; onApply: (query: string) => void; onExport: (query: string) => Promise<void> }) {
+  const [tenant, setTenant] = useState(""); const [model, setModel] = useState(""); const [start, setStart] = useState(""); const [end, setEnd] = useState(""); const [busy, setBusy] = useState(false); const [error, setError] = useState("");
+  const query = (limit = "200") => { const q = new URLSearchParams({ limit }); if (tenant) q.set("tenant_id", tenant); if (model) q.set("model", model); if (start) q.set("start", start); if (end) q.set("end", end); return q.toString(); };
+  const submit = (e: FormEvent) => { e.preventDefault(); onApply(query()); };
+  const exportCSV = async () => { setBusy(true); setError(""); try { await onExport(query("10000")); } catch (err) { setError(err instanceof Error ? err.message : "导出失败"); } finally { setBusy(false); } };
+  const successRate = summary?.requests ? (summary.successes / summary.requests) * 100 : 0;
+  const maxRequests = Math.max(...(summary?.daily ?? []).map((item) => item.requests), 1);
+  return <div className="usage-stack"><section className="panel"><PanelHead title="用量汇总" subtitle={summary ? `${summary.start.slice(0, 10)} 至 ${inclusiveEndDate(summary.end)}` : "选择时间范围查看"} action={<button className="secondary" onClick={exportCSV} disabled={busy}><Download size={15} />{busy ? "正在导出" : "导出 CSV"}</button>} /><form className="usage-filters" onSubmit={submit}><label>开始日期<input type="date" value={start} onChange={(e) => setStart(e.target.value)} /></label><label>结束日期<input type="date" value={end} onChange={(e) => setEnd(e.target.value)} /></label><label>租户 ID<input value={tenant} onChange={(e) => setTenant(e.target.value)} placeholder="全部租户" /></label><label>模型<input value={model} onChange={(e) => setModel(e.target.value)} placeholder="全部模型" /></label><button className="primary">应用筛选</button></form>{error && <p className="form-error usage-error">{error}</p>}{summary && <><div className="summary-grid"><Metric icon={Activity} label="请求数" value={formatNumber(summary.requests)} detail={`${successRate.toFixed(1)}% 成功`} tone="green" /><Metric icon={Gauge} label="Token" value={formatCompact(summary.total_tokens)} detail={`输入 ${formatCompact(summary.prompt_tokens)} · 输出 ${formatCompact(summary.completion_tokens)}`} tone="blue" /><Metric icon={CircleDollarSign} label="预估费用" value={`¥ ${summary.estimated_cost_cny.toFixed(4)}`} detail="按当前价格配置" tone="amber" /><Metric icon={AlertCircle} label="失败请求" value={formatNumber(summary.errors)} detail="需关注上游状态" tone="red" /></div><div className="usage-chart"><div className="chart-head"><strong>每日趋势</strong><span>请求数 / Token</span></div><div className="chart-bars">{summary.daily.length ? summary.daily.map((item) => <div className="chart-bar" key={item.date} title={`${item.date} · ${item.requests} 请求 · ${formatCompact(item.total_tokens)} Token`}><div className="bar-column" style={{ height: `${Math.max(6, (item.requests / maxRequests) * 100)}%` }} /><small>{item.date.slice(5)}</small></div>) : <Empty label="所选范围暂无请求" />}</div></div><div className="ranking-grid"><Ranking title="租户排行" items={summary.by_tenant} /><Ranking title="模型排行" items={summary.by_model} /></div></>}</section><section className="panel"><PanelHead title="请求事件" subtitle={`当前显示 ${events.length} 条记录`} /><RequestTable events={events} /></section></div>;
 }
+
+function Ranking({ title, items }: { title: string; items: UsageBreakdown[] }) { return <div className="ranking"><strong>{title}</strong>{items.length ? items.slice(0, 5).map((item) => <div key={item.id}><span title={item.id}>{item.id || "未标识"}</span><b>{formatCompact(item.total_tokens)}</b><small>¥ {item.estimated_cost_cny.toFixed(4)}</small></div>) : <Empty label="暂无数据" />}</div>; }
 
 function RequestTable({ events, compact = false }: { events: RequestEvent[]; compact?: boolean }) {
   return <div className="table-wrap"><table><thead><tr><th>时间 / 请求</th><th>租户</th><th>模型</th><th>状态</th><th>Token</th>{!compact && <><th>首字节</th><th>费用</th></>}</tr></thead><tbody>{events.map((e) => <tr key={e.request_id}><td><span>{formatTime(e.created_at)}</span><small className="mono">{e.request_id.slice(0, 10)}</small></td><td>{e.tenant_id || "-"}</td><td>{e.model || "-"}</td><td><Status ok={e.status >= 200 && e.status < 400} label={String(e.status)} /></td><td>{formatNumber(e.usage.total_tokens)}</td>{!compact && <><td>{e.first_byte_ms} ms</td><td>¥ {e.estimated_cost_cny.toFixed(5)}</td></>}</tr>)}</tbody></table>{!events.length && <Empty label="暂无请求记录" />}</div>;
@@ -473,5 +484,7 @@ function Empty({ label }: { label: string }) { return <div className="empty">{la
 function formatNumber(v = 0) { return new Intl.NumberFormat("zh-CN").format(v); }
 function formatCompact(v = 0) { return new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(v); }
 function formatTime(value?: string) { if (!value || value.startsWith("0001-")) return "-"; return new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(value)); }
+function recentUsageQuery() { const end = new Date(); const start = new Date(end); start.setUTCDate(start.getUTCDate() - 6); return `limit=100&start=${start.toISOString().slice(0, 10)}&end=${end.toISOString().slice(0, 10)}`; }
+function inclusiveEndDate(value: string) { const end = new Date(value); end.setUTCDate(end.getUTCDate() - 1); return end.toISOString().slice(0, 10); }
 function numberOrZero(value: string) { return value ? Number(value) : 0; }
 function quotaText(q: QuotaPolicy) { const parts = []; if (q.requests_per_minute) parts.push(`${q.requests_per_minute} RPM`); if (q.concurrent_requests) parts.push(`${q.concurrent_requests} 并发`); if (q.daily_tokens) parts.push(`${formatCompact(q.daily_tokens)} Token/日`); if (q.daily_cost_cny) parts.push(`¥${q.daily_cost_cny}/日`); return parts.join(" · ") || "不限"; }

@@ -78,6 +78,8 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `GET /admin/stats`：管理统计，需要 `X-Admin-Key` 或管理员 Bearer Token
 - `GET /admin/client-config`：获取当前 OpenAI/Anthropic Base URL 和平台 API Key，需要管理员认证
 - `GET /admin/usage`：查询持久化用量事件，支持 `tenant_id`、`virtual_key_id`、`account_id`、`model`、`limit` 参数
+- `GET /admin/usage/summary`：查询时间范围用量汇总、每日趋势和租户/密钥/模型/账号排行；支持 `start`、`end`（包含结束日期）、`tenant_id`、`virtual_key_id`、`account_id`、`model`
+- `GET /admin/usage/export`：按同样筛选条件导出 UTF-8 CSV，最多导出 10000 条记录
 - `GET /admin/accounts`：列出环境变量账号和 SQLite 托管账号
 - `POST /admin/accounts`：创建 SQLite 托管的上游账号
 - `PUT /admin/accounts/{id}`：更新或启停托管账号，`api_key` 留空时保留原值
@@ -96,7 +98,7 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 
 Chat、Responses 和 Anthropic Messages JSON 请求体在 MVP 中限制为 32 MiB；流式 Chat 请求会在转发前确保 `stream_options.include_usage=true`。Anthropic 非流式和 SSE 响应的 `input_tokens`、`output_tokens`、缓存读取/创建 Token 会写入同一用量账本。虚拟 Key、用量事件、统计恢复和余额快照会写入 SQLite。
 
-控制台创建或更新上游账号时会立即检测一次，后台还会按 `BALANCE_POLL_INTERVAL` 自动检测；账号列表也提供单账号手动检测。未完成检测的账号显示“待检测”，只有余额接口成功返回后才显示“健康”。控制台账号会立即加入代理池并写入 SQLite；环境变量账号继续作为只读基线。上游 API Key 和可恢复租户 Key 使用 AES-256-GCM 加密后写入 SQLite，认证索引仍使用摘要。历史版本中的明文凭据会在首次启用主密钥时自动迁移；只保存哈希的旧租户 Key 仍不可恢复，可通过轮换生成可查看的新密钥。
+控制台创建或更新上游账号时会立即检测一次，后台还会按 `BALANCE_POLL_INTERVAL` 自动检测；账号列表也提供单账号手动检测。未完成检测的账号显示“待检测”，只有余额接口成功返回后才显示“健康”。控制台账号会立即加入代理池并写入 SQLite；环境变量账号继续作为只读基线。请求账本支持最近 7 天默认汇总、自定义日期、租户/模型筛选、每日趋势、用量排行和 CSV 导出。上游 API Key 和可恢复租户 Key 使用 AES-256-GCM 加密后写入 SQLite，认证索引仍使用摘要。历史版本中的明文凭据会在首次启用主密钥时自动迁移；只保存哈希的旧租户 Key 仍不可恢复，可通过轮换生成可查看的新密钥。
 
 ## 备份与恢复
 

@@ -1,18 +1,110 @@
-# DeepSeek API Key 使用量统计与代理池平台规划
+# SeekOps 产品规划
 
-## 1. 目标
+## 1. 产品目标
 
-建设一个面向团队/多租户的 DeepSeek 兼容网关，统一管理上游账号和 API Key，向客户端发放平台虚拟 Key，并对经过网关的请求做 Token、费用、延迟、错误和余额统计。
+SeekOps 是部署在本地的 DeepSeek API Key 使用与代理池管理平台，解决四个直接问题：
 
-## 2. 官方文档约束
+1. 集中管理多个 DeepSeek 上游账号，不再把真实 API Key 分发给应用。
+2. 为不同团队或应用发放独立租户密钥，并设置可执行的用量上限。
+3. 看清每个租户、密钥、模型和上游账号用了多少 Token、花了多少钱、是否调用成功。
+4. 当上游账号异常时尽量继续提供服务，并给管理员明确的处理信息。
 
-- API 使用 Bearer API Key，OpenAI 兼容 Base URL 为 `https://api.deepseek.com`。
-- `GET /user/balance` 返回账号余额详情，但不是历史用量接口。
-- Chat Completions 响应 `usage` 包含 `prompt_tokens`、缓存命中/未命中 Token、`completion_tokens`、`total_tokens` 和推理 Token；流式请求通过最终 usage 块获取统计。
-- Responses API 的 `response.completed`、`response.incomplete` 或 `response.failed` 事件包含响应级 usage。
-- 并发限制按账号计算，与 API Key 无关；同账号多 Key 不能提升并发。
-- 429 可能来自 RPM/TPM 或并发限制；401、402、422、500、503 需要分别处理。
-- 价格包含缓存命中输入、缓存未命中输入和输出单价，且可能调整，价格必须版本化。
+产品默认单机部署，使用 SQLite 持久化。只有在用户规模确实需要时才考虑分布式架构，不为尚未出现的规模问题增加配置负担。
+
+## 2. 用户使用流程
+
+1. 首次打开控制台，设置管理员 API Key。
+2. 添加一个或多个 DeepSeek 上游账号，系统立即验证 Key 和余额接口。
+3. 创建租户密钥，按需配置 RPM、并发、每日 Token 和每日费用配额。
+4. 从“接入配置”复制 Base URL 和 API Key，接入 OpenAI 或 Anthropic SDK。
+5. 在“请求账本”查看趋势、费用、错误和明细，在“余额历史”查看上游余额变化。
+6. 在“设置”确认凭据加密状态，并成对备份 SQLite 数据库与主密钥文件。
+
+## 3. 已完成功能
+
+- OpenAI Chat Completions、Responses、Models 和 Anthropic Messages 兼容代理。
+- 上游账号增删改查、启停、权重、模型范围、自动检测和手动检测。
+- 按权重、当前活跃请求和健康状态选择上游账号，常见错误进入冷却。
+- 租户密钥创建、查看、复制、启停、轮换和撤销。
+- RPM、并发、每日 Token 和每日费用配额。
+- 请求状态、Token、缓存命中、费用、首字节延迟和总耗时账本。
+- 上游余额轮询、当前状态和历史快照。
+- SQLite WAL 持久化；上游及租户凭据 AES-256-GCM 加密。
+- 历史明文自动迁移、本地主密钥轮换、错误密钥启动保护和备份恢复说明。
+- 控制台展示 OpenAI/Anthropic Base URL、平台 API Key 和请求示例。
+
+## 4. 后续功能优先级
+
+### P0：用量汇总与导出（已完成）
+
+用户价值：管理员可以回答“谁在什么时间用了多少、花了多少、错误是否集中”，并能把账单交给财务或业务负责人。
+
+验收标准：
+
+- 按最近 7 天、最近 30 天或自定义日期查看请求量、成功率、Token 和预估费用。
+- 支持按租户、租户密钥、模型和上游账号筛选。
+- 展示每日趋势以及租户、模型用量排行。
+- 将当前筛选结果导出为 UTF-8 CSV。
+
+### P1：账号故障转移
+
+用户价值：单个账号遇到网络错误、限流或短暂服务异常时，客户端不必立即失败。
+
+验收标准：
+
+- 请求尚未向客户端返回数据时，可切换到另一个健康账号重试一次。
+- 只重试网络错误、429 和可恢复的 5xx；401、402、422 不重复发送。
+- 流式响应首包发出后绝不重试。
+- 请求账本能看到尝试次数和最终使用的上游账号。
+
+### P2：价格与费用准确性
+
+用户价值：费用统计能够跟随 DeepSeek 价格变化，并说明采用了哪一版价格。
+
+验收标准：
+
+- 在设置页维护不同模型的缓存命中输入、未命中输入和输出价格及生效日期。
+- 每条请求保存价格版本，历史费用不会因改价而变化。
+- 价格缺失时明确标记为“无法估算”，不显示误导性的零费用。
+
+### P3：可见告警
+
+用户价值：管理员不用持续盯着控制台，也能发现账号失效、余额不足、错误率升高或配额即将耗尽。
+
+验收标准：
+
+- 控制台提供未处理告警菜单和数量提示。
+- 支持账号检测失败、余额阈值、租户配额 80%/100% 和近期错误率告警。
+- 告警可确认、静默和恢复，并保留发生与恢复时间。
+
+### P4：操作记录与备份工具
+
+用户价值：管理员可以追查谁修改了账号、密钥和配额，并能在界面中完成可靠备份。
+
+验收标准：
+
+- 记录账号、租户密钥、配额、管理员 Key 和主密钥轮换操作，不记录明文密钥。
+- 设置页可下载一致性的 SQLite 备份和配套主密钥文件。
+- 提供恢复检查，提前发现数据库与主密钥不匹配。
+
+## 5. 当前不做
+
+以下内容只有在真实用户规模或部署方式提出明确需求后再评估，不进入当前产品路线：
+
+- PostgreSQL、Redis、分布式锁、集群高可用。
+- 独立 Prometheus/Grafana/OpenTelemetry 平台搭建。
+- 多语言 SDK 全量兼容矩阵。
+- 自动抓取官方价格、模型或账单；DeepSeek 没有公开历史用量账单接口，无法做可靠的上游账单自动对账。
+- 记录 Prompt、模型输出或 Authorization Header。
+
+## 6. DeepSeek 官方约束
+
+- OpenAI 兼容 Base URL 为 `https://api.deepseek.com`，认证使用 Bearer API Key。
+- `GET /user/balance` 只返回当前余额，不提供历史用量。
+- Chat、Responses 和 Anthropic 流式请求必须从最终 usage 块记账；缺失时标记为 `usage_missing`，不根据文本猜测 Token。
+- 并发限制按账号计算，同一账号增加 API Key 不能提升并发。
+- 429 可能来自 RPM、TPM 或并发限制；401、402、422、500、503 需要区别处理。
+- 价格可能调整，费用必须绑定请求发生时的价格版本。
 
 官方参考：
 
@@ -23,66 +115,3 @@
 - https://api-docs.deepseek.com/zh-cn/quick_start/pricing
 - https://api-docs.deepseek.com/zh-cn/quick_start/rate_limit
 - https://api-docs.deepseek.com/zh-cn/quick_start/error_codes
-
-## 3. MVP 范围
-
-### 数据面
-
-1. 接受 `/chat/completions`、`/responses`、`/models`、`/anthropic/v1/messages` 及 OpenAI `/v1` 别名。
-2. 用虚拟 Key 鉴权，不把客户端 Key 转发到 DeepSeek。
-3. 按上游账号选择凭据；支持权重、活跃请求数和失败熔断。
-4. 透明转发 JSON 和 SSE，客户端断开时取消上游请求。
-5. 自动补充 Chat 流式 `stream_options.include_usage=true`，保证能够记账。
-6. 记录请求、响应状态、Token、估算费用、首 Token 延迟和总耗时。
-
-### 控制面
-
-1. 管理上游账号/Key、池成员和权重。
-2. 创建、列出、查看、复制、启停、轮换和撤销租户虚拟 Key。
-3. 为虚拟 Key 配置 RPM、并发、每日 Token 和每日费用上限。
-4. 查询账号健康状态和余额快照。
-5. 查询按租户、虚拟 Key、模型、账号、时间的统计。
-6. 配置告警阈值和审计策略。
-
-## 4. 生产架构
-
-- 本地单机部署使用 SQLite WAL 保存虚拟 Key、用量事件和余额快照；通过 `SQLITE_PATH` 指定数据库文件。
-- Go 网关 + Worker；PostgreSQL 保存配置、请求账本、价格版本和余额快照。
-- Redis 保存分布式并发计数、RPM/TPM Token Bucket、熔断状态和短期缓存。
-- Prometheus/Grafana/OpenTelemetry 提供指标、告警和链路。
-- 上游 Secret 和可恢复虚拟 Key 使用 KMS/Vault 或 AES-GCM 信封加密；认证索引继续保存 HMAC 摘要。
-- 默认不记录 Prompt、输出和 Authorization Header，所有密钥操作写入审计日志。
-
-## 5. 核心表
-
-`upstream_accounts`、`upstream_keys`、`pools`、`pool_members`、`tenants`、`virtual_keys`、`quota_policies`、`requests`、`usage_events`、`price_versions`、`balance_snapshots`、`health_checks`、`audit_logs`。
-
-账本字段至少包括：`request_id`、租户/虚拟 Key、上游账号/Key、协议、模型、HTTP 状态、完成原因、缓存命中/未命中 Token、输入/输出/推理/总 Token、估算费用、价格版本、首 Token 延迟、总耗时和 `usage_status`。
-
-## 6. 路由与重试规则
-
-1. 先过滤禁用、认证失败、余额不足、模型不支持、熔断中的账号。
-2. 用“加权最少并发 + 健康度 + 余额阈值”选账号。
-3. 可按租户 `user_id` 做一致性哈希提高 KV Cache 命中；传给 DeepSeek 的 `user_id` 必须满足官方字符集限制，不能包含隐私信息。
-4. 401 禁用 Key，402 暂停账号，429 进入账号/模型级冷却，5xx/503 短暂熔断。
-5. 已发送流式数据后不自动重试；超时和客户端断开标记为 `usage_missing`，不凭文本估算 Token。
-
-## 7. 迭代验收
-
-- 第 1 阶段：非流式/SSE/Responses usage 采集测试通过。
-- 第 2 阶段：虚拟 Key、账号池、健康检查和基础统计可用。
-- 第 3 阶段：PostgreSQL、Redis、密钥加密、告警、对账和压测完成。
-- 第 4 阶段：细粒度租户配额、完整管理后台和多协议 SDK 兼容矩阵。
-
-## 8. 当前实现状态与剩余功能
-
-当前本地版本已实现 SQLite WAL 持久化、上游账号增删改查、创建/更新自动检测与手动检测、OpenAI 与 Anthropic Messages 兼容代理、租户密钥独立菜单、密钥查看/复制/启停/轮换、RPM/并发/每日 Token/每日费用配额、请求账本和余额历史。管理控制台可展示两种协议的 Base URL 与平台 API Key。SQLite 中的上游与租户凭据已使用 AES-256-GCM 加密，支持明文自动迁移、本地主密钥轮换、错误密钥启动保护和数据库/密钥成对备份恢复流程。
-
-仍需按优先级补齐：
-
-1. 按租户/密钥的时间范围聚合、趋势图、账单导出和上游账单对账。
-2. 账号失败后的有限重试与跨账号故障转移，流式首包后禁止重试。
-3. 余额、错误率、配额消耗和账号失效告警，以及变更审计日志。
-4. TPM 等更细粒度配额、模型能力发现、价格版本管理和自动更新。
-5. Anthropic 官方 SDK 多语言兼容矩阵、工具调用和长连接回归测试。
-6. PostgreSQL/Redis 分布式部署、高可用、压测和可观测性完善。

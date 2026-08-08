@@ -24,6 +24,43 @@ export interface RequestEvent {
   created_at: string;
 }
 
+export interface UsageBucket {
+  date: string;
+  requests: number;
+  successes: number;
+  errors: number;
+  total_tokens: number;
+  estimated_cost_cny: number;
+}
+
+export interface UsageBreakdown {
+  id: string;
+  requests: number;
+  successes: number;
+  errors: number;
+  total_tokens: number;
+  estimated_cost_cny: number;
+}
+
+export interface UsageSummary {
+  start: string;
+  end: string;
+  requests: number;
+  successes: number;
+  errors: number;
+  total_tokens: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cache_hit_tokens: number;
+  cache_miss_tokens: number;
+  estimated_cost_cny: number;
+  daily: UsageBucket[];
+  by_tenant: UsageBreakdown[];
+  by_virtual_key: UsageBreakdown[];
+  by_model: UsageBreakdown[];
+  by_account: UsageBreakdown[];
+}
+
 export interface Stats {
   requests: number;
   successes: number;

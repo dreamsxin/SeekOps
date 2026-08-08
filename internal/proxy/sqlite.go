@@ -319,6 +319,8 @@ type UsageFilter struct {
 	AccountID    string
 	Model        string
 	Limit        int
+	StartAt      time.Time
+	EndAt        time.Time
 }
 
 func queryUsage(db *sql.DB, filter UsageFilter) ([]RequestStats, error) {
@@ -326,30 +328,15 @@ func queryUsage(db *sql.DB, filter UsageFilter) ([]RequestStats, error) {
 	query.WriteString(`SELECT request_id, tenant_id, virtual_key_id, account_id, model, path, status,
 		duration_ms, first_byte_ms, prompt_tokens, cache_hit_tokens, cache_miss_tokens, completion_tokens,
 		reasoning_tokens, total_tokens, usage_present, usage_status, estimated_cost_cny, created_at
-		FROM usage_events WHERE 1=1`)
-	args := make([]any, 0, 5)
-	if filter.TenantID != "" {
-		query.WriteString(" AND tenant_id = ?")
-		args = append(args, filter.TenantID)
-	}
-	if filter.VirtualKeyID != "" {
-		query.WriteString(" AND virtual_key_id = ?")
-		args = append(args, filter.VirtualKeyID)
-	}
-	if filter.AccountID != "" {
-		query.WriteString(" AND account_id = ?")
-		args = append(args, filter.AccountID)
-	}
-	if filter.Model != "" {
-		query.WriteString(" AND model = ?")
-		args = append(args, filter.Model)
-	}
+		FROM usage_events`)
+	where, args := usageWhere(filter)
+	query.WriteString(where)
 	limit := filter.Limit
 	if limit <= 0 {
 		limit = 100
 	}
-	if limit > 1000 {
-		limit = 1000
+	if limit > 10000 {
+		limit = 10000
 	}
 	query.WriteString(" ORDER BY id DESC LIMIT ?")
 	args = append(args, limit)

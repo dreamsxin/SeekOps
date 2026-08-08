@@ -1,4 +1,4 @@
-import type { Account, AccountInput, AdminSetupStatus, BalanceSnapshot, ClientConfig, RequestEvent, SecurityStatus, Stats, VirtualKey, VirtualKeyInput } from "./types";
+import type { Account, AccountInput, AdminSetupStatus, BalanceSnapshot, ClientConfig, RequestEvent, SecurityStatus, Stats, UsageSummary, VirtualKey, VirtualKeyInput } from "./types";
 
 const keyName = "seekops.adminKey";
 
@@ -40,6 +40,18 @@ export const api = {
   deleteAccount: (id: string) => request<{ id: string; deleted: boolean }>(`/admin/accounts/${encodeURIComponent(id)}`, { method: "DELETE" }),
   keys: () => request<VirtualKey[]>("/admin/virtual-keys"),
   usage: (query = "") => request<RequestEvent[]>(`/admin/usage${query ? `?${query}` : ""}`),
+  usageSummary: (query = "") => request<UsageSummary>(`/admin/usage/summary${query ? `?${query}` : ""}`),
+  exportUsage: async (query = "") => {
+    const response = await fetch(`/admin/usage/export${query ? `?${query}` : ""}`, { headers: { "X-Admin-Key": auth.get() } });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "seekops-usage.csv";
+    link.click();
+    URL.revokeObjectURL(url);
+  },
   balances: (query = "") => request<BalanceSnapshot[]>(`/admin/balance-history${query ? `?${query}` : ""}`),
   createKey: (body: VirtualKeyInput) => request<{ key: VirtualKey; secret: string }>("/admin/virtual-keys", { method: "POST", body: JSON.stringify(body) }),
   updateKey: (id: string, body: VirtualKeyInput) => request<VirtualKey>(`/admin/virtual-keys/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(body) }),

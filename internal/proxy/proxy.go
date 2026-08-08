@@ -1179,13 +1179,22 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 		s.handleAdminAccounts(w, r)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/admin/usage/") {
+		s.handleUsageSummary(w, r)
+		return
+	}
 	if r.URL.Path == "/admin/usage" && r.Method == http.MethodGet {
 		if s.config.DB == nil {
 			writeJSON(w, http.StatusOK, s.recorder.Snapshot().LastRequests)
 			return
 		}
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-		events, err := queryUsage(s.config.DB, UsageFilter{TenantID: r.URL.Query().Get("tenant_id"), VirtualKeyID: r.URL.Query().Get("virtual_key_id"), AccountID: r.URL.Query().Get("account_id"), Model: r.URL.Query().Get("model"), Limit: limit})
+		start, end, rangeErr := usageRange(r.URL.Query().Get("start"), r.URL.Query().Get("end"), time.Now())
+		if rangeErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": rangeErr.Error()})
+			return
+		}
+		events, err := queryUsage(s.config.DB, UsageFilter{TenantID: r.URL.Query().Get("tenant_id"), VirtualKeyID: r.URL.Query().Get("virtual_key_id"), AccountID: r.URL.Query().Get("account_id"), Model: r.URL.Query().Get("model"), Limit: limit, StartAt: start, EndAt: end})
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "query usage failed"})
 			return
