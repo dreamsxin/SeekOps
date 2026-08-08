@@ -258,7 +258,12 @@ export function App() {
         await refresh();
         if (firstHealthyAccount && saved.healthy) setView("access");
       }} />}
-      {accountTester && <AccountTestModal account={accountTester} onClose={() => setAccountTester(null)} onRun={(mode, model) => api.testAccount(accountTester.id, { mode, model })} />}
+      {accountTester && <AccountTestModal account={accountTester} onClose={() => setAccountTester(null)} onRun={(mode, model) => api.testAccount(accountTester.id, { mode, model })} onSync={async (models) => {
+        const saved = await api.updateAccount(accountTester.id, { ...accountPayload(accountTester), models });
+        setAccounts((current) => current.map((item) => item.id === saved.id ? saved : item));
+        setAccountTester(saved);
+        return saved;
+      }} />}
     </div>
   );
 }
@@ -333,7 +338,7 @@ function Metric({ icon: Icon, label, value, detail, tone }: { icon: typeof Activ
 }
 
 function Accounts({ accounts, checkingAccount, onCreate, onEdit, onCheck, onTest, onToggle, onDelete }: { accounts: Account[]; checkingAccount: string; onCreate: () => void; onEdit: (account: Account) => void; onCheck: (account: Account) => Promise<void>; onTest: (account: Account) => void; onToggle: (account: Account) => Promise<void>; onDelete: (account: Account) => Promise<void> }) {
-  return <div className="panel"><PanelHead title="账号池" subtitle={`${accounts.length} 个上游账号`} action={<button className="primary" onClick={onCreate}><Server size={16} />添加账号</button>} /><div className="table-wrap account-table"><table><thead><tr><th>账号</th><th>状态</th><th>余额</th><th>权重 / 活跃</th><th>来源</th><th></th></tr></thead><tbody>{accounts.map((a) => <tr key={a.id}><td><strong>{a.name}</strong><small>{a.id} · {a.api_key_prefix || "无 Key"}</small></td><td><Status ok={a.healthy} pending={a.check_status === "unchecked" || a.check_status === "disabled"} label={accountStatusLabel(a)} /></td><td>{a.balances?.length ? a.balances.map((b) => <div key={b.currency} className="money">{b.currency} {b.total_balance}</div>) : <span className="muted">暂无快照</span>}{a.balance_updated_at && <small>检测 {formatTime(a.balance_updated_at)}</small>}{a.balance_error && <small className="danger-text">{a.balance_error}</small>}</td><td>{a.weight} / {a.active}</td><td><span className={`source-tag ${a.managed ? "managed" : "env"}`}>{a.managed ? "控制台" : "环境变量"}</span></td><td><div className="row-actions"><button className="icon-button small" title="检测余额" disabled={!a.enabled || checkingAccount === a.id} onClick={() => onCheck(a)}><RefreshCw className={checkingAccount === a.id ? "spin" : ""} size={15} /></button><button className="icon-button small" title="测试 API" disabled={!a.enabled} onClick={() => onTest(a)}><FlaskConical size={15} /></button>{a.managed && <><button className="icon-button small" title="编辑账号" onClick={() => onEdit(a)}><Pencil size={15} /></button><label className="switch" title={a.enabled ? "停用账号" : "启用账号"}><input type="checkbox" checked={a.enabled} onChange={() => onToggle(a)} /><span /></label><button className="icon-button small danger-icon" title="删除账号" onClick={() => onDelete(a)}><Trash2 size={15} /></button></>}</div></td></tr>)}</tbody></table>{!accounts.length && <Empty label="尚未配置上游账号" />}</div></div>;
+  return <div className="panel"><PanelHead title="账号池" subtitle={`${accounts.length} 个上游账号`} action={<button className="primary" onClick={onCreate}><Server size={16} />添加账号</button>} /><div className="table-wrap account-table"><table><thead><tr><th>账号</th><th>状态</th><th>余额</th><th>权重 / 活跃</th><th>来源</th><th></th></tr></thead><tbody>{accounts.map((a) => <tr key={a.id}><td><strong>{a.name}</strong><small>{a.id} · {a.api_key_prefix || "无 Key"}</small><small className="account-models" title={a.models?.join(", ") || "未限制模型"}>{a.models?.length ? a.models.join(", ") : "未限制模型"}</small></td><td><Status ok={a.healthy} pending={a.check_status === "unchecked" || a.check_status === "disabled"} label={accountStatusLabel(a)} /></td><td>{a.balances?.length ? a.balances.map((b) => <div key={b.currency} className="money">{b.currency} {b.total_balance}</div>) : <span className="muted">暂无快照</span>}{a.balance_updated_at && <small>检测 {formatTime(a.balance_updated_at)}</small>}{a.balance_error && <small className="danger-text">{a.balance_error}</small>}</td><td>{a.weight} / {a.active}</td><td><span className={`source-tag ${a.managed ? "managed" : "env"}`}>{a.managed ? "控制台" : "环境变量"}</span></td><td><div className="row-actions"><button className="icon-button small" title="检测余额" disabled={!a.enabled || checkingAccount === a.id} onClick={() => onCheck(a)}><RefreshCw className={checkingAccount === a.id ? "spin" : ""} size={15} /></button><button className="icon-button small" title="测试 API" disabled={!a.enabled} onClick={() => onTest(a)}><FlaskConical size={15} /></button>{a.managed && <><button className="icon-button small" title="编辑账号" onClick={() => onEdit(a)}><Pencil size={15} /></button><label className="switch" title={a.enabled ? "停用账号" : "启用账号"}><input type="checkbox" checked={a.enabled} onChange={() => onToggle(a)} /><span /></label><button className="icon-button small danger-icon" title="删除账号" onClick={() => onDelete(a)}><Trash2 size={15} /></button></>}</div></td></tr>)}</tbody></table>{!accounts.length && <Empty label="尚未配置上游账号" />}</div></div>;
 }
 
 function AccessConfig({ config }: { config: ClientConfig | null }) {
@@ -423,16 +428,19 @@ function accountPayload(account: Account, enabled = account.enabled): AccountInp
   return { id: account.id, name: account.name, api_key: "", base_url: account.base_url, weight: account.weight, models: account.models ?? [], enabled };
 }
 
-function AccountTestModal({ account, onClose, onRun }: { account: Account; onClose: () => void; onRun: (mode: "models" | "chat", model?: string) => Promise<AccountTestResult> }) {
+function AccountTestModal({ account, onClose, onRun, onSync }: { account: Account; onClose: () => void; onRun: (mode: "models" | "chat", model?: string) => Promise<AccountTestResult>; onSync: (models: string[]) => Promise<Account> }) {
   const [mode, setMode] = useState<"models" | "chat">("models");
   const [model, setModel] = useState(account.models?.[0] || "deepseek-chat");
   const [busy, setBusy] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [synced, setSynced] = useState(false);
   const [result, setResult] = useState<AccountTestResult | null>(null);
   const [error, setError] = useState("");
   const run = async () => {
     setBusy(true);
     setError("");
     setResult(null);
+    setSynced(false);
     try {
       setResult(await onRun(mode, mode === "chat" ? model.trim() : undefined));
     } catch (err) {
@@ -441,7 +449,20 @@ function AccountTestModal({ account, onClose, onRun }: { account: Account; onClo
       setBusy(false);
     }
   };
-  return <div className="modal-backdrop"><div className="modal account-test-modal"><div className="modal-head"><div><h2>测试上游 API</h2><p>{account.name} · {account.base_url}</p></div><button className="icon-button" title="关闭" onClick={onClose}><X size={19} /></button></div><div className="account-test-body"><div className="test-mode-row"><div className="protocol-tabs"><button className={mode === "models" ? "active" : ""} aria-pressed={mode === "models"} onClick={() => { setMode("models"); setResult(null); }}>模型列表</button><button className={mode === "chat" ? "active" : ""} aria-pressed={mode === "chat"} onClick={() => { setMode("chat"); setResult(null); }}>Chat</button></div>{mode === "chat" && <label>模型<input value={model} onChange={(event) => setModel(event.target.value)} required /></label>}</div>{error && <p className="form-error">{error}</p>}{result && <div className={`account-test-result ${result.ok ? "ok" : "bad"}`}><div className="test-result-head">{result.ok ? <Check size={18} /> : <AlertCircle size={18} />}<div><strong>{result.ok ? "测试通过" : "测试失败"}</strong><span>{result.status ? `HTTP ${result.status} · ` : ""}{result.latency_ms} ms</span></div></div>{result.error && <p>{result.error}</p>}{result.mode === "models" && result.ok && <p>{result.models?.length || 0} 个模型：{result.models?.slice(0, 12).join(", ") || "未返回模型 ID"}</p>}{result.mode === "chat" && result.ok && <p>{result.model || model}：{result.output || "请求成功，响应内容为空"}</p>}</div>}<div className="modal-actions"><button className="secondary" onClick={onClose}>关闭</button><button className="primary" disabled={busy || (mode === "chat" && !model.trim())} onClick={run}><FlaskConical size={15} />{busy ? "正在测试" : "运行测试"}</button></div></div></div></div>;
+  const syncModels = async () => {
+    if (!result?.models?.length) return;
+    setSyncing(true);
+    setError("");
+    try {
+      await onSync(result.models);
+      setSynced(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "同步模型失败");
+    } finally {
+      setSyncing(false);
+    }
+  };
+  return <div className="modal-backdrop"><div className="modal account-test-modal"><div className="modal-head"><div><h2>测试上游 API</h2><p>{account.name} · {account.base_url}</p></div><button className="icon-button" title="关闭" onClick={onClose}><X size={19} /></button></div><div className="account-test-body"><div className="test-mode-row"><div className="protocol-tabs"><button className={mode === "models" ? "active" : ""} aria-pressed={mode === "models"} onClick={() => { setMode("models"); setResult(null); setSynced(false); }}>模型列表</button><button className={mode === "chat" ? "active" : ""} aria-pressed={mode === "chat"} onClick={() => { setMode("chat"); setResult(null); setSynced(false); }}>Chat</button></div>{mode === "chat" && <label>模型<input value={model} onChange={(event) => setModel(event.target.value)} required /></label>}</div>{error && <p className="form-error">{error}</p>}{result && <div className={`account-test-result ${result.ok ? "ok" : "bad"}`}><div className="test-result-head">{result.ok ? <Check size={18} /> : <AlertCircle size={18} />}<div><strong>{result.ok ? "测试通过" : "测试失败"}</strong><span>{result.status ? `HTTP ${result.status} · ` : ""}{result.latency_ms} ms</span></div></div>{result.error && <p>{result.error}</p>}{result.mode === "models" && result.ok && <><p>{result.models?.length || 0} 个模型：{result.models?.slice(0, 12).join(", ") || "未返回模型 ID"}</p>{account.managed && Boolean(result.models?.length) && <button className="secondary model-sync-button" disabled={syncing || synced} onClick={syncModels}>{synced ? <Check size={15} /> : <RefreshCw className={syncing ? "spin" : ""} size={15} />}{synced ? "已同步到账号" : syncing ? "正在同步" : "同步到账号"}</button>}</>}{result.mode === "chat" && result.ok && <p>{result.model || model}：{result.output || "请求成功，响应内容为空"}</p>}</div>}<div className="modal-actions"><button className="secondary" onClick={onClose}>关闭</button><button className="primary" disabled={busy || syncing || (mode === "chat" && !model.trim())} onClick={run}><FlaskConical size={15} />{busy ? "正在测试" : "运行测试"}</button></div></div></div></div>;
 }
 
 function AccountModal({ account, onClose, onSave }: { account?: Account; onClose: () => void; onSave: (body: AccountInput) => Promise<void> }) {

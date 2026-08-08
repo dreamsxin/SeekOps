@@ -55,6 +55,7 @@ main { min-width: 0; flex: 1; }
 .account-table th, .account-table td { padding-left: 14px; padding-right: 14px; }
 .account-table td { white-space: normal; vertical-align: top; }
 .account-table th:last-child, .account-table td:last-child { width: 212px; white-space: nowrap; }
+.account-models { max-width: 180px; overflow: hidden; color: #4c4c48 !important; text-overflow: ellipsis; white-space: nowrap; }
 .request-table:not(.compact) table { min-width: 900px; }
 .status { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; }.status > span { width: 7px; height: 7px; border-radius: 50%; }.status.ok { color: var(--green); }.status.ok > span { background: #53b880; }.status.bad { color: var(--red); }.status.bad > span { background: #df8178; }
 .status.pending { color: var(--muted); }.status.pending > span { background: #9aa6a0; }
@@ -82,6 +83,7 @@ main { min-width: 0; flex: 1; }
 .test-result-head strong { font-size: 12px; }
 .test-result-head span { margin-top: 3px; color: var(--muted); font-size: 10px; }
 .account-test-result p { margin: 12px 0 0; color: #4c4c48; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.model-sync-button { margin-top: 12px; }
 .scrim { display: none; }
 @media (min-width: 701px) { .overview-grid .table-wrap table { min-width: 0; } }
 @media (max-width: 1020px) { .sidebar { width: 205px; flex-basis: 205px; }.content { padding-left: 24px; padding-right: 24px; }.topbar { padding-left: 24px; padding-right: 24px; }.metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.overview-grid { grid-template-columns: 1fr; } }
