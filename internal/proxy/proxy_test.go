@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -213,5 +214,68 @@ func TestBalancePolling(t *testing.T) {
 	available, balances, updatedAt, balanceError := account.balanceSnapshot()
 	if !available || len(balances) != 1 || balances[0].TotalBalance != "10.00" || updatedAt.IsZero() || balanceError != "" {
 		t.Fatalf("balance=%v balances=%+v updated=%v error=%q", available, balances, updatedAt, balanceError)
+	}
+}
+
+func TestSQLitePersistenceAcrossServerRestart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "seekops.db")
+	db, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(Config{PlatformAPIKey: "admin-secret", DB: db})
+	view, secret, err := s.keys.CreateWithQuota("Persistent app", "tenant-p", QuotaPolicy{DailyTokens: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.keys.RecordUsage(view.ID, 12, 0.25, time.Now())
+	s.Recorder().Record(RequestStats{RequestID: "persisted-request", TenantID: "tenant-p", VirtualKeyID: view.ID, AccountID: "acct-a", Path: "/chat/completions", Status: 200, Usage: Usage{PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12, UsagePresent: true}, UsageStatus: "complete", EstimatedCostCNY: 0.25, CreatedAt: time.Now()})
+	if err := persistBalance(db, "acct-a", true, []BalanceInfo{{Currency: "CNY", TotalBalance: "88.00", GrantedBalance: "8.00", ToppedUpBalance: "80.00"}}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	account := &Account{ID: "acct-a"}
+	restarted := NewServer(Config{PlatformAPIKey: "admin-secret", DB: reopened, Accounts: []*Account{account}})
+	if _, ok := restarted.keys.Authenticate(secret); !ok {
+		t.Fatal("persisted virtual key did not authenticate after restart")
+	}
+	var persistedTokens int64
+	if err := reopened.QueryRow("SELECT daily_tokens FROM virtual_keys WHERE id = ?", view.ID).Scan(&persistedTokens); err != nil {
+		t.Fatal(err)
+	}
+	if persistedTokens != 12 {
+		t.Fatalf("persisted daily tokens=%d", persistedTokens)
+	}
+	stats := restarted.Recorder().Snapshot()
+	if stats.Requests != 1 || stats.TotalTokens != 12 || len(stats.LastRequests) != 1 {
+		t.Fatalf("restored stats=%+v", stats)
+	}
+	available, balances, _, _ := account.balanceSnapshot()
+	if !available || len(balances) != 1 || balances[0].TotalBalance != "88.00" {
+		t.Fatalf("restored balance available=%v balances=%+v", available, balances)
+	}
+	usageReq := httptest.NewRequest(http.MethodGet, "/admin/usage?tenant_id=tenant-p&limit=10", nil)
+	usageReq.Header.Set("X-Admin-Key", "admin-secret")
+	usageRec := httptest.NewRecorder()
+	restarted.ServeHTTP(usageRec, usageReq)
+	var events []RequestStats
+	if usageRec.Code != http.StatusOK || json.Unmarshal(usageRec.Body.Bytes(), &events) != nil || len(events) != 1 || events[0].RequestID != "persisted-request" {
+		t.Fatalf("usage query status=%d body=%s", usageRec.Code, usageRec.Body.String())
+	}
+	balanceReq := httptest.NewRequest(http.MethodGet, "/admin/balance-history?account_id=acct-a", nil)
+	balanceReq.Header.Set("X-Admin-Key", "admin-secret")
+	balanceRec := httptest.NewRecorder()
+	restarted.ServeHTTP(balanceRec, balanceReq)
+	var history []BalanceSnapshot
+	if balanceRec.Code != http.StatusOK || json.Unmarshal(balanceRec.Body.Bytes(), &history) != nil || len(history) != 1 || history[0].TotalBalance != "88.00" {
+		t.Fatalf("balance query status=%d body=%s", balanceRec.Code, balanceRec.Body.String())
 	}
 }

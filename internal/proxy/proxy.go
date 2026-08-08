@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -168,13 +169,33 @@ type KeyStore struct {
 	mu     sync.RWMutex
 	byHash map[string]*virtualKey
 	byID   map[string]*virtualKey
+	db     *sql.DB
 }
 
 func NewKeyStore(defaultSecret string) *KeyStore {
-	store := &KeyStore{byHash: make(map[string]*virtualKey), byID: make(map[string]*virtualKey)}
+	return NewKeyStoreWithDB(defaultSecret, nil)
+}
+func NewKeyStoreWithDB(defaultSecret string, db *sql.DB) *KeyStore {
+	store := &KeyStore{byHash: make(map[string]*virtualKey), byID: make(map[string]*virtualKey), db: db}
+	if db != nil {
+		store.mu.Lock()
+		store.loadSQLite(db)
+		store.mu.Unlock()
+	}
 	if defaultSecret != "" {
 		store.mu.Lock()
-		store.add("vk-default", "Default platform key", "default", defaultSecret)
+		hash := hashSecret(defaultSecret)
+		if _, exists := store.byHash[hash]; !exists {
+			if old, exists := store.byID["vk-default"]; exists {
+				delete(store.byHash, old.Hash)
+			}
+			key := store.add("vk-default", "Default platform key", "default", defaultSecret)
+			if db != nil {
+				if err := store.persistKeyLocked(db, key); err != nil {
+					log.Printf("persist default virtual key: %v", err)
+				}
+			}
+		}
 		store.mu.Unlock()
 	}
 	return store
@@ -214,6 +235,14 @@ func (s *KeyStore) CreateWithQuota(name, tenant string, quota QuotaPolicy) (Virt
 	s.mu.Lock()
 	key := s.add(id, name, tenant, secret)
 	key.Quota = quota
+	if s.db != nil {
+		if err := s.persistKeyLocked(s.db, key); err != nil {
+			delete(s.byHash, key.Hash)
+			delete(s.byID, key.ID)
+			s.mu.Unlock()
+			return VirtualKeyView{}, "", fmt.Errorf("persist virtual key: %w", err)
+		}
+	}
 	s.mu.Unlock()
 	return key.view(), secret, nil
 }
@@ -286,6 +315,11 @@ func (s *KeyStore) RecordUsage(id string, tokens int64, cost float64, now time.T
 	key.resetUsage(now)
 	key.dailyTokens += tokens
 	key.dailyCostCNY += cost
+	if s.db != nil {
+		if err := s.persistKeyLocked(s.db, key); err != nil {
+			log.Printf("persist virtual key usage: %v", err)
+		}
+	}
 }
 func (key *virtualKey) principal() *Principal {
 	return &Principal{ID: key.ID, Name: key.Name, TenantID: key.TenantID}
@@ -311,6 +345,12 @@ func (s *KeyStore) Revoke(id string) bool {
 		return false
 	}
 	key.Enabled = false
+	if s.db != nil {
+		if err := s.persistKeyLocked(s.db, key); err != nil {
+			key.Enabled = true
+			return false
+		}
+	}
 	return true
 }
 func hashSecret(secret string) string {
@@ -341,12 +381,17 @@ type Recorder struct {
 	mu     sync.Mutex
 	stats  Stats
 	latest []RequestStats
+	db     *sql.DB
 }
 
 func NewRecorder() *Recorder { return &Recorder{latest: make([]RequestStats, 0, 50)} }
+func NewRecorderWithDB(db *sql.DB) *Recorder {
+	recorder := &Recorder{latest: make([]RequestStats, 0, 50), db: db}
+	recorder.loadSQLite(db)
+	return recorder
+}
 func (r *Recorder) Record(event RequestStats) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.stats.Requests++
 	if event.Status >= 200 && event.Status < 400 {
 		r.stats.Successes++
@@ -362,6 +407,12 @@ func (r *Recorder) Record(event RequestStats) {
 	r.latest = append([]RequestStats{event}, r.latest...)
 	if len(r.latest) > 50 {
 		r.latest = r.latest[:50]
+	}
+	r.mu.Unlock()
+	if r.db != nil {
+		if err := persistRequest(r.db, event); err != nil {
+			log.Printf("persist usage event: %v", err)
+		}
 	}
 }
 func (r *Recorder) Snapshot() Stats {
@@ -379,6 +430,7 @@ type Config struct {
 	RequestTimeout time.Duration
 	Accounts       []*Account
 	VirtualKeys    *KeyStore
+	DB             *sql.DB
 	PriceInputHit  float64
 	PriceInputMiss float64
 	PriceOutput    float64
@@ -584,9 +636,14 @@ func NewServer(cfg Config) *Server {
 	}
 	keys := cfg.VirtualKeys
 	if keys == nil {
-		keys = NewKeyStore(cfg.PlatformAPIKey)
+		keys = NewKeyStoreWithDB(cfg.PlatformAPIKey, cfg.DB)
 	}
-	s := &Server{config: cfg, keys: keys, recorder: NewRecorder(), transport: http.DefaultTransport}
+	recorder := NewRecorder()
+	if cfg.DB != nil {
+		recorder = NewRecorderWithDB(cfg.DB)
+		loadLatestBalances(cfg.DB, cfg.Accounts)
+	}
+	s := &Server{config: cfg, keys: keys, recorder: recorder, transport: http.DefaultTransport}
 	s.proxy = &httputil.ReverseProxy{Director: s.director, Transport: s.transport, ModifyResponse: s.modifyResponse, ErrorHandler: s.errorHandler, FlushInterval: -1}
 	s.server = &http.Server{Addr: cfg.ListenAddr, Handler: s, ReadHeaderTimeout: 10 * time.Second}
 	return s
@@ -839,6 +896,34 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 401, map[string]any{"error": "admin authentication required"})
 		return
 	}
+	if r.URL.Path == "/admin/usage" && r.Method == http.MethodGet {
+		if s.config.DB == nil {
+			writeJSON(w, http.StatusOK, s.recorder.Snapshot().LastRequests)
+			return
+		}
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		events, err := queryUsage(s.config.DB, UsageFilter{TenantID: r.URL.Query().Get("tenant_id"), VirtualKeyID: r.URL.Query().Get("virtual_key_id"), AccountID: r.URL.Query().Get("account_id"), Model: r.URL.Query().Get("model"), Limit: limit})
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "query usage failed"})
+			return
+		}
+		writeJSON(w, http.StatusOK, events)
+		return
+	}
+	if r.URL.Path == "/admin/balance-history" && r.Method == http.MethodGet {
+		if s.config.DB == nil {
+			writeJSON(w, http.StatusOK, []BalanceSnapshot{})
+			return
+		}
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		history, err := queryBalanceHistory(s.config.DB, r.URL.Query().Get("account_id"), limit)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "query balance history failed"})
+			return
+		}
+		writeJSON(w, http.StatusOK, history)
+		return
+	}
 	if r.URL.Path == "/admin/virtual-keys" && r.Method == http.MethodGet {
 		writeJSON(w, http.StatusOK, s.keys.List())
 		return
@@ -946,6 +1031,11 @@ func (s *Server) pollAccountBalance(ctx context.Context, account *Account) {
 		return
 	}
 	account.setBalance(payload.IsAvailable, payload.BalanceInfos, nil)
+	if s.config.DB != nil {
+		if err := persistBalance(s.config.DB, account.ID, payload.IsAvailable, payload.BalanceInfos, time.Now()); err != nil {
+			log.Printf("persist balance snapshot: %v", err)
+		}
+	}
 }
 
 func (s *Server) writeMetrics(w http.ResponseWriter) {

@@ -2,4 +2,5 @@
 .env
 bin
 *.log
+data
 docs

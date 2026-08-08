@@ -46,6 +46,7 @@
 
 ## 4. 生产架构
 
+- 本地单机部署使用 SQLite WAL 保存虚拟 Key、用量事件和余额快照；通过 `SQLITE_PATH` 指定数据库文件。
 - Go 网关 + Worker；PostgreSQL 保存配置、请求账本、价格版本和余额快照。
 - Redis 保存分布式并发计数、RPM/TPM Token Bucket、熔断状态和短期缓存。
 - Prometheus/Grafana/OpenTelemetry 提供指标、告警和链路。

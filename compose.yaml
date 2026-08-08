@@ -1,0 +1,18 @@
+services:
+  seekops:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      LISTEN_ADDR: ":8080"
+      SQLITE_PATH: "/data/seekops.db"
+      PLATFORM_API_KEY: "${PLATFORM_API_KEY:-change-me}"
+      ADMIN_API_KEY: "${ADMIN_API_KEY:-change-me}"
+      UPSTREAM_API_KEY: "${UPSTREAM_API_KEY:-}"
+      BALANCE_POLL_INTERVAL: "${BALANCE_POLL_INTERVAL:-5m}"
+    volumes:
+      - seekops-data:/data
+
+volumes:
+  seekops-data:

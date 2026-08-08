@@ -13,12 +13,18 @@ import (
 )
 
 func main() {
+	db, err := proxy.OpenSQLite(envOr("SQLITE_PATH", "data/seekops.db"))
+	if err != nil {
+		log.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
 	cfg := proxy.Config{
 		ListenAddr:     os.Getenv("LISTEN_ADDR"),
 		PlatformAPIKey: envOr("PLATFORM_API_KEY", "proxy-demo-key"),
 		AdminAPIKey:    envOr("ADMIN_API_KEY", envOr("PLATFORM_API_KEY", "proxy-demo-key")),
 		RequestTimeout: durationOr("REQUEST_TIMEOUT", 10*time.Minute),
 		Accounts:       loadAccounts(),
+		DB:             db,
 		PriceInputHit:  floatEnv("PRICE_INPUT_HIT_CNY_PER_MILLION", 0.02),
 		PriceInputMiss: floatEnv("PRICE_INPUT_MISS_CNY_PER_MILLION", 1),
 		PriceOutput:    floatEnv("PRICE_OUTPUT_CNY_PER_MILLION", 2),
