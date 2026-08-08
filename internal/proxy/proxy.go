@@ -579,7 +579,17 @@ func (u *usageCollector) merge(v Usage, model string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if v.UsagePresent {
-		u.usage = v
+		if v.PromptTokens > 0 || u.usage.PromptTokens == 0 {
+			u.usage.PromptTokens = v.PromptTokens
+			u.usage.CacheHitTokens = v.CacheHitTokens
+			u.usage.CacheMissTokens = v.CacheMissTokens
+		}
+		if v.CompletionTokens > 0 || u.usage.CompletionTokens == 0 {
+			u.usage.CompletionTokens = v.CompletionTokens
+			u.usage.ReasoningTokens = v.ReasoningTokens
+		}
+		u.usage.TotalTokens = maxInt64(v.TotalTokens, u.usage.PromptTokens+u.usage.CompletionTokens)
+		u.usage.UsagePresent = true
 	}
 	if model != "" {
 		u.model = model
@@ -655,14 +665,35 @@ func scanUsage(reader io.Reader, meta *requestMeta) {
 			continue
 		}
 		if value, ok := payload["usage"].(map[string]any); ok {
-			meta.usage.merge(parseUsage(value), stringValue(payload["model"]))
+			meta.usage.merge(parseCompatibleUsage(value), stringValue(payload["model"]))
 		}
 		if response, ok := payload["response"].(map[string]any); ok {
 			if value, ok := response["usage"].(map[string]any); ok {
 				meta.usage.merge(parseResponsesUsage(value), stringValue(response["model"]))
 			}
 		}
+		if message, ok := payload["message"].(map[string]any); ok {
+			if value, ok := message["usage"].(map[string]any); ok {
+				meta.usage.merge(parseAnthropicUsage(value), stringValue(message["model"]))
+			}
+		}
 	}
+}
+
+func parseCompatibleUsage(v map[string]any) Usage {
+	if _, ok := v["prompt_tokens"]; ok {
+		return parseUsage(v)
+	}
+	if _, ok := v["completion_tokens"]; ok {
+		return parseUsage(v)
+	}
+	if _, ok := v["cache_read_input_tokens"]; ok {
+		return parseAnthropicUsage(v)
+	}
+	if _, ok := v["cache_creation_input_tokens"]; ok {
+		return parseAnthropicUsage(v)
+	}
+	return parseResponsesUsage(v)
 }
 
 func parseUsage(v map[string]any) Usage {
@@ -688,6 +719,22 @@ func parseResponsesUsage(v map[string]any) Usage {
 		total = prompt + completion
 	}
 	return Usage{PromptTokens: prompt, CacheHitTokens: hit, CacheMissTokens: prompt - hit, CompletionTokens: completion, ReasoningTokens: intValue(nested(v, "output_tokens_details", "reasoning_tokens")), TotalTokens: total, UsagePresent: true}
+}
+
+func parseAnthropicUsage(v map[string]any) Usage {
+	input := intValue(v["input_tokens"])
+	hit := intValue(v["cache_read_input_tokens"])
+	creation := intValue(v["cache_creation_input_tokens"])
+	prompt := input + hit + creation
+	completion := intValue(v["output_tokens"])
+	return Usage{PromptTokens: prompt, CacheHitTokens: hit, CacheMissTokens: input + creation, CompletionTokens: completion, TotalTokens: prompt + completion, UsagePresent: true}
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 func nested(m map[string]any, first, second string) any {
 	child, ok := m[first].(map[string]any)
@@ -804,12 +851,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer s.keys.Release(principal.ID)
 	model, status, err := s.prepareRequest(r)
 	if err != nil {
-		writeJSON(w, status, map[string]any{"error": map[string]any{"message": err.Error(), "type": "invalid_request_error"}})
+		writeProxyError(w, r, status, "invalid_request_error", err.Error(), nil)
 		return
 	}
 	account := s.selectAccount(r, model)
 	if account == nil {
-		writeJSON(w, 503, map[string]any{"error": map[string]any{"message": "no healthy upstream account available", "type": "proxy_error"}})
+		writeProxyError(w, r, http.StatusServiceUnavailable, "proxy_error", "no healthy upstream account available", nil)
 		return
 	}
 	account.active.Add(1)
@@ -856,6 +903,9 @@ func (s *Server) console(w http.ResponseWriter, r *http.Request) {
 }
 
 func isProxyPath(path string) bool {
+	if isAnthropicPath(path) {
+		return true
+	}
 	for _, suffix := range []string{"/chat/completions", "/responses", "/models"} {
 		if path == suffix || path == "/v1"+suffix {
 			return true
@@ -863,6 +913,7 @@ func isProxyPath(path string) bool {
 	}
 	return false
 }
+func isAnthropicPath(path string) bool { return path == "/anthropic/v1/messages" }
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) (*Principal, bool) {
 	token := r.Header.Get("Authorization")
 	if strings.HasPrefix(token, "Bearer ") {
@@ -871,16 +922,19 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) (*Principal, 
 	if token == "" {
 		token = r.Header.Get("X-Proxy-API-Key")
 	}
+	if token == "" {
+		token = r.Header.Get("X-Api-Key")
+	}
 	principal, rejection := s.keys.Acquire(token, time.Now())
 	if principal == nil {
-		writeJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid proxy API key", "type": "authentication_error"}})
+		writeProxyError(w, r, http.StatusUnauthorized, "authentication_error", "invalid proxy API key", nil)
 		return nil, false
 	}
 	if rejection != nil {
 		if rejection.RetryAfter > 0 {
 			w.Header().Set("Retry-After", strconv.Itoa(rejection.RetryAfter))
 		}
-		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": map[string]any{"message": "virtual key quota exceeded", "type": "quota_error", "reason": rejection.Reason}})
+		writeProxyError(w, r, http.StatusTooManyRequests, "quota_error", "virtual key quota exceeded", map[string]any{"reason": rejection.Reason})
 		return nil, false
 	}
 	return principal, true
@@ -916,7 +970,7 @@ func max(a, b int) int {
 }
 func (s *Server) prepareRequest(r *http.Request) (string, int, error) {
 	isJSON := strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json")
-	isSupportedBody := strings.HasSuffix(r.URL.Path, "/chat/completions") || strings.HasSuffix(r.URL.Path, "/responses")
+	isSupportedBody := strings.HasSuffix(r.URL.Path, "/chat/completions") || strings.HasSuffix(r.URL.Path, "/responses") || isAnthropicPath(r.URL.Path)
 	if r.Body == nil || !isJSON || !isSupportedBody {
 		return r.Header.Get("X-Proxy-Model"), 0, nil
 	}
@@ -969,11 +1023,20 @@ func (s *Server) director(r *http.Request) {
 	if strings.HasPrefix(path, "/v1/") {
 		path = strings.TrimPrefix(path, "/v1")
 	}
+	if isAnthropicPath(path) && strings.HasSuffix(strings.TrimRight(target.Path, "/"), "/anthropic") {
+		path = strings.TrimPrefix(path, "/anthropic")
+	}
 	r.URL.Scheme, r.URL.Host = target.Scheme, target.Host
 	r.URL.Path = joinPath(target.Path, path)
 	r.URL.RawPath = ""
 	r.Host = target.Host
-	r.Header.Set("Authorization", "Bearer "+meta.account.APIKey)
+	if isAnthropicPath(meta.path) {
+		r.Header.Del("Authorization")
+		r.Header.Set("X-Api-Key", meta.account.APIKey)
+	} else {
+		r.Header.Set("Authorization", "Bearer "+meta.account.APIKey)
+		r.Header.Del("X-Api-Key")
+	}
 	r.Header.Del("X-Proxy-API-Key")
 	r.Header.Del("X-Admin-Key")
 	r.Header.Del("X-Proxy-Model")
@@ -1004,7 +1067,19 @@ func (s *Server) errorHandler(w http.ResponseWriter, r *http.Request, err error)
 		recordMeta(meta)
 	}
 	log.Printf("proxy request failed: %v", err)
-	writeJSON(w, 502, map[string]any{"error": map[string]any{"message": "upstream request failed", "type": "proxy_error"}})
+	writeProxyError(w, r, http.StatusBadGateway, "proxy_error", "upstream request failed", nil)
+}
+
+func writeProxyError(w http.ResponseWriter, r *http.Request, status int, errorType, message string, extra map[string]any) {
+	errorBody := map[string]any{"message": message, "type": errorType}
+	for key, value := range extra {
+		errorBody[key] = value
+	}
+	if isAnthropicPath(r.URL.Path) {
+		writeJSON(w, status, map[string]any{"type": "error", "error": errorBody})
+		return
+	}
+	writeJSON(w, status, map[string]any{"error": errorBody})
 }
 func recordMeta(meta *requestMeta) {
 	if meta == nil || !meta.recorded.CompareAndSwap(false, true) {

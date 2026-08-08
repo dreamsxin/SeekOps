@@ -23,6 +23,16 @@ curl http://localhost:8080/v1/chat/completions `
   -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Hello"}],"stream":false}'
 ```
 
+Anthropic SDK 兼容 Base URL 为 `http://localhost:8080/anthropic`，使用同一个平台 Key：
+
+```powershell
+curl http://localhost:8080/anthropic/v1/messages `
+  -H "x-api-key: proxy-demo-key" `
+  -H "anthropic-version: 2023-06-01" `
+  -H "Content-Type: application/json" `
+  -d '{"model":"deepseek-v4-flash","max_tokens":64,"messages":[{"role":"user","content":"Hello"}]}'
+```
+
 Docker Compose 本地部署：
 
 ```powershell
@@ -62,7 +72,7 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `POST /admin/admin-key`：在已认证状态下轮换管理员 API Key，JSON 格式为 `{"api_key":"..."}`
 - `GET /metrics`：Prometheus 文本指标
 - `GET /admin/stats`：管理统计，需要 `X-Admin-Key` 或管理员 Bearer Token
-- `GET /admin/client-config`：获取当前平台 Base URL 和平台 API Key，需要管理员认证
+- `GET /admin/client-config`：获取当前 OpenAI/Anthropic Base URL 和平台 API Key，需要管理员认证
 - `GET /admin/usage`：查询持久化用量事件，支持 `tenant_id`、`virtual_key_id`、`account_id`、`model`、`limit` 参数
 - `GET /admin/accounts`：列出环境变量账号和 SQLite 托管账号
 - `POST /admin/accounts`：创建 SQLite 托管的上游账号
@@ -78,8 +88,9 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `/chat/completions`、`/v1/chat/completions`：Chat Completions 代理
 - `/responses`、`/v1/responses`：Responses 代理
 - `/models`、`/v1/models`：模型列表代理
+- `/anthropic/v1/messages`：Anthropic Messages 兼容代理，使用 `x-api-key` 传入平台租户 Key
 
-Chat JSON 请求体在 MVP 中限制为 32 MiB；流式 Chat 请求会在转发前确保 `stream_options.include_usage=true`，以便从最后一个 SSE 块记账。虚拟 Key、用量事件、统计恢复和余额快照会写入 SQLite。
+Chat、Responses 和 Anthropic Messages JSON 请求体在 MVP 中限制为 32 MiB；流式 Chat 请求会在转发前确保 `stream_options.include_usage=true`。Anthropic 非流式和 SSE 响应的 `input_tokens`、`output_tokens`、缓存读取/创建 Token 会写入同一用量账本。虚拟 Key、用量事件、统计恢复和余额快照会写入 SQLite。
 
 控制台创建或更新上游账号时会立即检测一次，后台还会按 `BALANCE_POLL_INTERVAL` 自动检测；账号列表也提供单账号手动检测。未完成检测的账号显示“待检测”，只有余额接口成功返回后才显示“健康”。控制台账号会立即加入代理池并写入 SQLite；环境变量账号继续作为只读基线。上游 API Key 和控制台创建的租户 Key 必须可在重启后恢复，因此本地数据库包含可用凭据，部署时应严格限制 `data/seekops.db` 的文件访问权限并纳入安全备份。历史版本创建且只保存哈希的租户 Key 会显示为不可恢复，可通过轮换生成可查看的新密钥。
 

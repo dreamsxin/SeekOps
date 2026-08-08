@@ -6,9 +6,10 @@ import (
 )
 
 type ClientConfigView struct {
-	BaseURL      string `json:"base_url"`
-	APIKey       string `json:"api_key"`
-	APIKeyPrefix string `json:"api_key_prefix"`
+	BaseURL          string `json:"base_url"`
+	AnthropicBaseURL string `json:"anthropic_base_url"`
+	APIKey           string `json:"api_key"`
+	APIKeyPrefix     string `json:"api_key_prefix"`
 }
 
 func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {
@@ -19,10 +20,17 @@ func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	apiKey := s.config.PlatformAPIKey
 	writeJSON(w, http.StatusOK, ClientConfigView{
-		BaseURL:      s.clientBaseURL(r),
-		APIKey:       apiKey,
-		APIKeyPrefix: secretPrefix(apiKey),
+		BaseURL:          s.clientBaseURL(r),
+		AnthropicBaseURL: s.clientAnthropicBaseURL(r),
+		APIKey:           apiKey,
+		APIKeyPrefix:     secretPrefix(apiKey),
 	})
+}
+
+func (s *Server) clientAnthropicBaseURL(r *http.Request) string {
+	baseURL := strings.TrimRight(s.clientBaseURL(r), "/")
+	baseURL = strings.TrimSuffix(baseURL, "/v1")
+	return baseURL + "/anthropic"
 }
 
 func (s *Server) clientBaseURL(r *http.Request) string {

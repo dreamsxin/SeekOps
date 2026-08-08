@@ -66,6 +66,79 @@ func TestProxyCapturesStreamingUsage(t *testing.T) {
 	}
 }
 
+func TestAnthropicProxyCapturesNonStreamingUsage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/anthropic/v1/messages" {
+			t.Fatalf("upstream path=%q", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Api-Key"); got != "upstream-secret" {
+			t.Fatalf("upstream x-api-key=%q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Fatalf("upstream authorization=%q", got)
+		}
+		if got := r.Header.Get("Anthropic-Version"); got != "2023-06-01" {
+			t.Fatalf("anthropic version=%q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"msg-1","type":"message","model":"deepseek-v4-flash","content":[],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":3}}`)
+	}))
+	defer upstream.Close()
+	s := NewServer(Config{PlatformAPIKey: "client-secret", Accounts: []*Account{{ID: "a", APIKey: "upstream-secret", BaseURL: upstream.URL}}})
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"deepseek-v4-flash","max_tokens":4,"messages":[]}`))
+	req.Header.Set("X-Api-Key", "client-secret")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	stats := s.Recorder().Snapshot()
+	if stats.TotalTokens != 13 || stats.PromptTokens != 10 || stats.CompletionTokens != 3 || len(stats.LastRequests) != 1 || stats.LastRequests[0].Path != "/anthropic/v1/messages" {
+		t.Fatalf("stats=%+v", stats)
+	}
+}
+
+func TestAnthropicProxyCapturesStreamingUsage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/anthropic/v1/messages" {
+			t.Fatalf("upstream path=%q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"deepseek-v4-flash\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n")
+		flusher.Flush()
+		fmt.Fprint(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n")
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+	s := NewServer(Config{PlatformAPIKey: "client-secret", Accounts: []*Account{{ID: "a", APIKey: "upstream-secret", BaseURL: upstream.URL + "/anthropic"}}})
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"deepseek-v4-flash","max_tokens":8,"stream":true,"messages":[]}`))
+	req.Header.Set("X-Api-Key", "client-secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "message_delta") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	stats := s.Recorder().Snapshot()
+	if stats.TotalTokens != 12 || stats.PromptTokens != 5 || stats.CompletionTokens != 7 {
+		t.Fatalf("stats=%+v", stats)
+	}
+}
+
+func TestAnthropicAuthenticationErrorShape(t *testing.T) {
+	s := NewServer(Config{PlatformAPIKey: "client-secret"})
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"deepseek-v4-flash"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), `"type":"error"`) || !strings.Contains(rec.Body.String(), `"type":"authentication_error"`) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestAuthAndReadiness(t *testing.T) {
 	s := NewServer(Config{PlatformAPIKey: "client-secret"})
 	req := httptest.NewRequest(http.MethodGet, "/models", nil)
@@ -686,7 +759,7 @@ func TestClientConfigUsesPublicURLAndPlatformKey(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&config); err != nil {
 		t.Fatal(err)
 	}
-	if config.BaseURL != "https://seekops.example.com/openai/v1" || config.APIKey != "client-secret" || config.APIKeyPrefix != "client-s..." {
+	if config.BaseURL != "https://seekops.example.com/openai/v1" || config.AnthropicBaseURL != "https://seekops.example.com/openai/anthropic" || config.APIKey != "client-secret" || config.APIKeyPrefix != "client-s..." {
 		t.Fatalf("client config=%+v", config)
 	}
 
@@ -697,7 +770,7 @@ func TestClientConfigUsesPublicURLAndPlatformKey(t *testing.T) {
 	derivedReq.Header.Set("X-Forwarded-Proto", "https")
 	derivedRec := httptest.NewRecorder()
 	derived.ServeHTTP(derivedRec, derivedReq)
-	if derivedRec.Code != http.StatusOK || !strings.Contains(derivedRec.Body.String(), `"base_url":"https://proxy.local:8080/v1"`) {
+	if derivedRec.Code != http.StatusOK || !strings.Contains(derivedRec.Body.String(), `"base_url":"https://proxy.local:8080/v1"`) || !strings.Contains(derivedRec.Body.String(), `"anthropic_base_url":"https://proxy.local:8080/anthropic"`) {
 		t.Fatalf("derived config status=%d body=%s", derivedRec.Code, derivedRec.Body.String())
 	}
 }

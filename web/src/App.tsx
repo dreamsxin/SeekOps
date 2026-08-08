@@ -157,7 +157,7 @@ export function App() {
   const titles: Record<View, [string, string]> = {
     overview: ["运行总览", "代理流量、成本与健康状态"],
     accounts: ["上游账号", "DeepSeek 账号健康与余额状态"],
-    access: ["接入配置", "OpenAI 兼容地址与平台 Key"],
+    access: ["接入配置", "OpenAI 与 Anthropic 兼容地址"],
     keys: ["租户密钥", "凭据、配额与实时用量"],
     usage: ["请求账本", "持久化调用明细与 Token 用量"],
     balances: ["余额历史", "上游账号余额快照"],
@@ -298,19 +298,26 @@ function Accounts({ accounts, checkingAccount, onCreate, onEdit, onCheck, onTogg
 function AccessConfig({ config }: { config: ClientConfig | null }) {
   const [revealed, setRevealed] = useState(false);
   const [copied, setCopied] = useState("");
+  const [protocol, setProtocol] = useState<"openai" | "anthropic">("openai");
   if (!config) return null;
-  const command = [
+  const command = protocol === "openai" ? [
     `curl ${config.base_url}/chat/completions \\`,
     `  -H "Authorization: Bearer $SEEKOPS_API_KEY" \\`,
     `  -H "Content-Type: application/json" \\`,
-    `  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"你好"}]}'`,
+    `  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"你好"}]}'`,
+  ].join("\n") : [
+    `curl ${config.anthropic_base_url}/v1/messages \\`,
+    `  -H "x-api-key: $SEEKOPS_API_KEY" \\`,
+    `  -H "anthropic-version: 2023-06-01" \\`,
+    `  -H "Content-Type: application/json" \\`,
+    `  -d '{"model":"deepseek-v4-flash","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}'`,
   ].join("\n");
   const copy = async (key: string, value: string) => {
     await navigator.clipboard.writeText(value);
     setCopied(key);
     window.setTimeout(() => setCopied(""), 1600);
   };
-  return <div className="panel access-panel"><PanelHead title="客户端接入" subtitle="OpenAI 兼容代理地址与平台凭据" /><div className="access-content"><div className="access-fields"><div className="access-field"><span>Base URL</span><div className="access-value"><code>{config.base_url}</code><button className="icon-button small" title="复制 Base URL" onClick={() => copy("base", config.base_url)}>{copied === "base" ? <Check size={15} /> : <Clipboard size={15} />}</button></div></div><div className="access-field"><span>平台 API Key</span><div className="access-value"><code>{revealed ? config.api_key : `${config.api_key_prefix}••••••••`}</code><button className="icon-button small" title={revealed ? "隐藏 API Key" : "显示 API Key"} onClick={() => setRevealed((value) => !value)}>{revealed ? <EyeOff size={15} /> : <Eye size={15} />}</button><button className="icon-button small" title="复制平台 API Key" onClick={() => copy("key", config.api_key)}>{copied === "key" ? <Check size={15} /> : <Clipboard size={15} />}</button></div></div></div><div className="access-command"><div className="access-command-head"><span>请求示例</span><button className="icon-button small" title="复制请求示例" onClick={() => copy("command", command)}>{copied === "command" ? <Check size={15} /> : <Clipboard size={15} />}</button></div><pre>{command}</pre></div></div></div>;
+  return <div className="panel access-panel"><PanelHead title="客户端接入" subtitle="OpenAI 与 Anthropic 兼容地址及平台凭据" /><div className="access-content"><div className="access-fields"><div className="access-field"><span>OpenAI Base URL</span><div className="access-value"><code>{config.base_url}</code><button className="icon-button small" title="复制 OpenAI Base URL" onClick={() => copy("openai-base", config.base_url)}>{copied === "openai-base" ? <Check size={15} /> : <Clipboard size={15} />}</button></div></div><div className="access-field"><span>Anthropic Base URL</span><div className="access-value"><code>{config.anthropic_base_url}</code><button className="icon-button small" title="复制 Anthropic Base URL" onClick={() => copy("anthropic-base", config.anthropic_base_url)}>{copied === "anthropic-base" ? <Check size={15} /> : <Clipboard size={15} />}</button></div></div><div className="access-field api-key-field"><span>平台 API Key</span><div className="access-value"><code>{revealed ? config.api_key : `${config.api_key_prefix}••••••••`}</code><button className="icon-button small" title={revealed ? "隐藏 API Key" : "显示 API Key"} onClick={() => setRevealed((value) => !value)}>{revealed ? <EyeOff size={15} /> : <Eye size={15} />}</button><button className="icon-button small" title="复制平台 API Key" onClick={() => copy("key", config.api_key)}>{copied === "key" ? <Check size={15} /> : <Clipboard size={15} />}</button></div></div></div><div className="access-command"><div className="access-command-head"><div className="protocol-tabs"><button className={protocol === "openai" ? "active" : ""} aria-pressed={protocol === "openai"} onClick={() => setProtocol("openai")}>OpenAI</button><button className={protocol === "anthropic" ? "active" : ""} aria-pressed={protocol === "anthropic"} onClick={() => setProtocol("anthropic")}>Anthropic</button></div><button className="icon-button small" title="复制请求示例" onClick={() => copy("command", command)}>{copied === "command" ? <Check size={15} /> : <Clipboard size={15} />}</button></div><pre>{command}</pre></div></div></div>;
 }
 
 function Keys({ keys, onCreate, onEdit }: { keys: VirtualKey[]; onCreate: () => void; onEdit: (key: VirtualKey) => void }) {
