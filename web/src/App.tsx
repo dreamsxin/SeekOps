@@ -17,7 +17,7 @@ import {
   X,
 } from "lucide-react";
 import { api, auth } from "./api";
-import type { Account, BalanceSnapshot, QuotaPolicy, RequestEvent, Stats, VirtualKey } from "./types";
+import type { Account, AdminSetupStatus, BalanceSnapshot, QuotaPolicy, RequestEvent, Stats, VirtualKey } from "./types";
 
 type View = "overview" | "accounts" | "keys" | "usage" | "balances";
 
@@ -44,8 +44,9 @@ const initialStats: Stats = {
 
 export function App() {
   const [adminKey, setAdminKey] = useState(auth.get());
+  const [setup, setSetup] = useState<AdminSetupStatus | null>(null);
   const [authorized, setAuthorized] = useState(false);
-  const [checking, setChecking] = useState(Boolean(adminKey));
+  const [checking, setChecking] = useState(true);
   const [view, setView] = useState<View>("overview");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [stats, setStats] = useState<Stats>(initialStats);
@@ -85,14 +86,40 @@ export function App() {
   }, [authorized]);
 
   useEffect(() => {
-    if (adminKey) refresh();
-    else setChecking(false);
+    api.setupStatus().then((status) => {
+      setSetup(status);
+      if (status.initialized && auth.get()) refresh();
+      else {
+        if (!status.initialized && !auth.get()) setAdminKey("admin");
+        setChecking(false);
+      }
+    }).catch((err) => {
+      setError(err instanceof Error ? err.message : "无法读取初始化状态");
+      setChecking(false);
+    });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const login = async (event: FormEvent) => {
+  const submitAdminKey = async (event: FormEvent) => {
     event.preventDefault();
-    auth.set(adminKey.trim());
-    await refresh();
+    setLoading(true);
+    setError("");
+    try {
+      const value = adminKey.trim();
+      if (!value) throw new Error("请输入管理员 API Key");
+      if (setup?.initialized) {
+        auth.set(value);
+      } else {
+        await api.setup({ api_key: value });
+        setSetup({ initialized: true });
+        auth.set(value);
+      }
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "验证失败");
+      setChecking(false);
+    } finally {
+      setLoading(false);
+    }
   };
 
   const logout = () => {
@@ -102,7 +129,7 @@ export function App() {
   };
 
   if (checking) return <div className="boot"><div className="spinner" />正在连接 SeekOps</div>;
-  if (!authorized) return <Login value={adminKey} onChange={setAdminKey} onSubmit={login} error={error} loading={loading} />;
+  if (!authorized) return <Login setup={!setup?.initialized} value={adminKey} onChange={setAdminKey} onSubmit={submitAdminKey} error={error} loading={loading} />;
 
   const titles: Record<View, [string, string]> = {
     overview: ["运行总览", "代理流量、成本与健康状态"],
@@ -148,8 +175,8 @@ export function App() {
   );
 }
 
-function Login({ value, onChange, onSubmit, error, loading }: { value: string; onChange: (v: string) => void; onSubmit: (e: FormEvent) => void; error: string; loading: boolean }) {
-  return <div className="login-page"><div className="login-panel"><div className="brand login-brand"><div className="brand-mark">S</div><div><strong>SeekOps</strong><span>DeepSeek API Control Plane</span></div></div><div className="login-copy"><ShieldCheck size={30} /><h1>管理控制台</h1><p>使用本地配置的管理员密钥继续。</p></div><form onSubmit={onSubmit}><label>管理员密钥<input autoFocus type="password" value={value} onChange={(e) => onChange(e.target.value)} placeholder="ADMIN_API_KEY" required /></label>{error && <p className="form-error">{error}</p>}<button className="primary full" disabled={loading}>{loading ? "正在验证" : "进入控制台"}</button></form></div></div>;
+function Login({ setup, value, onChange, onSubmit, error, loading }: { setup: boolean; value: string; onChange: (v: string) => void; onSubmit: (e: FormEvent) => void; error: string; loading: boolean }) {
+  return <div className="login-page"><div className="login-panel"><div className="brand login-brand"><div className="brand-mark">S</div><div><strong>SeekOps</strong><span>DeepSeek API Control Plane</span></div></div><div className="login-copy"><ShieldCheck size={30} /><h1>{setup ? "初始化管理员 Key" : "管理控制台"}</h1><p>{setup ? "首次运行，请设置管理 API Key。默认值为 admin，生产环境建议改为长随机字符串。" : "使用管理员 API Key 进入本地控制台。"}</p></div><form onSubmit={onSubmit}><label>管理员 API Key<input autoFocus type="password" value={value} onChange={(e) => onChange(e.target.value)} placeholder="admin" autoComplete={setup ? "new-password" : "current-password"} required /></label>{error && <p className="form-error">{error}</p>}<button className="primary full" disabled={loading}>{loading ? (setup ? "正在初始化" : "正在验证") : (setup ? "保存并进入" : "进入控制台")}</button></form></div></div>;
 }
 
 function Overview({ stats, accounts, usage }: { stats: Stats; accounts: Account[]; usage: RequestEvent[] }) {

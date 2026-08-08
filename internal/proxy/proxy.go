@@ -450,6 +450,8 @@ type Server struct {
 	transport http.RoundTripper
 	server    *http.Server
 	sequence  atomic.Uint64
+	adminMu   sync.RWMutex
+	adminKey  *adminKeyCredential
 }
 
 type contextKey string
@@ -649,7 +651,11 @@ func NewServer(cfg Config) *Server {
 		recorder = NewRecorderWithDB(cfg.DB)
 		loadLatestBalances(cfg.DB, cfg.Accounts)
 	}
-	s := &Server{config: cfg, keys: keys, recorder: recorder, transport: http.DefaultTransport}
+	adminKey, err := loadAdminKey(cfg.DB)
+	if err != nil {
+		log.Printf("load admin key: %v", err)
+	}
+	s := &Server{config: cfg, keys: keys, recorder: recorder, transport: http.DefaultTransport, adminKey: adminKey}
 	s.proxy = &httputil.ReverseProxy{Director: s.director, Transport: s.transport, ModifyResponse: s.modifyResponse, ErrorHandler: s.errorHandler, FlushInterval: -1}
 	s.server = &http.Server{Addr: cfg.ListenAddr, Handler: s, ReadHeaderTimeout: 10 * time.Second}
 	return s
@@ -929,11 +935,11 @@ func recordMeta(meta *requestMeta) {
 }
 
 func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
-	key := r.Header.Get("X-Admin-Key")
-	if key == "" {
-		key = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if r.URL.Path == "/admin/setup" {
+		s.handleAdminSetup(w, r)
+		return
 	}
-	if key != s.config.AdminAPIKey {
+	if !s.authenticateAdmin(r) {
 		writeJSON(w, 401, map[string]any{"error": "admin authentication required"})
 		return
 	}

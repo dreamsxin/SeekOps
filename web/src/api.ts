@@ -1,4 +1,4 @@
-import type { Account, BalanceSnapshot, RequestEvent, Stats, VirtualKey } from "./types";
+import type { Account, AdminSetupStatus, BalanceSnapshot, RequestEvent, Stats, VirtualKey } from "./types";
 
 const keyName = "seekops.adminKey";
 
@@ -26,6 +26,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  setupStatus: () => request<AdminSetupStatus>("/admin/setup"),
+  setup: (body: { api_key: string }) => request<AdminSetupStatus>("/admin/setup", { method: "POST", body: JSON.stringify(body) }),
   stats: () => request<Stats>("/admin/stats"),
   accounts: () => request<Account[]>("/admin/accounts"),
   keys: () => request<VirtualKey[]>("/admin/virtual-keys"),

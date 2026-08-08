@@ -302,3 +302,73 @@ func TestConsoleAssets(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminSetupAndKeyPersistence(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "seekops.db")
+	db, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(Config{PlatformAPIKey: "client-secret", AdminAPIKey: "legacy-admin", DB: db})
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/admin/setup", nil)
+	statusRec := httptest.NewRecorder()
+	s.ServeHTTP(statusRec, statusReq)
+	var status AdminSetupStatus
+	if statusRec.Code != http.StatusOK || json.Unmarshal(statusRec.Body.Bytes(), &status) != nil || status.Initialized {
+		t.Fatalf("initial setup status=%d body=%s", statusRec.Code, statusRec.Body.String())
+	}
+
+	setupReq := httptest.NewRequest(http.MethodPost, "/admin/setup", strings.NewReader(`{"api_key":"admin"}`))
+	setupReq.Header.Set("Content-Type", "application/json")
+	setupRec := httptest.NewRecorder()
+	s.ServeHTTP(setupRec, setupReq)
+	if setupRec.Code != http.StatusCreated {
+		t.Fatalf("setup status=%d body=%s", setupRec.Code, setupRec.Body.String())
+	}
+
+	duplicateReq := httptest.NewRequest(http.MethodPost, "/admin/setup", strings.NewReader(`{"api_key":"other-admin"}`))
+	duplicateRec := httptest.NewRecorder()
+	s.ServeHTTP(duplicateRec, duplicateReq)
+	if duplicateRec.Code != http.StatusConflict {
+		t.Fatalf("duplicate setup status=%d body=%s", duplicateRec.Code, duplicateRec.Body.String())
+	}
+
+	statsReq := httptest.NewRequest(http.MethodGet, "/admin/stats", nil)
+	statsReq.Header.Set("X-Admin-Key", "admin")
+	statsRec := httptest.NewRecorder()
+	s.ServeHTTP(statsRec, statsReq)
+	if statsRec.Code != http.StatusOK {
+		t.Fatalf("configured key stats status=%d body=%s", statsRec.Code, statsRec.Body.String())
+	}
+	legacyReq := httptest.NewRequest(http.MethodGet, "/admin/stats", nil)
+	legacyReq.Header.Set("X-Admin-Key", "legacy-admin")
+	legacyRec := httptest.NewRecorder()
+	s.ServeHTTP(legacyRec, legacyReq)
+	if legacyRec.Code != http.StatusUnauthorized {
+		t.Fatalf("legacy key should be disabled after setup, status=%d body=%s", legacyRec.Code, legacyRec.Body.String())
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	restarted := NewServer(Config{PlatformAPIKey: "client-secret", AdminAPIKey: "legacy-admin", DB: reopened})
+	restartedStatusReq := httptest.NewRequest(http.MethodGet, "/admin/setup", nil)
+	restartedStatusRec := httptest.NewRecorder()
+	restarted.ServeHTTP(restartedStatusRec, restartedStatusReq)
+	if restartedStatusRec.Code != http.StatusOK || !strings.Contains(restartedStatusRec.Body.String(), `"initialized":true`) {
+		t.Fatalf("restarted setup status=%d body=%s", restartedStatusRec.Code, restartedStatusRec.Body.String())
+	}
+	restartedStats := httptest.NewRequest(http.MethodGet, "/admin/stats", nil)
+	restartedStats.Header.Set("X-Admin-Key", "admin")
+	restartedStatsRec := httptest.NewRecorder()
+	restarted.ServeHTTP(restartedStatsRec, restartedStats)
+	if restartedStatsRec.Code != http.StatusOK {
+		t.Fatalf("restarted key stats status=%d body=%s", restartedStatsRec.Code, restartedStatsRec.Body.String())
+	}
+}

@@ -37,6 +37,10 @@ export interface Stats {
   last_requests: RequestEvent[];
 }
 
+export interface AdminSetupStatus {
+  initialized: boolean;
+}
+
 export interface BalanceInfo {
   currency: string;
   total_balance: string;

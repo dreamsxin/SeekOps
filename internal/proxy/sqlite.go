@@ -48,6 +48,12 @@ func OpenSQLite(path string) (*sql.DB, error) {
 
 func migrateSQLite(db *sql.DB) error {
 	statements := []string{
+		`CREATE TABLE IF NOT EXISTS admin_settings (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			key_salt TEXT NOT NULL,
+			key_hash TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS virtual_keys (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
