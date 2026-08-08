@@ -1,8 +1,22 @@
 # DeepSeek Proxy
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-111110.svg)](LICENSE)
+
 DeepSeek API 兼容代理的 MVP。它接受平台虚拟 API Key，按上游账号池选择凭据，转发 OpenAI 兼容请求，并从响应中的 `usage` 字段建立持久化用量账本。
 
 本地运行默认使用 `data/seekops.db` 持久化，不需要单独部署数据库或 Redis。测试代码在未传入 DB 时仍会使用内存存储；生产环境还需要接入密钥管理服务。
+
+## 控制台预览
+
+以下截图使用匿名演示数据，展示从代理池健康、请求用量到成本分析的核心工作流。
+
+<p>
+  <img src="docs/screenshots/overview.png" alt="SeekOps 运行总览" width="49%" />
+  <img src="docs/screenshots/usage-ledger.png" alt="SeekOps 请求账本" width="49%" />
+</p>
+<p align="center">
+  <img src="docs/screenshots/account-pool.png" alt="SeekOps 上游账号池" width="82%" />
+</p>
 
 ## 快速开始
 
@@ -121,3 +135,7 @@ npm run build
 ## 已知边界
 
 DeepSeek 公开 API 提供账号余额查询，但没有历史用量查询接口，因此历史统计必须来自经过本代理的响应 `usage`。同一账号下增加多个 API Key 不会提高 DeepSeek 账号并发额度；账号池的容量扩展必须使用独立账号。
+
+## License
+
+本项目采用 MIT License，详见 [LICENSE](LICENSE)。
