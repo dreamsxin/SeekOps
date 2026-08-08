@@ -127,18 +127,41 @@ type Principal struct {
 	TenantID string `json:"tenant_id"`
 }
 
+type QuotaPolicy struct {
+	RequestsPerMinute  int     `json:"requests_per_minute,omitempty"`
+	ConcurrentRequests int     `json:"concurrent_requests,omitempty"`
+	DailyTokens        int64   `json:"daily_tokens,omitempty"`
+	DailyCostCNY       float64 `json:"daily_cost_cny,omitempty"`
+}
+
+type QuotaUsage struct {
+	Date               string  `json:"date"`
+	RequestsThisMinute int     `json:"requests_this_minute"`
+	ActiveRequests     int     `json:"active_requests"`
+	DailyTokens        int64   `json:"daily_tokens"`
+	DailyCostCNY       float64 `json:"daily_cost_cny"`
+}
+
 type VirtualKeyView struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	TenantID  string    `json:"tenant_id"`
-	Prefix    string    `json:"prefix"`
-	Enabled   bool      `json:"enabled"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        string      `json:"id"`
+	Name      string      `json:"name"`
+	TenantID  string      `json:"tenant_id"`
+	Prefix    string      `json:"prefix"`
+	Enabled   bool        `json:"enabled"`
+	CreatedAt time.Time   `json:"created_at"`
+	Quota     QuotaPolicy `json:"quota"`
+	Usage     QuotaUsage  `json:"usage"`
 }
 
 type virtualKey struct {
 	VirtualKeyView
-	Hash string
+	Hash           string
+	minute         int64
+	minuteRequests int
+	active         int
+	usageDate      string
+	dailyTokens    int64
+	dailyCostCNY   float64
 }
 
 type KeyStore struct {
@@ -178,6 +201,9 @@ func (s *KeyStore) Authenticate(secret string) (*Principal, bool) {
 	return principal, ok
 }
 func (s *KeyStore) Create(name, tenant string) (VirtualKeyView, string, error) {
+	return s.CreateWithQuota(name, tenant, QuotaPolicy{})
+}
+func (s *KeyStore) CreateWithQuota(name, tenant string, quota QuotaPolicy) (VirtualKeyView, string, error) {
 	name = strings.TrimSpace(name)
 	tenant = strings.TrimSpace(tenant)
 	if name == "" || tenant == "" {
@@ -187,15 +213,16 @@ func (s *KeyStore) Create(name, tenant string) (VirtualKeyView, string, error) {
 	id := "vk-" + newID()[:16]
 	s.mu.Lock()
 	key := s.add(id, name, tenant, secret)
+	key.Quota = quota
 	s.mu.Unlock()
-	return key.VirtualKeyView, secret, nil
+	return key.view(), secret, nil
 }
 func (s *KeyStore) List() []VirtualKeyView {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := make([]VirtualKeyView, 0, len(s.byID))
 	for _, key := range s.byID {
-		result = append(result, key.VirtualKeyView)
+		result = append(result, key.view())
 	}
 	for i := 0; i < len(result); i++ {
 		for j := i + 1; j < len(result); j++ {
@@ -205,6 +232,76 @@ func (s *KeyStore) List() []VirtualKeyView {
 		}
 	}
 	return result
+}
+
+type QuotaRejection struct {
+	Reason     string
+	RetryAfter int
+}
+
+func (s *KeyStore) Acquire(secret string, now time.Time) (*Principal, *QuotaRejection) {
+	hash := hashSecret(secret)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, ok := s.byHash[hash]
+	if !ok || !key.Enabled {
+		return nil, nil
+	}
+	key.resetUsage(now)
+	minute := now.Unix() / 60
+	if key.minute != minute {
+		key.minute = minute
+		key.minuteRequests = 0
+	}
+	if key.Quota.RequestsPerMinute > 0 && key.minuteRequests >= key.Quota.RequestsPerMinute {
+		return key.principal(), &QuotaRejection{Reason: "requests_per_minute", RetryAfter: int(60 - now.Unix()%60)}
+	}
+	if key.Quota.ConcurrentRequests > 0 && key.active >= key.Quota.ConcurrentRequests {
+		return key.principal(), &QuotaRejection{Reason: "concurrent_requests", RetryAfter: 1}
+	}
+	if key.Quota.DailyTokens > 0 && key.dailyTokens >= key.Quota.DailyTokens {
+		return key.principal(), &QuotaRejection{Reason: "daily_tokens", RetryAfter: 60}
+	}
+	if key.Quota.DailyCostCNY > 0 && key.dailyCostCNY >= key.Quota.DailyCostCNY {
+		return key.principal(), &QuotaRejection{Reason: "daily_cost_cny", RetryAfter: 60}
+	}
+	key.minuteRequests++
+	key.active++
+	return key.principal(), nil
+}
+func (s *KeyStore) Release(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if key, ok := s.byID[id]; ok && key.active > 0 {
+		key.active--
+	}
+}
+func (s *KeyStore) RecordUsage(id string, tokens int64, cost float64, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, ok := s.byID[id]
+	if !ok {
+		return
+	}
+	key.resetUsage(now)
+	key.dailyTokens += tokens
+	key.dailyCostCNY += cost
+}
+func (key *virtualKey) principal() *Principal {
+	return &Principal{ID: key.ID, Name: key.Name, TenantID: key.TenantID}
+}
+func (key *virtualKey) resetUsage(now time.Time) {
+	date := now.Format("2006-01-02")
+	if key.usageDate != date {
+		key.usageDate = date
+		key.dailyTokens = 0
+		key.dailyCostCNY = 0
+	}
+}
+func (key *virtualKey) view() VirtualKeyView {
+	view := key.VirtualKeyView
+	view.Usage = QuotaUsage{Date: key.usageDate, RequestsThisMinute: key.minuteRequests, ActiveRequests: key.active, DailyTokens: key.dailyTokens, DailyCostCNY: key.dailyCostCNY}
+	return view
 }
 func (s *KeyStore) Revoke(id string) bool {
 	s.mu.Lock()
@@ -307,6 +404,7 @@ type requestMeta struct {
 	requestID string
 	principal *Principal
 	account   *Account
+	keys      *KeyStore
 	path      string
 	started   time.Time
 	recorder  *Recorder
@@ -530,6 +628,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	defer s.keys.Release(principal.ID)
 	model, status, err := s.prepareRequest(r)
 	if err != nil {
 		writeJSON(w, status, map[string]any{"error": map[string]any{"message": err.Error(), "type": "invalid_request_error"}})
@@ -543,7 +642,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	account.active.Add(1)
 	defer account.active.Add(-1)
 	requestID := newID()
-	meta := &requestMeta{requestID: requestID, principal: principal, account: account, path: r.URL.Path, started: time.Now(), recorder: s.recorder, priceHit: s.config.PriceInputHit, priceMiss: s.config.PriceInputMiss, priceOut: s.config.PriceOutput}
+	meta := &requestMeta{requestID: requestID, principal: principal, account: account, keys: s.keys, path: r.URL.Path, started: time.Now(), recorder: s.recorder, priceHit: s.config.PriceInputHit, priceMiss: s.config.PriceInputMiss, priceOut: s.config.PriceOutput}
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
 	defer cancel()
 	ctx = context.WithValue(ctx, requestMetaKey, meta)
@@ -568,9 +667,16 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) (*Principal, 
 	if token == "" {
 		token = r.Header.Get("X-Proxy-API-Key")
 	}
-	principal, ok := s.keys.Authenticate(token)
-	if !ok {
+	principal, rejection := s.keys.Acquire(token, time.Now())
+	if principal == nil {
 		writeJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid proxy API key", "type": "authentication_error"}})
+		return nil, false
+	}
+	if rejection != nil {
+		if rejection.RetryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(rejection.RetryAfter))
+		}
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": map[string]any{"message": "virtual key quota exceeded", "type": "quota_error", "reason": rejection.Reason}})
 		return nil, false
 	}
 	return principal, true
@@ -719,6 +825,9 @@ func recordMeta(meta *requestMeta) {
 		virtualKeyID = meta.principal.ID
 	}
 	meta.recorder.Record(RequestStats{RequestID: meta.requestID, TenantID: tenantID, VirtualKeyID: virtualKeyID, AccountID: meta.account.ID, Model: model, Path: meta.path, Status: status, DurationMS: time.Since(meta.started).Milliseconds(), FirstByteMS: first, Usage: usage, UsageStatus: usageStatus, EstimatedCostCNY: cost, CreatedAt: meta.started})
+	if meta.keys != nil && meta.principal != nil {
+		meta.keys.RecordUsage(meta.principal.ID, usage.TotalTokens, cost, time.Now())
+	}
 }
 
 func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
@@ -736,14 +845,15 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/admin/virtual-keys" && r.Method == http.MethodPost {
 		var input struct {
-			Name     string `json:"name"`
-			TenantID string `json:"tenant_id"`
+			Name     string      `json:"name"`
+			TenantID string      `json:"tenant_id"`
+			Quota    QuotaPolicy `json:"quota"`
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&input); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
-		view, secret, err := s.keys.Create(input.Name, input.TenantID)
+		view, secret, err := s.keys.CreateWithQuota(input.Name, input.TenantID, input.Quota)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return

@@ -106,6 +106,56 @@ func TestVirtualKeyLifecycle(t *testing.T) {
 	}
 }
 
+func TestVirtualKeyQuotas(t *testing.T) {
+	rpm := NewKeyStore("")
+	_, rpmSecret, err := rpm.CreateWithQuota("RPM", "tenant", QuotaPolicy{RequestsPerMinute: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, rejection := rpm.Acquire(rpmSecret, time.Now())
+	if principal == nil || rejection != nil {
+		t.Fatalf("first RPM acquire principal=%+v rejection=%+v", principal, rejection)
+	}
+	rpm.Release(principal.ID)
+	if _, rejection = rpm.Acquire(rpmSecret, time.Now()); rejection == nil || rejection.Reason != "requests_per_minute" {
+		t.Fatalf("second RPM acquire rejection=%+v", rejection)
+	}
+	nextMinute := time.Now().Add(time.Minute)
+	if principal, rejection = rpm.Acquire(rpmSecret, nextMinute); principal == nil || rejection != nil {
+		t.Fatalf("next-minute RPM acquire principal=%+v rejection=%+v", principal, rejection)
+	}
+	rpm.Release(principal.ID)
+
+	concurrent := NewKeyStore("")
+	_, concurrentSecret, err := concurrent.CreateWithQuota("Concurrency", "tenant", QuotaPolicy{ConcurrentRequests: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, rejection := concurrent.Acquire(concurrentSecret, time.Now())
+	if first == nil || rejection != nil {
+		t.Fatalf("first concurrent acquire principal=%+v rejection=%+v", first, rejection)
+	}
+	if _, rejection = concurrent.Acquire(concurrentSecret, time.Now()); rejection == nil || rejection.Reason != "concurrent_requests" {
+		t.Fatalf("second concurrent acquire rejection=%+v", rejection)
+	}
+	concurrent.Release(first.ID)
+
+	daily := NewKeyStore("")
+	_, dailySecret, err := daily.CreateWithQuota("Daily", "tenant", QuotaPolicy{DailyTokens: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, rejection = daily.Acquire(dailySecret, time.Now())
+	if first == nil || rejection != nil {
+		t.Fatalf("daily acquire principal=%+v rejection=%+v", first, rejection)
+	}
+	daily.RecordUsage(first.ID, 2, 0, time.Now())
+	daily.Release(first.ID)
+	if _, rejection = daily.Acquire(dailySecret, time.Now()); rejection == nil || rejection.Reason != "daily_tokens" {
+		t.Fatalf("daily quota rejection=%+v", rejection)
+	}
+}
+
 func TestVirtualKeyAdminAndTenantStats(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -113,7 +163,7 @@ func TestVirtualKeyAdminAndTenantStats(t *testing.T) {
 	}))
 	defer upstream.Close()
 	s := NewServer(Config{PlatformAPIKey: "admin-secret", AdminAPIKey: "admin-secret", Accounts: []*Account{{ID: "a", APIKey: "upstream-secret", BaseURL: upstream.URL}}})
-	create := httptest.NewRequest(http.MethodPost, "/admin/virtual-keys", strings.NewReader(`{"name":"App A","tenant_id":"tenant-a"}`))
+	create := httptest.NewRequest(http.MethodPost, "/admin/virtual-keys", strings.NewReader(`{"name":"App A","tenant_id":"tenant-a","quota":{"requests_per_minute":12,"daily_tokens":1000}}`))
 	create.Header.Set("X-Admin-Key", "admin-secret")
 	create.Header.Set("Content-Type", "application/json")
 	created := httptest.NewRecorder()
@@ -127,6 +177,9 @@ func TestVirtualKeyAdminAndTenantStats(t *testing.T) {
 	}
 	if err := json.Unmarshal(created.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
+	}
+	if payload.Key.Quota.RequestsPerMinute != 12 || payload.Key.Quota.DailyTokens != 1000 {
+		t.Fatalf("quota=%+v", payload.Key.Quota)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/chat/completions", strings.NewReader(`{"model":"deepseek-v4-flash","messages":[]}`))
 	req.Header.Set("Authorization", "Bearer "+payload.Secret)

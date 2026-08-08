@@ -48,7 +48,7 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `GET /admin/stats`：管理统计，需要 `X-Admin-Key` 或管理员 Bearer Token
 - `GET /admin/accounts`：上游账号状态，需要管理员权限
 - `GET /admin/virtual-keys`：列出虚拟 Key（只显示前缀）
-- `POST /admin/virtual-keys`：创建虚拟 Key，JSON 为 `{"name":"应用 A","tenant_id":"tenant-a"}`，密钥只在创建响应中返回一次
+- `POST /admin/virtual-keys`：创建虚拟 Key，JSON 可包含 `quota.requests_per_minute`、`quota.concurrent_requests`、`quota.daily_tokens`、`quota.daily_cost_cny`，密钥只在创建响应中返回一次
 - `POST /admin/virtual-keys/{id}/revoke`：撤销虚拟 Key
 - `/chat/completions`、`/v1/chat/completions`：Chat Completions 代理
 - `/responses`、`/v1/responses`：Responses 代理
