@@ -22,6 +22,7 @@ type UsageSummary struct {
 	CacheHitTokens   int64            `json:"cache_hit_tokens"`
 	CacheMissTokens  int64            `json:"cache_miss_tokens"`
 	EstimatedCostCNY float64          `json:"estimated_cost_cny"`
+	UnpricedRequests int64            `json:"unpriced_requests"`
 	Daily            []UsageBucket    `json:"daily"`
 	ByTenant         []UsageBreakdown `json:"by_tenant"`
 	ByVirtualKey     []UsageBreakdown `json:"by_virtual_key"`
@@ -36,6 +37,7 @@ type UsageBucket struct {
 	Errors           int64   `json:"errors"`
 	TotalTokens      int64   `json:"total_tokens"`
 	EstimatedCostCNY float64 `json:"estimated_cost_cny"`
+	UnpricedRequests int64   `json:"unpriced_requests"`
 }
 
 type UsageBreakdown struct {
@@ -45,6 +47,7 @@ type UsageBreakdown struct {
 	Errors           int64   `json:"errors"`
 	TotalTokens      int64   `json:"total_tokens"`
 	EstimatedCostCNY float64 `json:"estimated_cost_cny"`
+	UnpricedRequests int64   `json:"unpriced_requests"`
 }
 
 func parseUsageDate(value string) (time.Time, error) {
@@ -132,9 +135,10 @@ func usageSummary(db *sql.DB, filter UsageFilter) (UsageSummary, error) {
 	where, args := usageWhere(filter)
 	row := db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN status >= 200 AND status < 400 THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status < 200 OR status >= 400 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(total_tokens), 0), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
-		COALESCE(SUM(cache_hit_tokens), 0), COALESCE(SUM(cache_miss_tokens), 0), COALESCE(SUM(estimated_cost_cny), 0)
+		COALESCE(SUM(cache_hit_tokens), 0), COALESCE(SUM(cache_miss_tokens), 0), COALESCE(SUM(estimated_cost_cny), 0),
+		COALESCE(SUM(CASE WHEN price_status IN ('missing', 'usage_missing') THEN 1 ELSE 0 END), 0)
 		FROM usage_events`+where, args...)
-	if err := row.Scan(&result.Requests, &result.Successes, &result.Errors, &result.TotalTokens, &result.PromptTokens, &result.CompletionTokens, &result.CacheHitTokens, &result.CacheMissTokens, &result.EstimatedCostCNY); err != nil {
+	if err := row.Scan(&result.Requests, &result.Successes, &result.Errors, &result.TotalTokens, &result.PromptTokens, &result.CompletionTokens, &result.CacheHitTokens, &result.CacheMissTokens, &result.EstimatedCostCNY, &result.UnpricedRequests); err != nil {
 		return UsageSummary{}, err
 	}
 	var err error
@@ -154,7 +158,8 @@ func usageSummary(db *sql.DB, filter UsageFilter) (UsageSummary, error) {
 
 func queryUsageBuckets(db *sql.DB, where string, args []any) ([]UsageBucket, error) {
 	rows, err := db.Query(`SELECT substr(created_at, 1, 10), COUNT(*), COALESCE(SUM(CASE WHEN status >= 200 AND status < 400 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN status < 200 OR status >= 400 THEN 1 ELSE 0 END), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(estimated_cost_cny), 0)
+		COALESCE(SUM(CASE WHEN status < 200 OR status >= 400 THEN 1 ELSE 0 END), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(estimated_cost_cny), 0),
+		COALESCE(SUM(CASE WHEN price_status IN ('missing', 'usage_missing') THEN 1 ELSE 0 END), 0)
 		FROM usage_events`+where+` GROUP BY substr(created_at, 1, 10) ORDER BY substr(created_at, 1, 10)`, args...)
 	if err != nil {
 		return nil, err
@@ -163,7 +168,7 @@ func queryUsageBuckets(db *sql.DB, where string, args []any) ([]UsageBucket, err
 	result := make([]UsageBucket, 0)
 	for rows.Next() {
 		var item UsageBucket
-		if err := rows.Scan(&item.Date, &item.Requests, &item.Successes, &item.Errors, &item.TotalTokens, &item.EstimatedCostCNY); err != nil {
+		if err := rows.Scan(&item.Date, &item.Requests, &item.Successes, &item.Errors, &item.TotalTokens, &item.EstimatedCostCNY, &item.UnpricedRequests); err != nil {
 			return nil, err
 		}
 		result = append(result, item)
@@ -177,7 +182,8 @@ func queryUsageBreakdowns(db *sql.DB, where string, args []any, column string) (
 		return nil, fmt.Errorf("invalid breakdown column")
 	}
 	rows, err := db.Query(`SELECT `+column+`, COUNT(*), COALESCE(SUM(CASE WHEN status >= 200 AND status < 400 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN status < 200 OR status >= 400 THEN 1 ELSE 0 END), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(estimated_cost_cny), 0)
+		COALESCE(SUM(CASE WHEN status < 200 OR status >= 400 THEN 1 ELSE 0 END), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(estimated_cost_cny), 0),
+		COALESCE(SUM(CASE WHEN price_status IN ('missing', 'usage_missing') THEN 1 ELSE 0 END), 0)
 		FROM usage_events`+where+` GROUP BY `+column+` ORDER BY total_tokens DESC, estimated_cost_cny DESC LIMIT 20`, args...)
 	if err != nil {
 		return nil, err
@@ -186,7 +192,7 @@ func queryUsageBreakdowns(db *sql.DB, where string, args []any, column string) (
 	result := make([]UsageBreakdown, 0)
 	for rows.Next() {
 		var item UsageBreakdown
-		if err := rows.Scan(&item.ID, &item.Requests, &item.Successes, &item.Errors, &item.TotalTokens, &item.EstimatedCostCNY); err != nil {
+		if err := rows.Scan(&item.ID, &item.Requests, &item.Successes, &item.Errors, &item.TotalTokens, &item.EstimatedCostCNY, &item.UnpricedRequests); err != nil {
 			return nil, err
 		}
 		result = append(result, item)
@@ -199,11 +205,11 @@ func writeUsageCSV(w http.ResponseWriter, events []RequestStats) error {
 	w.Header().Set("Content-Disposition", `attachment; filename="seekops-usage.csv"`)
 	_, _ = w.Write([]byte{0xEF, 0xBB, 0xBF})
 	writer := csv.NewWriter(w)
-	if err := writer.Write([]string{"created_at", "request_id", "tenant_id", "virtual_key_id", "account_id", "attempts", "model", "path", "status", "duration_ms", "first_byte_ms", "prompt_tokens", "cache_hit_tokens", "cache_miss_tokens", "completion_tokens", "reasoning_tokens", "total_tokens", "usage_status", "estimated_cost_cny"}); err != nil {
+	if err := writer.Write([]string{"created_at", "request_id", "tenant_id", "virtual_key_id", "account_id", "attempts", "model", "path", "status", "duration_ms", "first_byte_ms", "prompt_tokens", "cache_hit_tokens", "cache_miss_tokens", "completion_tokens", "reasoning_tokens", "total_tokens", "usage_status", "price_rule_id", "price_status", "estimated_cost_cny"}); err != nil {
 		return err
 	}
 	for _, event := range events {
-		values := []string{event.CreatedAt.UTC().Format(time.RFC3339), csvText(event.RequestID), csvText(event.TenantID), csvText(event.VirtualKeyID), csvText(event.AccountID), strconv.Itoa(event.Attempts), csvText(event.Model), csvText(event.Path), strconv.Itoa(event.Status), strconv.FormatInt(event.DurationMS, 10), strconv.FormatInt(event.FirstByteMS, 10), strconv.FormatInt(event.Usage.PromptTokens, 10), strconv.FormatInt(event.Usage.CacheHitTokens, 10), strconv.FormatInt(event.Usage.CacheMissTokens, 10), strconv.FormatInt(event.Usage.CompletionTokens, 10), strconv.FormatInt(event.Usage.ReasoningTokens, 10), strconv.FormatInt(event.Usage.TotalTokens, 10), csvText(event.UsageStatus), strconv.FormatFloat(event.EstimatedCostCNY, 'f', 8, 64)}
+		values := []string{event.CreatedAt.UTC().Format(time.RFC3339), csvText(event.RequestID), csvText(event.TenantID), csvText(event.VirtualKeyID), csvText(event.AccountID), strconv.Itoa(event.Attempts), csvText(event.Model), csvText(event.Path), strconv.Itoa(event.Status), strconv.FormatInt(event.DurationMS, 10), strconv.FormatInt(event.FirstByteMS, 10), strconv.FormatInt(event.Usage.PromptTokens, 10), strconv.FormatInt(event.Usage.CacheHitTokens, 10), strconv.FormatInt(event.Usage.CacheMissTokens, 10), strconv.FormatInt(event.Usage.CompletionTokens, 10), strconv.FormatInt(event.Usage.ReasoningTokens, 10), strconv.FormatInt(event.Usage.TotalTokens, 10), csvText(event.UsageStatus), csvText(event.PriceRuleID), csvText(event.PriceStatus), strconv.FormatFloat(event.EstimatedCostCNY, 'f', 8, 64)}
 		if err := writer.Write(values); err != nil {
 			return err
 		}

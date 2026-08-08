@@ -16,6 +16,7 @@ import {
   Menu,
   Pencil,
   Plug,
+  Plus,
   RefreshCw,
   Server,
   Settings,
@@ -25,7 +26,7 @@ import {
   X,
 } from "lucide-react";
 import { api, auth } from "./api";
-import type { Account, AccountInput, AccountTestResult, AdminSetupStatus, BalanceSnapshot, ClientConfig, QuotaPolicy, RequestEvent, SecurityStatus, Stats, UsageBreakdown, UsageSummary, VirtualKey, VirtualKeyInput } from "./types";
+import type { Account, AccountInput, AccountTestResult, AdminSetupStatus, BalanceSnapshot, ClientConfig, PriceRule, PriceRuleInput, QuotaPolicy, RequestEvent, SecurityStatus, Stats, UsageBreakdown, UsageSummary, VirtualKey, VirtualKeyInput } from "./types";
 
 type View = "overview" | "accounts" | "access" | "keys" | "usage" | "balances" | "settings";
 
@@ -49,6 +50,7 @@ const initialStats: Stats = {
   cache_hit_tokens: 0,
   cache_miss_tokens: 0,
   estimated_cost_cny: 0,
+  unpriced_requests: 0,
   last_requests: [],
 };
 
@@ -71,6 +73,7 @@ export function App() {
   const [usageSummary, setUsageSummary] = useState<UsageSummary | null>(null);
   const [balances, setBalances] = useState<BalanceSnapshot[]>([]);
   const [security, setSecurity] = useState<SecurityStatus | null>(null);
+  const [prices, setPrices] = useState<PriceRule[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
@@ -85,7 +88,7 @@ export function App() {
     setError("");
     try {
       const defaultUsageQuery = recentUsageQuery();
-      const [nextStats, nextAccounts, nextConfig, nextKeys, nextUsage, nextUsageSummary, nextBalances, nextSecurity] = await Promise.all([
+      const [nextStats, nextAccounts, nextConfig, nextKeys, nextUsage, nextUsageSummary, nextBalances, nextSecurity, nextPrices] = await Promise.all([
         api.stats(),
         api.accounts(),
         api.clientConfig(),
@@ -94,6 +97,7 @@ export function App() {
         api.usageSummary(defaultUsageQuery),
         api.balances("limit=100"),
         api.security(),
+        api.prices(),
       ]);
       setStats(nextStats);
       setAccounts(nextAccounts);
@@ -103,6 +107,7 @@ export function App() {
       setUsageSummary(nextUsageSummary);
       setBalances(nextBalances);
       setSecurity(nextSecurity);
+      setPrices(nextPrices);
       if (!authorized && nextAccounts.length === 0) setView("accounts");
       setAuthorized(true);
     } catch (err) {
@@ -228,7 +233,14 @@ export function App() {
           {view === "keys" && <Keys keys={keys} onCreate={() => { setCreatedSecret(""); setCreateOpen(true); }} onEdit={setKeyEditor} />}
           {view === "usage" && <Usage events={usage} summary={usageSummary} onApply={async (query) => { setLoading(true); setError(""); try { const [nextSummary, nextUsage] = await Promise.all([api.usageSummary(query), api.usage(query)]); setUsageSummary(nextSummary); setUsage(nextUsage); } catch (err) { setError(err instanceof Error ? err.message : "加载用量失败"); } finally { setLoading(false); } }} onExport={api.exportUsage} />}
           {view === "balances" && <Balances snapshots={balances} accounts={accounts} onFilter={async (query) => { setLoading(true); try { setBalances(await api.balances(query)); } finally { setLoading(false); } }} />}
-          {view === "settings" && <SettingsPage security={security} onRotateAdmin={rotateAdminKey} onRotateMaster={async () => {
+          {view === "settings" && <SettingsPage security={security} prices={prices} onCreatePrice={async (body) => {
+            const created = await api.createPrice(body);
+            setPrices((current) => [created, ...current].sort((a, b) => b.effective_at.localeCompare(a.effective_at)));
+            return created;
+          }} onDeletePrice={async (id) => {
+            await api.deletePrice(id);
+            setPrices((current) => current.filter((item) => item.id !== id));
+          }} onRotateAdmin={rotateAdminKey} onRotateMaster={async () => {
             const next = await api.rotateMasterKey();
             setSecurity(next);
             return next;
@@ -272,7 +284,7 @@ function Login({ setup, value, onChange, onSubmit, error, loading }: { setup: bo
   return <div className="login-page"><div className="login-panel"><div className="brand login-brand"><BrandMark /><div><strong>SeekOps</strong><span>DeepSeek API Control Plane</span></div></div><div className="login-copy"><ShieldCheck size={30} /><h1>{setup ? "初始化管理员 Key" : "管理控制台"}</h1><p>{setup ? "首次运行，请设置管理 API Key。默认值为 admin，生产环境建议改为长随机字符串。" : "使用管理员 API Key 进入本地控制台。"}</p></div><form onSubmit={onSubmit}><label>管理员 API Key<input autoFocus type="password" value={value} onChange={(e) => onChange(e.target.value)} placeholder="admin" autoComplete={setup ? "new-password" : "current-password"} required /></label>{error && <p className="form-error">{error}</p>}<button className="primary full" disabled={loading}>{loading ? (setup ? "正在初始化" : "正在验证") : (setup ? "保存并进入" : "进入控制台")}</button></form></div></div>;
 }
 
-function SettingsPage({ security, onRotateAdmin, onRotateMaster }: { security: SecurityStatus | null; onRotateAdmin: (value: string) => Promise<void>; onRotateMaster: () => Promise<SecurityStatus> }) {
+function SettingsPage({ security, prices, onCreatePrice, onDeletePrice, onRotateAdmin, onRotateMaster }: { security: SecurityStatus | null; prices: PriceRule[]; onCreatePrice: (value: PriceRuleInput) => Promise<PriceRule>; onDeletePrice: (id: string) => Promise<void>; onRotateAdmin: (value: string) => Promise<void>; onRotateMaster: () => Promise<SecurityStatus> }) {
   const [value, setValue] = useState("");
   const [adminBusy, setAdminBusy] = useState(false);
   const [masterBusy, setMasterBusy] = useState(false);
@@ -312,8 +324,56 @@ function SettingsPage({ security, onRotateAdmin, onRotateMaster }: { security: S
   const storageLabel = security?.key_storage === "local_file" ? "本地密钥文件" : security?.key_storage === "external" ? "外部主密钥" : "未启用";
   return <div className="settings-stack">
     <section className="panel settings-panel"><PanelHead title="SQLite 凭据加密" subtitle="上游 API Key 与可恢复租户密钥" /><div className="security-content"><div className="security-state"><div className={`security-icon ${security?.encryption_enabled ? "ok" : "bad"}`}><ShieldCheck size={20} /></div><div><strong>{security?.encryption_enabled ? "AES-256-GCM 已启用" : "凭据加密未启用"}</strong><span>{storageLabel}</span></div></div><dl className="security-details"><div><dt>主密钥 ID</dt><dd><code>{security?.key_id || "-"}</code></dd></div><div><dt>密钥位置</dt><dd><code>{security?.key_file || (security?.key_storage === "external" ? "SECRETS_MASTER_KEY" : "-")}</code></dd></div></dl><p className="settings-note">备份 SQLite 时需同时备份密钥文件；缺失或不匹配时服务会拒绝启动。</p>{masterError && <p className="form-error">{masterError}</p>}{masterSaved && <p className="form-success">主密钥已轮换，SQLite 凭据已重新加密。</p>}<button className="secondary" disabled={masterBusy || !security?.rotation_supported} onClick={rotateMaster}><RefreshCw className={masterBusy ? "spin" : ""} size={15} />{masterBusy ? "正在轮换" : "轮换本地主密钥"}</button></div></section>
+    <PriceSettings prices={prices} onCreate={onCreatePrice} onDelete={onDeletePrice} />
     <section className="panel settings-panel"><PanelHead title="管理员 API Key" subtitle="本地管理控制台访问凭据" /><form className="settings-form" onSubmit={submit}><label>新的管理员 API Key<input type="password" value={value} onChange={(e) => setValue(e.target.value)} placeholder="输入新的长随机字符串" required autoComplete="new-password" /></label><p className="settings-note">保存后旧 Key 会立即失效，当前浏览器会自动切换到新 Key。</p>{adminError && <p className="form-error">{adminError}</p>}{adminSaved && <p className="form-success">管理员 API Key 已更新。</p>}<button className="primary" disabled={adminBusy}>{adminBusy ? "正在保存" : "保存新 Key"}</button></form></section>
   </div>;
+}
+
+function PriceSettings({ prices, onCreate, onDelete }: { prices: PriceRule[]; onCreate: (value: PriceRuleInput) => Promise<PriceRule>; onDelete: (id: string) => Promise<void> }) {
+  const [model, setModel] = useState("*");
+  const [hit, setHit] = useState("");
+  const [miss, setMiss] = useState("");
+  const [output, setOutput] = useState("");
+  const [effectiveAt, setEffectiveAt] = useState(localDateTimeInput());
+  const [busy, setBusy] = useState(false);
+  const [deleting, setDeleting] = useState("");
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const values = [Number(hit), Number(miss), Number(output)];
+    if (values.some((value) => !Number.isFinite(value) || value < 0)) {
+      setError("价格必须是大于或等于 0 的数字");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setSaved(false);
+    try {
+      await onCreate({ model: model.trim(), cache_hit_cny_per_million: values[0], cache_miss_cny_per_million: values[1], output_cny_per_million: values[2], effective_at: new Date(effectiveAt).toISOString() });
+      setSaved(true);
+      setHit("");
+      setMiss("");
+      setOutput("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存价格版本失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async (rule: PriceRule) => {
+    if (!confirm(`删除 ${rule.model === "*" ? "默认" : rule.model} 的这个价格版本？历史请求费用不会改变。`)) return;
+    setDeleting(rule.id);
+    setError("");
+    try {
+      await onDelete(rule.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除价格版本失败");
+    } finally {
+      setDeleting("");
+    }
+  };
+  return <section className="panel settings-panel"><PanelHead title="模型价格版本" subtitle="每百万 Token / 人民币；新版本不会改写历史费用" /><form className="price-form" onSubmit={submit}><label>模型<input value={model} onChange={(event) => setModel(event.target.value)} required placeholder="deepseek-v4-flash 或 *" /></label><label>缓存命中输入<input type="number" min="0" step="0.0001" value={hit} onChange={(event) => setHit(event.target.value)} required placeholder="0.02" /></label><label>缓存未命中输入<input type="number" min="0" step="0.0001" value={miss} onChange={(event) => setMiss(event.target.value)} required placeholder="1.00" /></label><label>输出<input type="number" min="0" step="0.0001" value={output} onChange={(event) => setOutput(event.target.value)} required placeholder="2.00" /></label><label>生效时间<input type="datetime-local" value={effectiveAt} onChange={(event) => setEffectiveAt(event.target.value)} required /></label><button className="primary" disabled={busy}><Plus size={15} />{busy ? "正在保存" : "新增价格版本"}</button><p className="settings-note price-note"><code>*</code> 是未配置专属价格模型的默认规则。缺少匹配价格时，请求账本会显示“无法估算”，每日费用配额也不会累计该请求。</p>{error && <p className="form-error price-message">{error}</p>}{saved && <p className="form-success price-message">价格版本已保存，生效时间之后的新请求将使用它。</p>}</form><div className="table-wrap price-table"><table><thead><tr><th>模型 / 生效时间</th><th>缓存命中输入</th><th>缓存未命中输入</th><th>输出</th><th></th></tr></thead><tbody>{prices.map((rule) => <tr key={rule.id}><td><strong>{rule.model === "*" ? "全部模型（默认）" : rule.model}</strong><small>{rule.id === "price-default" ? "始终生效" : formatTime(rule.effective_at)} · <span className="mono">{rule.id}</span></small></td><td>¥ {rule.cache_hit_cny_per_million.toFixed(4)}</td><td>¥ {rule.cache_miss_cny_per_million.toFixed(4)}</td><td>¥ {rule.output_cny_per_million.toFixed(4)}</td><td><button className="icon-button small danger-icon" title="删除价格版本" disabled={deleting === rule.id} onClick={() => remove(rule)}><Trash2 size={15} /></button></td></tr>)}</tbody></table>{!prices.length && <Empty label="暂无价格版本，新请求费用将无法估算" />}</div></section>;
 }
 
 function Overview({ stats, accounts, usage }: { stats: Stats; accounts: Account[]; usage: RequestEvent[] }) {
@@ -323,7 +383,7 @@ function Overview({ stats, accounts, usage }: { stats: Stats; accounts: Account[
     <section className="metric-grid">
       <Metric icon={Activity} label="总请求" value={formatNumber(stats.requests)} detail={`${successRate.toFixed(1)}% 成功`} tone="green" />
       <Metric icon={Gauge} label="Token 总量" value={formatCompact(stats.total_tokens)} detail={`输入 ${formatCompact(stats.prompt_tokens)} · 输出 ${formatCompact(stats.completion_tokens)}`} tone="blue" />
-      <Metric icon={CircleDollarSign} label="预估费用" value={`¥ ${stats.estimated_cost_cny.toFixed(4)}`} detail="按当前配置价格" tone="amber" />
+      <Metric icon={CircleDollarSign} label="已估费用" value={`¥ ${stats.estimated_cost_cny.toFixed(4)}`} detail={stats.unpriced_requests ? `${formatNumber(stats.unpriced_requests)} 条无法估算` : "全部已绑定价格版本"} tone="amber" />
       <Metric icon={Server} label="健康账号" value={`${accounts.filter((a) => a.healthy).length} / ${accounts.length}`} detail={`${accounts.reduce((sum, a) => sum + a.active, 0)} 个活跃请求`} tone="red" />
     </section>
     <section className="overview-grid">
@@ -500,13 +560,20 @@ function Usage({ events, summary, onApply, onExport }: { events: RequestEvent[];
   const exportCSV = async () => { setBusy(true); setError(""); try { await onExport(query("10000")); } catch (err) { setError(err instanceof Error ? err.message : "导出失败"); } finally { setBusy(false); } };
   const successRate = summary?.requests ? (summary.successes / summary.requests) * 100 : 0;
   const maxRequests = Math.max(...(summary?.daily ?? []).map((item) => item.requests), 1);
-  return <div className="usage-stack"><section className="panel"><PanelHead title="用量汇总" subtitle={summary ? `${summary.start.slice(0, 10)} 至 ${inclusiveEndDate(summary.end)}` : "选择时间范围查看"} action={<button className="secondary" onClick={exportCSV} disabled={busy}><Download size={15} />{busy ? "正在导出" : "导出 CSV"}</button>} /><form className="usage-filters" onSubmit={submit}><label>开始日期<input type="date" value={start} onChange={(e) => setStart(e.target.value)} /></label><label>结束日期<input type="date" value={end} onChange={(e) => setEnd(e.target.value)} /></label><label>租户 ID<input value={tenant} onChange={(e) => setTenant(e.target.value)} placeholder="全部租户" /></label><label>模型<input value={model} onChange={(e) => setModel(e.target.value)} placeholder="全部模型" /></label><button className="primary">应用筛选</button></form>{error && <p className="form-error usage-error">{error}</p>}{summary && <><div className="summary-grid"><Metric icon={Activity} label="请求数" value={formatNumber(summary.requests)} detail={`${successRate.toFixed(1)}% 成功`} tone="green" /><Metric icon={Gauge} label="Token" value={formatCompact(summary.total_tokens)} detail={`输入 ${formatCompact(summary.prompt_tokens)} · 输出 ${formatCompact(summary.completion_tokens)}`} tone="blue" /><Metric icon={CircleDollarSign} label="预估费用" value={`¥ ${summary.estimated_cost_cny.toFixed(4)}`} detail="按当前价格配置" tone="amber" /><Metric icon={AlertCircle} label="失败请求" value={formatNumber(summary.errors)} detail="需关注上游状态" tone="red" /></div><div className="usage-chart"><div className="chart-head"><strong>每日趋势</strong><span>请求数 / Token</span></div><div className="chart-bars">{summary.daily.length ? summary.daily.map((item) => <div className="chart-bar" key={item.date} title={`${item.date} · ${item.requests} 请求 · ${formatCompact(item.total_tokens)} Token`}><div className="bar-column" style={{ height: `${Math.max(6, (item.requests / maxRequests) * 100)}%` }} /><small>{item.date.slice(5)}</small></div>) : <Empty label="所选范围暂无请求" />}</div></div><div className="ranking-grid"><Ranking title="租户排行" items={summary.by_tenant} /><Ranking title="模型排行" items={summary.by_model} /></div></>}</section><section className="panel"><PanelHead title="请求事件" subtitle={`当前显示 ${events.length} 条记录`} /><RequestTable events={events} /></section></div>;
+  return <div className="usage-stack"><section className="panel"><PanelHead title="用量汇总" subtitle={summary ? `${summary.start.slice(0, 10)} 至 ${inclusiveEndDate(summary.end)}` : "选择时间范围查看"} action={<button className="secondary" onClick={exportCSV} disabled={busy}><Download size={15} />{busy ? "正在导出" : "导出 CSV"}</button>} /><form className="usage-filters" onSubmit={submit}><label>开始日期<input type="date" value={start} onChange={(e) => setStart(e.target.value)} /></label><label>结束日期<input type="date" value={end} onChange={(e) => setEnd(e.target.value)} /></label><label>租户 ID<input value={tenant} onChange={(e) => setTenant(e.target.value)} placeholder="全部租户" /></label><label>模型<input value={model} onChange={(e) => setModel(e.target.value)} placeholder="全部模型" /></label><button className="primary">应用筛选</button></form>{error && <p className="form-error usage-error">{error}</p>}{summary && <><div className="summary-grid"><Metric icon={Activity} label="请求数" value={formatNumber(summary.requests)} detail={`${successRate.toFixed(1)}% 成功`} tone="green" /><Metric icon={Gauge} label="Token" value={formatCompact(summary.total_tokens)} detail={`输入 ${formatCompact(summary.prompt_tokens)} · 输出 ${formatCompact(summary.completion_tokens)}`} tone="blue" /><Metric icon={CircleDollarSign} label="已估费用" value={`¥ ${summary.estimated_cost_cny.toFixed(4)}`} detail={summary.unpriced_requests ? `${formatNumber(summary.unpriced_requests)} 条无法估算` : "全部已绑定价格版本"} tone="amber" /><Metric icon={AlertCircle} label="失败请求" value={formatNumber(summary.errors)} detail="需关注上游状态" tone="red" /></div><div className="usage-chart"><div className="chart-head"><strong>每日趋势</strong><span>请求数 / Token</span></div><div className="chart-bars">{summary.daily.length ? summary.daily.map((item) => <div className="chart-bar" key={item.date} title={`${item.date} · ${item.requests} 请求 · ${formatCompact(item.total_tokens)} Token${item.unpriced_requests ? ` · ${item.unpriced_requests} 条无法估算` : ""}`}><div className="bar-column" style={{ height: `${Math.max(6, (item.requests / maxRequests) * 100)}%` }} /><small>{item.date.slice(5)}</small></div>) : <Empty label="所选范围暂无请求" />}</div></div><div className="ranking-grid"><Ranking title="租户排行" items={summary.by_tenant} /><Ranking title="模型排行" items={summary.by_model} /></div></>}</section><section className="panel"><PanelHead title="请求事件" subtitle={`当前显示 ${events.length} 条记录`} /><RequestTable events={events} /></section></div>;
 }
 
-function Ranking({ title, items }: { title: string; items: UsageBreakdown[] }) { return <div className="ranking"><strong>{title}</strong>{items.length ? items.slice(0, 5).map((item) => <div key={item.id}><span title={item.id}>{item.id || "未标识"}</span><b>{formatCompact(item.total_tokens)}</b><small>¥ {item.estimated_cost_cny.toFixed(4)}</small></div>) : <Empty label="暂无数据" />}</div>; }
+function Ranking({ title, items }: { title: string; items: UsageBreakdown[] }) { return <div className="ranking"><strong>{title}</strong>{items.length ? items.slice(0, 5).map((item) => <div key={item.id}><span title={item.id}>{item.id || "未标识"}</span><b>{formatCompact(item.total_tokens)}</b><small>¥ {item.estimated_cost_cny.toFixed(4)}{item.unpriced_requests ? ` · ${item.unpriced_requests} 条未估` : ""}</small></div>) : <Empty label="暂无数据" />}</div>; }
 
 function RequestTable({ events, compact = false }: { events: RequestEvent[]; compact?: boolean }) {
-  return <div className={`table-wrap request-table ${compact ? "compact" : ""}`}><table><thead><tr><th>时间 / 请求</th><th>租户</th><th>模型</th><th>状态</th><th>Token</th>{!compact && <><th>最终上游 / 尝试</th><th>首字节</th><th>费用</th></>}</tr></thead><tbody>{events.map((e) => <tr key={e.request_id}><td><span>{formatTime(e.created_at)}</span><small className="mono">{e.request_id.slice(0, 10)}</small></td><td>{e.tenant_id || "-"}</td><td>{e.model || "-"}</td><td><Status ok={e.status >= 200 && e.status < 400} label={String(e.status)} /></td><td>{formatNumber(e.usage.total_tokens)}</td>{!compact && <><td><span>{e.account_id || "-"}</span><small>{Math.max(e.attempts || 1, 1)} 次尝试</small></td><td>{e.first_byte_ms} ms</td><td>¥ {e.estimated_cost_cny.toFixed(5)}</td></>}</tr>)}</tbody></table>{!events.length && <Empty label="暂无请求记录" />}</div>;
+  return <div className={`table-wrap request-table ${compact ? "compact" : ""}`}><table><thead><tr><th>时间 / 请求</th><th>租户</th><th>模型</th><th>状态</th><th>Token</th>{!compact && <><th>最终上游 / 尝试</th><th>首字节</th><th>费用</th></>}</tr></thead><tbody>{events.map((e) => <tr key={e.request_id}><td><span>{formatTime(e.created_at)}</span><small className="mono">{e.request_id.slice(0, 10)}</small></td><td>{e.tenant_id || "-"}</td><td>{e.model || "-"}</td><td><Status ok={e.status >= 200 && e.status < 400} label={String(e.status)} /></td><td>{formatNumber(e.usage.total_tokens)}</td>{!compact && <><td><span>{e.account_id || "-"}</span><small>{Math.max(e.attempts || 1, 1)} 次尝试</small></td><td>{e.first_byte_ms} ms</td><td><PriceValue event={e} /></td></>}</tr>)}</tbody></table>{!events.length && <Empty label="暂无请求记录" />}</div>;
+}
+
+function PriceValue({ event }: { event: RequestEvent }) {
+  if (event.price_status === "estimated" || event.price_status === "legacy" || !event.price_status) {
+    return <><span>¥ {event.estimated_cost_cny.toFixed(5)}</span><small title={event.price_rule_id || "历史全局配置"}>{event.price_rule_id || "历史配置"}</small></>;
+  }
+  return <span className="price-missing" title={event.price_status === "missing" ? "该模型在请求发生时间没有匹配的价格版本" : "上游响应没有返回 usage"}>{event.price_status === "missing" ? "缺少价格" : "无 usage"}</span>;
 }
 
 function Balances({ snapshots, accounts, onFilter }: { snapshots: BalanceSnapshot[]; accounts: Account[]; onFilter: (query: string) => void }) {
@@ -540,4 +607,5 @@ function formatTime(value?: string) { if (!value || value.startsWith("0001-")) r
 function recentUsageQuery() { const end = new Date(); const start = new Date(end); start.setUTCDate(start.getUTCDate() - 6); return `limit=100&start=${start.toISOString().slice(0, 10)}&end=${end.toISOString().slice(0, 10)}`; }
 function inclusiveEndDate(value: string) { const end = new Date(value); end.setUTCDate(end.getUTCDate() - 1); return end.toISOString().slice(0, 10); }
 function numberOrZero(value: string) { return value ? Number(value) : 0; }
+function localDateTimeInput() { const value = new Date(); value.setMinutes(value.getMinutes() - value.getTimezoneOffset()); return value.toISOString().slice(0, 16); }
 function quotaText(q: QuotaPolicy) { const parts = []; if (q.requests_per_minute) parts.push(`${q.requests_per_minute} RPM`); if (q.concurrent_requests) parts.push(`${q.concurrent_requests} 并发`); if (q.daily_tokens) parts.push(`${formatCompact(q.daily_tokens)} Token/日`); if (q.daily_cost_cny) parts.push(`¥${q.daily_cost_cny}/日`); return parts.join(" · ") || "不限"; }

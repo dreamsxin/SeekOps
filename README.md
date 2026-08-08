@@ -69,7 +69,7 @@ SQLite 数据和本地主密钥分别保存在 `seekops-data` 命名卷的 `/dat
 - `SQLITE_PATH`：SQLite 文件路径，默认 `data/seekops.db`；设置为 `:memory:` 可关闭持久化
 - `SECRETS_MASTER_KEY_FILE`：AES-256-GCM 本地主密钥文件，默认与 SQLite 同目录、文件名为 `seekops.key`；首次启动自动生成
 - `SECRETS_MASTER_KEY`：Base64 或 64 位十六进制编码的 32 字节外部主密钥；设置后优先于本地密钥文件，不能在控制台轮换
-- `PRICE_INPUT_HIT_CNY_PER_MILLION`、`PRICE_INPUT_MISS_CNY_PER_MILLION`、`PRICE_OUTPUT_CNY_PER_MILLION`：MVP 估算价格，默认分别为 `0.02`、`1`、`2`
+- `PRICE_INPUT_HIT_CNY_PER_MILLION`、`PRICE_INPUT_MISS_CNY_PER_MILLION`、`PRICE_OUTPUT_CNY_PER_MILLION`：首次运行时生成全模型默认价格版本，默认分别为 `0.02`、`1`、`2`；之后可在设置页按模型新增带生效时间的价格版本
 - `BALANCE_POLL_INTERVAL`：上游余额轮询间隔，默认 `5m`
 
 示例：
@@ -94,6 +94,7 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `GET /admin/usage`：查询持久化用量事件，支持 `tenant_id`、`virtual_key_id`、`account_id`、`model`、`limit` 参数
 - `GET /admin/usage/summary`：查询时间范围用量汇总、每日趋势和租户/密钥/模型/账号排行；支持 `start`、`end`（包含结束日期）、`tenant_id`、`virtual_key_id`、`account_id`、`model`
 - `GET /admin/usage/export`：按同样筛选条件导出 UTF-8 CSV，最多导出 10000 条记录
+- `GET /admin/prices`、`POST /admin/prices`、`DELETE /admin/prices/{id}`：查看、新增和删除模型价格版本；历史请求保存价格版本与费用结果，不会因后续改价而重算
 - `GET /admin/accounts`：列出环境变量账号和 SQLite 托管账号
 - `POST /admin/accounts`：创建 SQLite 托管的上游账号
 - `PUT /admin/accounts/{id}`：更新或启停托管账号，`api_key` 留空时保留原值

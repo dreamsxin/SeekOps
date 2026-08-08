@@ -159,7 +159,7 @@ func TestAccountAPITestModelsAndChat(t *testing.T) {
 	}
 }
 
-func TestSQLiteMigratesUsageAttempts(t *testing.T) {
+func TestSQLiteMigratesUsageMetadata(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	legacy, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -208,8 +208,9 @@ func TestSQLiteMigratesUsageAttempts(t *testing.T) {
 	}
 	defer db.Close()
 	var attempts int
-	if err := db.QueryRow(`SELECT attempts FROM usage_events WHERE request_id = 'legacy'`).Scan(&attempts); err != nil || attempts != 1 {
-		t.Fatalf("attempts=%d err=%v", attempts, err)
+	var priceRuleID, priceStatus string
+	if err := db.QueryRow(`SELECT attempts, price_rule_id, price_status FROM usage_events WHERE request_id = 'legacy'`).Scan(&attempts, &priceRuleID, &priceStatus); err != nil || attempts != 1 || priceRuleID != "" || priceStatus != "legacy" {
+		t.Fatalf("attempts=%d price_rule_id=%q price_status=%q err=%v", attempts, priceRuleID, priceStatus, err)
 	}
 }
 

@@ -134,6 +134,8 @@ type RequestStats struct {
 	FirstByteMS      int64     `json:"first_byte_ms"`
 	Usage            Usage     `json:"usage"`
 	UsageStatus      string    `json:"usage_status"`
+	PriceRuleID      string    `json:"price_rule_id,omitempty"`
+	PriceStatus      string    `json:"price_status"`
 	EstimatedCostCNY float64   `json:"estimated_cost_cny"`
 	CreatedAt        time.Time `json:"created_at"`
 }
@@ -498,6 +500,7 @@ type Stats struct {
 	CacheHitTokens   int64          `json:"cache_hit_tokens"`
 	CacheMissTokens  int64          `json:"cache_miss_tokens"`
 	EstimatedCostCNY float64        `json:"estimated_cost_cny"`
+	UnpricedRequests int64          `json:"unpriced_requests"`
 	LastRequests     []RequestStats `json:"last_requests"`
 }
 
@@ -531,6 +534,9 @@ func (r *Recorder) Record(event RequestStats) {
 	r.stats.CacheHitTokens += event.Usage.CacheHitTokens
 	r.stats.CacheMissTokens += event.Usage.CacheMissTokens
 	r.stats.EstimatedCostCNY += event.EstimatedCostCNY
+	if event.PriceStatus == "missing" || event.PriceStatus == "usage_missing" {
+		r.stats.UnpricedRequests++
+	}
 	r.latest = append([]RequestStats{event}, r.latest...)
 	if len(r.latest) > 50 {
 		r.latest = r.latest[:50]
@@ -569,6 +575,7 @@ type Server struct {
 	config     Config
 	recorder   *Recorder
 	keys       *KeyStore
+	prices     *PriceStore
 	proxy      *httputil.ReverseProxy
 	transport  http.RoundTripper
 	server     *http.Server
@@ -594,9 +601,7 @@ type requestMeta struct {
 	path      string
 	started   time.Time
 	recorder  *Recorder
-	priceHit  float64
-	priceMiss float64
-	priceOut  float64
+	prices    *PriceStore
 	firstByte atomic.Int64
 	status    atomic.Int64
 	attempts  atomic.Int64
@@ -911,6 +916,10 @@ func NewServerChecked(cfg Config) (*Server, error) {
 			return nil, fmt.Errorf("load virtual keys: %w", err)
 		}
 	}
+	prices, err := NewPriceStore(cfg.DB, cfg.PriceInputHit, cfg.PriceInputMiss, cfg.PriceOutput)
+	if err != nil {
+		return nil, fmt.Errorf("load price rules: %w", err)
+	}
 	recorder := NewRecorder()
 	accounts := mergeAccounts(cfg.Accounts, nil)
 	if cfg.DB != nil {
@@ -933,7 +942,7 @@ func NewServerChecked(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load admin key: %w", err)
 	}
-	s := &Server{config: cfg, keys: keys, recorder: recorder, transport: http.DefaultTransport, adminKey: adminKey, accounts: accounts}
+	s := &Server{config: cfg, keys: keys, prices: prices, recorder: recorder, transport: http.DefaultTransport, adminKey: adminKey, accounts: accounts}
 	s.proxy = &httputil.ReverseProxy{Director: s.director, Transport: &failoverTransport{server: s, base: s.transport}, ModifyResponse: s.modifyResponse, ErrorHandler: s.errorHandler, FlushInterval: -1}
 	s.server = &http.Server{Addr: cfg.ListenAddr, Handler: s, ReadHeaderTimeout: 10 * time.Second}
 	return s, nil
@@ -992,7 +1001,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	requestID := newID()
-	meta := &requestMeta{requestID: requestID, principal: principal, account: account, model: model, keys: s.keys, path: r.URL.Path, started: time.Now(), recorder: s.recorder, priceHit: s.config.PriceInputHit, priceMiss: s.config.PriceInputMiss, priceOut: s.config.PriceOutput}
+	meta := &requestMeta{requestID: requestID, principal: principal, account: account, model: model, keys: s.keys, prices: s.prices, path: r.URL.Path, started: time.Now(), recorder: s.recorder}
 	meta.attempts.Store(1)
 	account.active.Add(1)
 	defer func() { meta.account.active.Add(-1) }()
@@ -1239,10 +1248,23 @@ func recordMeta(meta *requestMeta) {
 	if status == 0 {
 		status = 502
 	}
-	cost := (float64(usage.CacheHitTokens)/1e6)*meta.priceHit + (float64(usage.CacheMissTokens)/1e6)*meta.priceMiss + (float64(usage.CompletionTokens)/1e6)*meta.priceOut
 	usageStatus := "missing"
 	if usage.UsagePresent {
 		usageStatus = "complete"
+	}
+	cost := float64(0)
+	priceRuleID := ""
+	priceStatus := "usage_missing"
+	if usage.UsagePresent && meta.prices != nil {
+		if rule, ok := meta.prices.Resolve(model, meta.started); ok {
+			priceRuleID = rule.ID
+			priceStatus = "estimated"
+			cost = (float64(usage.CacheHitTokens)/1e6)*rule.CacheHitCNYPerMillion +
+				(float64(usage.CacheMissTokens)/1e6)*rule.CacheMissCNYPerMillion +
+				(float64(usage.CompletionTokens)/1e6)*rule.OutputCNYPerMillion
+		} else {
+			priceStatus = "missing"
+		}
 	}
 	first := meta.firstByte.Load()
 	if first == 0 {
@@ -1253,7 +1275,7 @@ func recordMeta(meta *requestMeta) {
 		tenantID = meta.principal.TenantID
 		virtualKeyID = meta.principal.ID
 	}
-	meta.recorder.Record(RequestStats{RequestID: meta.requestID, TenantID: tenantID, VirtualKeyID: virtualKeyID, AccountID: meta.account.ID, Attempts: int(meta.attempts.Load()), Model: model, Path: meta.path, Status: status, DurationMS: time.Since(meta.started).Milliseconds(), FirstByteMS: first, Usage: usage, UsageStatus: usageStatus, EstimatedCostCNY: cost, CreatedAt: meta.started})
+	meta.recorder.Record(RequestStats{RequestID: meta.requestID, TenantID: tenantID, VirtualKeyID: virtualKeyID, AccountID: meta.account.ID, Attempts: int(meta.attempts.Load()), Model: model, Path: meta.path, Status: status, DurationMS: time.Since(meta.started).Milliseconds(), FirstByteMS: first, Usage: usage, UsageStatus: usageStatus, PriceRuleID: priceRuleID, PriceStatus: priceStatus, EstimatedCostCNY: cost, CreatedAt: meta.started})
 	if meta.keys != nil && meta.principal != nil {
 		meta.keys.RecordUsage(meta.principal.ID, usage.TotalTokens, cost, time.Now())
 	}
@@ -1274,6 +1296,10 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(r.URL.Path, "/admin/security") {
 		s.handleSecurity(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/admin/prices") {
+		s.handlePrices(w, r)
 		return
 	}
 	if r.URL.Path == "/admin/client-config" {

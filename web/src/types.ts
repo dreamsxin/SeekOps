@@ -21,6 +21,8 @@ export interface RequestEvent {
   first_byte_ms: number;
   usage: Usage;
   usage_status: string;
+  price_rule_id?: string;
+  price_status: "estimated" | "missing" | "usage_missing" | "legacy";
   estimated_cost_cny: number;
   created_at: string;
 }
@@ -32,6 +34,7 @@ export interface UsageBucket {
   errors: number;
   total_tokens: number;
   estimated_cost_cny: number;
+  unpriced_requests: number;
 }
 
 export interface UsageBreakdown {
@@ -41,6 +44,7 @@ export interface UsageBreakdown {
   errors: number;
   total_tokens: number;
   estimated_cost_cny: number;
+  unpriced_requests: number;
 }
 
 export interface UsageSummary {
@@ -55,6 +59,7 @@ export interface UsageSummary {
   cache_hit_tokens: number;
   cache_miss_tokens: number;
   estimated_cost_cny: number;
+  unpriced_requests: number;
   daily: UsageBucket[];
   by_tenant: UsageBreakdown[];
   by_virtual_key: UsageBreakdown[];
@@ -72,7 +77,26 @@ export interface Stats {
   cache_hit_tokens: number;
   cache_miss_tokens: number;
   estimated_cost_cny: number;
+  unpriced_requests: number;
   last_requests: RequestEvent[];
+}
+
+export interface PriceRule {
+  id: string;
+  model: string;
+  cache_hit_cny_per_million: number;
+  cache_miss_cny_per_million: number;
+  output_cny_per_million: number;
+  effective_at: string;
+  created_at: string;
+}
+
+export interface PriceRuleInput {
+  model: string;
+  cache_hit_cny_per_million: number;
+  cache_miss_cny_per_million: number;
+  output_cny_per_million: number;
+  effective_at: string;
 }
 
 export interface AdminSetupStatus {
