@@ -241,3 +241,29 @@ export interface AlertSettings {
   error_rate_window_minutes: number;
   silence_minutes: number;
 }
+
+export interface AuditLog {
+  id: number;
+  actor: string;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  summary: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface BackupComponent {
+  ok: boolean;
+  detail: string;
+  path?: string;
+  key_id?: string;
+}
+
+export interface BackupCheckResult {
+  ok: boolean;
+  checked_at: string;
+  sqlite: BackupComponent;
+  secrets: BackupComponent;
+  issues: string[];
+}

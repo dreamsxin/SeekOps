@@ -88,6 +88,9 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `POST /admin/admin-key`：在已认证状态下轮换管理员 API Key，JSON 格式为 `{"api_key":"..."}`
 - `GET /admin/security`：查询 SQLite 凭据加密状态、主密钥 ID 和密钥文件位置
 - `POST /admin/security/rotate`：轮换本地主密钥并重新加密全部 SQLite 凭据；外部主密钥模式不支持
+- `GET /admin/audit-logs`：查询持久化管理操作，支持 `action`、`resource_type`、`resource_id` 和 `limit` 参数；记录不包含明文密钥
+- `GET /admin/backups/check`：检查 SQLite 结构、主密钥文件及已存凭据能否使用当前密钥解密
+- `GET /admin/backups/download`：下载一致性 SQLite、备份清单和本地主密钥组成的 ZIP；外部主密钥模式仅写入恢复要求
 - `GET /metrics`：Prometheus 文本指标
 - `GET /admin/stats`：管理统计，需要 `X-Admin-Key` 或管理员 Bearer Token
 - `GET /admin/client-config`：获取当前 OpenAI/Anthropic Base URL 和平台 API Key，需要管理员认证
@@ -125,13 +128,15 @@ Chat、Responses 和 Anthropic Messages JSON 请求体在 MVP 中限制为 32 Mi
 
 ## 备份与恢复
 
-默认部署必须把 `data/seekops.db` 和 `data/seekops.key` 作为一组备份。只备份数据库无法恢复上游和租户凭据；密钥文件缺失或不匹配时服务会拒绝启动，避免以空凭据或错误状态继续运行。
+默认部署必须把 `data/seekops.db` 和 `data/seekops.key` 作为一组备份。只备份数据库无法恢复上游和租户凭据；密钥文件缺失或不匹配时服务会拒绝启动，避免以空凭据或错误状态继续运行。推荐在控制台“设置 > 备份与恢复检查”确认恢复条件后下载完整 ZIP，服务会通过 SQLite `VACUUM INTO` 生成一致性快照。
 
-1. 停止服务或先执行 SQLite 一致性备份。
-2. 同时复制 `seekops.db`、`seekops.db-wal`（如存在）、`seekops.db-shm`（如存在）和 `seekops.key`，并限制备份访问权限。
-3. 恢复时把数据库和对应的密钥文件放回配置路径，再启动服务并检查设置页的主密钥 ID。
+1. 在设置页确认 SQLite 与主密钥两项检查均通过，点击“下载完整备份”。
+2. 妥善保存 ZIP；其中包含 `seekops.db`、`manifest.json`，本地主密钥模式还包含 `seekops.key`。
+3. 恢复时停止服务，将数据库和对应密钥放回配置路径，再启动服务并重新执行恢复检查。
 
-控制台“设置”页可以轮换本地文件型主密钥。轮换会先保留旧密钥、重写所有凭据，成功后再移除旧密钥；轮换完成后应立即创建一组新的数据库与密钥文件备份。使用 `SECRETS_MASTER_KEY` 时，主密钥生命周期由外部部署系统负责，切换值之前必须完成数据重加密，当前版本不会从控制台轮换该模式。
+使用 `SECRETS_MASTER_KEY` 的部署不会把外部主密钥写入 ZIP，`manifest.json` 会标记恢复时必须提供相同的环境变量。需要手工文件备份时，应先停止服务，再同时复制 SQLite、WAL/SHM（如存在）和密钥文件。
+
+控制台“设置”页可以轮换本地文件型主密钥。轮换会先保留旧密钥、重写所有凭据，成功后再移除旧密钥；轮换完成后应立即下载新的完整备份。使用 `SECRETS_MASTER_KEY` 时，主密钥生命周期由外部部署系统负责，切换值之前必须完成数据重加密，当前版本不会从控制台轮换该模式。
 
 管理控制台源码位于 `web/`，生产构建会写入 `internal/proxy/web/` 并嵌入 Go 二进制：
 

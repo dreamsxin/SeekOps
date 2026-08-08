@@ -588,12 +588,14 @@ type Server struct {
 	keys       *KeyStore
 	prices     *PriceStore
 	alerts     *AlertStore
+	audit      *AuditStore
 	proxy      *httputil.ReverseProxy
 	transport  http.RoundTripper
 	server     *http.Server
 	sequence   atomic.Uint64
 	adminMu    sync.RWMutex
 	adminKey   *adminKeyCredential
+	backupMu   sync.Mutex
 	accountsMu sync.RWMutex
 	accounts   []*Account
 }
@@ -959,7 +961,7 @@ func NewServerChecked(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load admin key: %w", err)
 	}
-	s := &Server{config: cfg, keys: keys, prices: prices, alerts: alerts, recorder: recorder, transport: http.DefaultTransport, adminKey: adminKey, accounts: accounts}
+	s := &Server{config: cfg, keys: keys, prices: prices, alerts: alerts, audit: NewAuditStore(cfg.DB), recorder: recorder, transport: http.DefaultTransport, adminKey: adminKey, accounts: accounts}
 	s.proxy = &httputil.ReverseProxy{Director: s.director, Transport: &failoverTransport{server: s, base: s.transport}, ModifyResponse: s.modifyResponse, ErrorHandler: s.errorHandler, FlushInterval: -1}
 	s.server = &http.Server{Addr: cfg.ListenAddr, Handler: s, ReadHeaderTimeout: 10 * time.Second}
 	return s, nil
@@ -1325,6 +1327,14 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 		s.handleSecurity(w, r)
 		return
 	}
+	if r.URL.Path == "/admin/audit-logs" {
+		s.handleAuditLogs(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/admin/backups") {
+		s.handleBackups(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/admin/prices") {
 		s.handlePrices(w, r)
 		return
@@ -1397,6 +1407,9 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
+		if s.audit != nil {
+			s.audit.Record("virtual_key_created", "virtual_key", view.ID, "创建租户密钥", virtualKeyAuditMetadata(view), time.Now())
+		}
 		writeJSON(w, http.StatusCreated, map[string]any{"key": view, "secret": secret})
 		return
 	}
@@ -1428,6 +1441,9 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 		if s.alerts != nil {
 			s.alerts.EvaluateQuota(view, time.Now())
 		}
+		if s.audit != nil {
+			s.audit.Record("virtual_key_updated", "virtual_key", view.ID, "更新租户密钥配置", virtualKeyAuditMetadata(view), time.Now())
+		}
 		writeJSON(w, http.StatusOK, view)
 		return
 	}
@@ -1442,6 +1458,9 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, status, map[string]any{"error": err.Error()})
 			return
 		}
+		if s.audit != nil {
+			s.audit.Record("virtual_key_rotated", "virtual_key", view.ID, "轮换租户密钥", virtualKeyAuditMetadata(view), time.Now())
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"key": view, "secret": secret})
 		return
 	}
@@ -1453,6 +1472,9 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.alerts != nil {
 			s.alerts.ResolveScope("virtual_key", id, time.Now())
+		}
+		if s.audit != nil {
+			s.audit.Record("virtual_key_revoked", "virtual_key", id, "撤销租户密钥", nil, time.Now())
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"id": id, "revoked": true})
 		return

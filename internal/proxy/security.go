@@ -3,6 +3,7 @@ package proxy
 import (
 	"fmt"
 	"net/http"
+	"time"
 )
 
 type SecurityStatus struct {
@@ -54,9 +55,18 @@ func (s *Server) handleSecurity(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "master key rotation requires SQLite and a local key file"})
 		return
 	}
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+	previousKeyID := s.config.SecretCipher.CurrentID()
 	if err := s.config.SecretCipher.Rotate(s.reencryptStoredSecrets); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "rotate master key failed"})
 		return
+	}
+	if s.audit != nil {
+		s.audit.Record("master_key_rotated", "security", "", "轮换凭据主密钥", map[string]any{
+			"previous_key_id": previousKeyID,
+			"key_id":          s.config.SecretCipher.CurrentID(),
+		}, time.Now())
 	}
 	writeJSON(w, http.StatusOK, s.securityStatus())
 }

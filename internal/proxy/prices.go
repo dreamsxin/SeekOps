@@ -177,6 +177,13 @@ func (s *Server) handlePrices(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 				return
 			}
+			if s.audit != nil {
+				s.audit.Record("price_rule_created", "price_rule", rule.ID, "创建模型价格规则", map[string]any{
+					"model": rule.Model, "cache_hit_cny_per_million": rule.CacheHitCNYPerMillion,
+					"cache_miss_cny_per_million": rule.CacheMissCNYPerMillion, "output_cny_per_million": rule.OutputCNYPerMillion,
+					"effective_at": rule.EffectiveAt,
+				}, time.Now())
+			}
 			writeJSON(w, http.StatusCreated, rule)
 		default:
 			w.Header().Set("Allow", "GET, POST")
@@ -202,6 +209,9 @@ func (s *Server) handlePrices(w http.ResponseWriter, r *http.Request) {
 	if !deleted {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "price rule not found"})
 		return
+	}
+	if s.audit != nil {
+		s.audit.Record("price_rule_deleted", "price_rule", id, "删除模型价格规则", nil, time.Now())
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "deleted": true})
 }

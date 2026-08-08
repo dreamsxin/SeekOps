@@ -14,6 +14,7 @@ import {
   EyeOff,
   FlaskConical,
   Gauge,
+  History,
   KeyRound,
   LogOut,
   Menu,
@@ -29,9 +30,9 @@ import {
   X,
 } from "lucide-react";
 import { api, auth } from "./api";
-import type { Account, AccountInput, AccountTestResult, AdminSetupStatus, Alert, AlertSettings, BalanceSnapshot, ClientConfig, PriceRule, PriceRuleInput, QuotaPolicy, RequestEvent, SecurityStatus, Stats, UsageBreakdown, UsageSummary, VirtualKey, VirtualKeyInput } from "./types";
+import type { Account, AccountInput, AccountTestResult, AdminSetupStatus, Alert, AlertSettings, AuditLog, BackupCheckResult, BalanceSnapshot, ClientConfig, PriceRule, PriceRuleInput, QuotaPolicy, RequestEvent, SecurityStatus, Stats, UsageBreakdown, UsageSummary, VirtualKey, VirtualKeyInput } from "./types";
 
-type View = "overview" | "accounts" | "alerts" | "access" | "keys" | "usage" | "balances" | "settings";
+type View = "overview" | "accounts" | "alerts" | "access" | "keys" | "usage" | "balances" | "audit" | "settings";
 
 const navItems: Array<{ id: View; label: string; icon: typeof Activity }> = [
   { id: "overview", label: "总览", icon: BarChart3 },
@@ -41,6 +42,7 @@ const navItems: Array<{ id: View; label: string; icon: typeof Activity }> = [
   { id: "keys", label: "租户密钥", icon: KeyRound },
   { id: "usage", label: "请求账本", icon: Activity },
   { id: "balances", label: "余额历史", icon: WalletCards },
+  { id: "audit", label: "操作记录", icon: History },
   { id: "settings", label: "设置", icon: Settings },
 ];
 
@@ -89,6 +91,8 @@ export function App() {
   const [prices, setPrices] = useState<PriceRule[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [alertSettings, setAlertSettings] = useState<AlertSettings>(initialAlertSettings);
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [backup, setBackup] = useState<BackupCheckResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
@@ -103,7 +107,7 @@ export function App() {
     setError("");
     try {
       const defaultUsageQuery = recentUsageQuery();
-      const [nextStats, nextAccounts, nextConfig, nextKeys, nextUsage, nextUsageSummary, nextBalances, nextSecurity, nextPrices, nextAlerts, nextAlertSettings] = await Promise.all([
+      const [nextStats, nextAccounts, nextConfig, nextKeys, nextUsage, nextUsageSummary, nextBalances, nextSecurity, nextPrices, nextAlerts, nextAlertSettings, nextAuditLogs, nextBackup] = await Promise.all([
         api.stats(),
         api.accounts(),
         api.clientConfig(),
@@ -115,6 +119,8 @@ export function App() {
         api.prices(),
         api.alerts(),
         api.alertSettings(),
+        api.auditLogs("limit=200"),
+        backup ? Promise.resolve(backup) : api.backupCheck(),
       ]);
       setStats(nextStats);
       setAccounts(nextAccounts);
@@ -127,6 +133,8 @@ export function App() {
       setPrices(nextPrices);
       setAlerts(nextAlerts);
       setAlertSettings(nextAlertSettings);
+      setAuditLogs(nextAuditLogs);
+      setBackup(nextBackup);
       if (!authorized && nextAccounts.length === 0) setView("accounts");
       setAuthorized(true);
     } catch (err) {
@@ -136,7 +144,7 @@ export function App() {
       setLoading(false);
       setChecking(false);
     }
-  }, [authorized]);
+  }, [authorized, backup]);
 
   useEffect(() => {
     api.setupStatus().then((status) => {
@@ -208,6 +216,7 @@ export function App() {
     keys: ["租户密钥", "凭据、配额与实时用量"],
     usage: ["请求账本", "持久化调用明细与 Token 用量"],
     balances: ["余额历史", "上游账号余额快照"],
+    audit: ["操作记录", "账号、租户密钥与安全设置变更"],
     settings: ["系统设置", "管理员访问凭据与本地运行配置"],
   };
   const openAlertCount = alerts.filter((item) => item.status === "open").length;
@@ -277,7 +286,15 @@ export function App() {
           {view === "keys" && <Keys keys={keys} onCreate={() => { setCreatedSecret(""); setCreateOpen(true); }} onEdit={setKeyEditor} />}
           {view === "usage" && <Usage events={usage} summary={usageSummary} onApply={async (query) => { setLoading(true); setError(""); try { const [nextSummary, nextUsage] = await Promise.all([api.usageSummary(query), api.usage(query)]); setUsageSummary(nextSummary); setUsage(nextUsage); } catch (err) { setError(err instanceof Error ? err.message : "加载用量失败"); } finally { setLoading(false); } }} onExport={api.exportUsage} />}
           {view === "balances" && <Balances snapshots={balances} accounts={accounts} onFilter={async (query) => { setLoading(true); try { setBalances(await api.balances(query)); } finally { setLoading(false); } }} />}
-          {view === "settings" && <SettingsPage security={security} prices={prices} onCreatePrice={async (body) => {
+          {view === "audit" && <AuditPage logs={auditLogs} />}
+          {view === "settings" && <SettingsPage security={security} backup={backup} prices={prices} onCheckBackup={async () => {
+            const next = await api.backupCheck();
+            setBackup(next);
+            return next;
+          }} onDownloadBackup={async () => {
+            await api.downloadBackup();
+            setAuditLogs(await api.auditLogs("limit=200"));
+          }} onCreatePrice={async (body) => {
             const created = await api.createPrice(body);
             setPrices((current) => [created, ...current].sort((a, b) => b.effective_at.localeCompare(a.effective_at)));
             return created;
@@ -328,7 +345,33 @@ function Login({ setup, value, onChange, onSubmit, error, loading }: { setup: bo
   return <div className="login-page"><div className="login-panel"><div className="brand login-brand"><BrandMark /><div><strong>SeekOps</strong><span>DeepSeek API Control Plane</span></div></div><div className="login-copy"><ShieldCheck size={30} /><h1>{setup ? "初始化管理员 Key" : "管理控制台"}</h1><p>{setup ? "首次运行，请设置管理 API Key。默认值为 admin，生产环境建议改为长随机字符串。" : "使用管理员 API Key 进入本地控制台。"}</p></div><form onSubmit={onSubmit}><label>管理员 API Key<input autoFocus type="password" value={value} onChange={(e) => onChange(e.target.value)} placeholder="admin" autoComplete={setup ? "new-password" : "current-password"} required /></label>{error && <p className="form-error">{error}</p>}<button className="primary full" disabled={loading}>{loading ? (setup ? "正在初始化" : "正在验证") : (setup ? "保存并进入" : "进入控制台")}</button></form></div></div>;
 }
 
-function SettingsPage({ security, prices, onCreatePrice, onDeletePrice, onRotateAdmin, onRotateMaster }: { security: SecurityStatus | null; prices: PriceRule[]; onCreatePrice: (value: PriceRuleInput) => Promise<PriceRule>; onDeletePrice: (id: string) => Promise<void>; onRotateAdmin: (value: string) => Promise<void>; onRotateMaster: () => Promise<SecurityStatus> }) {
+function AuditPage({ logs }: { logs: AuditLog[] }) {
+  const [action, setAction] = useState("");
+  const [resource, setResource] = useState("");
+  const actions = Array.from(new Set(logs.map((item) => item.action))).sort();
+  const resources = Array.from(new Set(logs.map((item) => item.resource_type))).sort();
+  const visible = logs.filter((item) => (!action || item.action === action) && (!resource || item.resource_type === resource));
+  return <section className="panel audit-panel">
+    <PanelHead title="管理操作" subtitle={`最近 ${logs.length} 条持久化记录`} action={<div className="filters audit-filters"><select aria-label="操作类型" value={action} onChange={(event) => setAction(event.target.value)}><option value="">全部操作</option>{actions.map((item) => <option key={item} value={item}>{auditActionLabel(item)}</option>)}</select><select aria-label="资源类型" value={resource} onChange={(event) => setResource(event.target.value)}><option value="">全部对象</option>{resources.map((item) => <option key={item} value={item}>{auditResourceLabel(item)}</option>)}</select></div>} />
+    <div className="table-wrap audit-table"><table><thead><tr><th>操作</th><th>对象</th><th>变更摘要</th><th>操作者</th><th>时间</th></tr></thead><tbody>{visible.map((item) => <tr key={item.id}><td><strong>{auditActionLabel(item.action)}</strong><small className="mono">{item.action}</small></td><td><strong>{auditResourceLabel(item.resource_type)}</strong><small className="mono">{item.resource_id || "-"}</small></td><td><span>{item.summary}</span><small>{auditMetadataSummary(item.metadata)}</small></td><td>{item.actor}</td><td>{formatTime(item.created_at)}</td></tr>)}</tbody></table>{!visible.length && <Empty label="暂无匹配的操作记录" />}</div>
+  </section>;
+}
+
+function auditActionLabel(action: string) {
+  return ({ account_created: "创建账号", account_updated: "更新账号", account_deleted: "删除账号", virtual_key_created: "创建租户密钥", virtual_key_updated: "更新租户密钥", virtual_key_rotated: "轮换租户密钥", virtual_key_revoked: "撤销租户密钥", admin_key_initialized: "初始化管理员 Key", admin_key_rotated: "轮换管理员 Key", master_key_rotated: "轮换主密钥", price_rule_created: "创建价格规则", price_rule_deleted: "删除价格规则", alert_settings_updated: "更新告警设置", alert_acknowledged: "确认告警", alert_silenced: "静默告警", alert_resolved: "恢复告警", backup_downloaded: "下载备份" } as Record<string, string>)[action] ?? action;
+}
+
+function auditResourceLabel(resource: string) {
+  return ({ account: "上游账号", virtual_key: "租户密钥", admin: "管理员凭据", security: "凭据加密", price_rule: "价格规则", alert_settings: "告警设置", alert: "告警", backup: "系统备份" } as Record<string, string>)[resource] ?? resource;
+}
+
+function auditMetadataSummary(metadata: Record<string, unknown>) {
+  const entries = Object.entries(metadata ?? {});
+  if (!entries.length) return "-";
+  return entries.map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : String(value)}`).join(" · ");
+}
+
+function SettingsPage({ security, backup, prices, onCheckBackup, onDownloadBackup, onCreatePrice, onDeletePrice, onRotateAdmin, onRotateMaster }: { security: SecurityStatus | null; backup: BackupCheckResult | null; prices: PriceRule[]; onCheckBackup: () => Promise<BackupCheckResult>; onDownloadBackup: () => Promise<void>; onCreatePrice: (value: PriceRuleInput) => Promise<PriceRule>; onDeletePrice: (id: string) => Promise<void>; onRotateAdmin: (value: string) => Promise<void>; onRotateMaster: () => Promise<SecurityStatus> }) {
   const [value, setValue] = useState("");
   const [adminBusy, setAdminBusy] = useState(false);
   const [masterBusy, setMasterBusy] = useState(false);
@@ -368,9 +411,33 @@ function SettingsPage({ security, prices, onCreatePrice, onDeletePrice, onRotate
   const storageLabel = security?.key_storage === "local_file" ? "本地密钥文件" : security?.key_storage === "external" ? "外部主密钥" : "未启用";
   return <div className="settings-stack">
     <section className="panel settings-panel"><PanelHead title="SQLite 凭据加密" subtitle="上游 API Key 与可恢复租户密钥" /><div className="security-content"><div className="security-state"><div className={`security-icon ${security?.encryption_enabled ? "ok" : "bad"}`}><ShieldCheck size={20} /></div><div><strong>{security?.encryption_enabled ? "AES-256-GCM 已启用" : "凭据加密未启用"}</strong><span>{storageLabel}</span></div></div><dl className="security-details"><div><dt>主密钥 ID</dt><dd><code>{security?.key_id || "-"}</code></dd></div><div><dt>密钥位置</dt><dd><code>{security?.key_file || (security?.key_storage === "external" ? "SECRETS_MASTER_KEY" : "-")}</code></dd></div></dl><p className="settings-note">备份 SQLite 时需同时备份密钥文件；缺失或不匹配时服务会拒绝启动。</p>{masterError && <p className="form-error">{masterError}</p>}{masterSaved && <p className="form-success">主密钥已轮换，SQLite 凭据已重新加密。</p>}<button className="secondary" disabled={masterBusy || !security?.rotation_supported} onClick={rotateMaster}><RefreshCw className={masterBusy ? "spin" : ""} size={15} />{masterBusy ? "正在轮换" : "轮换本地主密钥"}</button></div></section>
+    <BackupPanel backup={backup} onCheck={onCheckBackup} onDownload={onDownloadBackup} />
     <PriceSettings prices={prices} onCreate={onCreatePrice} onDelete={onDeletePrice} />
     <section className="panel settings-panel"><PanelHead title="管理员 API Key" subtitle="本地管理控制台访问凭据" /><form className="settings-form" onSubmit={submit}><label>新的管理员 API Key<input type="password" value={value} onChange={(e) => setValue(e.target.value)} placeholder="输入新的长随机字符串" required autoComplete="new-password" /></label><p className="settings-note">保存后旧 Key 会立即失效，当前浏览器会自动切换到新 Key。</p>{adminError && <p className="form-error">{adminError}</p>}{adminSaved && <p className="form-success">管理员 API Key 已更新。</p>}<button className="primary" disabled={adminBusy}>{adminBusy ? "正在保存" : "保存新 Key"}</button></form></section>
   </div>;
+}
+
+function BackupPanel({ backup, onCheck, onDownload }: { backup: BackupCheckResult | null; onCheck: () => Promise<BackupCheckResult>; onDownload: () => Promise<void> }) {
+  const [busy, setBusy] = useState<"check" | "download" | "">("");
+  const [error, setError] = useState("");
+  const [downloaded, setDownloaded] = useState(false);
+  const run = async (mode: "check" | "download") => {
+    setBusy(mode);
+    setError("");
+    setDownloaded(false);
+    try {
+      if (mode === "check") await onCheck();
+      else {
+        await onDownload();
+        setDownloaded(true);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "备份操作失败");
+    } finally {
+      setBusy("");
+    }
+  };
+  return <section className="panel backup-panel"><PanelHead title="备份与恢复检查" subtitle="SQLite 一致性快照与对应主密钥" /><div className="backup-content"><div className={`backup-summary ${backup?.ok ? "ok" : "bad"}`}><div className="security-icon">{backup?.ok ? <Check size={20} /> : <AlertCircle size={20} />}</div><div><strong>{backup?.ok ? "当前数据可备份恢复" : "恢复条件未满足"}</strong><span>{backup ? `检查于 ${formatTime(backup.checked_at)}` : "尚未检查"}</span></div></div><div className="backup-components"><div><span className={`status ${backup?.sqlite.ok ? "ok" : "bad"}`}><span />SQLite</span><strong>{backup?.sqlite.detail ?? "等待检查"}</strong></div><div><span className={`status ${backup?.secrets.ok ? "ok" : "bad"}`}><span />主密钥</span><strong>{backup?.secrets.detail ?? "等待检查"}</strong></div></div>{backup?.issues?.length ? <div className="backup-issues">{backup.issues.map((issue) => <p key={issue}><AlertCircle size={14} />{issue}</p>)}</div> : null}{error && <p className="form-error">{error}</p>}{downloaded && <p className="form-success">完整备份已下载。</p>}<div className="backup-actions"><button className="secondary" disabled={Boolean(busy)} onClick={() => run("check")}><RefreshCw className={busy === "check" ? "spin" : ""} size={15} />重新检查</button><button className="primary" disabled={Boolean(busy) || !backup?.ok} onClick={() => run("download")}><Download size={15} />{busy === "download" ? "正在生成" : "下载完整备份"}</button></div></div></section>;
 }
 
 function PriceSettings({ prices, onCreate, onDelete }: { prices: PriceRule[]; onCreate: (value: PriceRuleInput) => Promise<PriceRule>; onDelete: (id: string) => Promise<void> }) {

@@ -539,6 +539,16 @@ func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.refreshAlerts(time.Now())
+			if s.audit != nil {
+				s.audit.Record("alert_settings_updated", "alert_settings", "", "更新告警设置", map[string]any{
+					"balance_threshold_cny":        settings.BalanceThresholdCNY,
+					"quota_warning_percent":        settings.QuotaWarningPercent,
+					"error_rate_threshold_percent": settings.ErrorRateThresholdPercent,
+					"error_rate_min_requests":      settings.ErrorRateMinRequests,
+					"error_rate_window_minutes":    settings.ErrorRateWindowMinutes,
+					"silence_minutes":              settings.SilenceMinutes,
+				}, time.Now())
+			}
 			writeJSON(w, http.StatusOK, settings)
 		default:
 			w.Header().Set("Allow", "GET, PUT")
@@ -596,6 +606,12 @@ func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, status, map[string]any{"error": err.Error()})
 		return
+	}
+	if s.audit != nil {
+		action := map[string]string{"acknowledge": "alert_acknowledged", "silence": "alert_silenced", "resolve": "alert_resolved"}[parts[1]]
+		if action != "" {
+			s.audit.Record(action, "alert", item.ID, "更新告警状态", map[string]any{"status": item.Status}, time.Now())
+		}
 	}
 	writeJSON(w, http.StatusOK, item)
 }

@@ -141,6 +141,9 @@ func (s *Server) handleAdminSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.adminKey = credential
+	if s.audit != nil {
+		s.audit.Record("admin_key_initialized", "admin", "", "初始化管理员密钥", nil, time.Now())
+	}
 	writeJSON(w, http.StatusCreated, AdminSetupStatus{Initialized: true})
 }
 
@@ -174,5 +177,8 @@ func (s *Server) handleAdminKeyRotation(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.adminKey = credential
+	if s.audit != nil {
+		s.audit.Record("admin_key_rotated", "admin", "", "轮换管理员密钥", nil, time.Now())
+	}
 	writeJSON(w, http.StatusOK, AdminSetupStatus{Initialized: true})
 }

@@ -1,4 +1,4 @@
-import type { Account, AccountInput, AccountTestInput, AccountTestResult, AdminSetupStatus, Alert, AlertSettings, BalanceSnapshot, ClientConfig, PriceRule, PriceRuleInput, RequestEvent, SecurityStatus, Stats, UsageSummary, VirtualKey, VirtualKeyInput } from "./types";
+import type { Account, AccountInput, AccountTestInput, AccountTestResult, AdminSetupStatus, Alert, AlertSettings, AuditLog, BackupCheckResult, BalanceSnapshot, ClientConfig, PriceRule, PriceRuleInput, RequestEvent, SecurityStatus, Stats, UsageSummary, VirtualKey, VirtualKeyInput } from "./types";
 
 const keyName = "seekops.adminKey";
 
@@ -31,6 +31,26 @@ export const api = {
   rotateAdminKey: (api_key: string) => request<AdminSetupStatus>("/admin/admin-key", { method: "POST", body: JSON.stringify({ api_key }) }),
   security: () => request<SecurityStatus>("/admin/security"),
   rotateMasterKey: () => request<SecurityStatus>("/admin/security/rotate", { method: "POST" }),
+  auditLogs: (query = "") => request<AuditLog[]>(`/admin/audit-logs${query ? `?${query}` : ""}`),
+  backupCheck: () => request<BackupCheckResult>("/admin/backups/check"),
+  downloadBackup: async () => {
+    const response = await fetch("/admin/backups/download", { headers: { "X-Admin-Key": auth.get() } });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(payload?.error ?? `HTTP ${response.status}`);
+    }
+    const disposition = response.headers.get("Content-Disposition") ?? "";
+    const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] ?? "seekops-backup.zip";
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  },
   prices: () => request<PriceRule[]>("/admin/prices"),
   createPrice: (body: PriceRuleInput) => request<PriceRule>("/admin/prices", { method: "POST", body: JSON.stringify(body) }),
   deletePrice: (id: string) => request<{ id: string; deleted: boolean }>(`/admin/prices/${encodeURIComponent(id)}`, { method: "DELETE" }),

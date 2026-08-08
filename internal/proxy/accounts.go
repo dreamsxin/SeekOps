@@ -369,6 +369,9 @@ func (s *Server) createManagedAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	s.accounts = append(s.accounts, account)
 	s.accountsMu.Unlock()
+	if s.audit != nil {
+		s.audit.Record("account_created", "account", account.ID, "创建上游账号", accountAuditMetadata(account), time.Now())
+	}
 	if !account.Disabled {
 		s.pollAccountBalance(r.Context(), account)
 	}
@@ -403,6 +406,9 @@ func (s *Server) updateManagedAccount(w http.ResponseWriter, r *http.Request, id
 		}
 		s.accounts[index] = account
 		s.accountsMu.Unlock()
+		if s.audit != nil {
+			s.audit.Record("account_updated", "account", account.ID, "更新上游账号", accountAuditMetadata(account), time.Now())
+		}
 		if !account.Disabled {
 			s.pollAccountBalance(r.Context(), account)
 		} else if s.alerts != nil {
@@ -598,25 +604,31 @@ func truncateText(value string, limit int) string {
 
 func (s *Server) removeManagedAccount(w http.ResponseWriter, _ *http.Request, id string) {
 	s.accountsMu.Lock()
-	defer s.accountsMu.Unlock()
 	for index, current := range s.accounts {
 		if current.ID != id {
 			continue
 		}
 		if !current.Managed {
+			s.accountsMu.Unlock()
 			writeJSON(w, http.StatusConflict, map[string]any{"error": "environment account is read-only"})
 			return
 		}
 		if err := deleteManagedAccount(s.config.DB, id); err != nil {
+			s.accountsMu.Unlock()
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "delete account failed"})
 			return
 		}
 		s.accounts = append(s.accounts[:index], s.accounts[index+1:]...)
+		s.accountsMu.Unlock()
 		if s.alerts != nil {
 			s.alerts.ResolveScope("account", id, time.Now())
+		}
+		if s.audit != nil {
+			s.audit.Record("account_deleted", "account", id, "删除上游账号", nil, time.Now())
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"id": id, "deleted": true})
 		return
 	}
+	s.accountsMu.Unlock()
 	writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found"})
 }
