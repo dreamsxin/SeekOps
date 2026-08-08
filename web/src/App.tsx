@@ -6,26 +6,30 @@ import {
   Check,
   CircleDollarSign,
   Clipboard,
+  Eye,
+  EyeOff,
   Gauge,
   KeyRound,
   LogOut,
   Menu,
+  Pencil,
   RefreshCw,
   Server,
   Settings,
   ShieldCheck,
+  Trash2,
   WalletCards,
   X,
 } from "lucide-react";
 import { api, auth } from "./api";
-import type { Account, AdminSetupStatus, BalanceSnapshot, QuotaPolicy, RequestEvent, Stats, VirtualKey } from "./types";
+import type { Account, AccountInput, AdminSetupStatus, BalanceSnapshot, ClientConfig, QuotaPolicy, RequestEvent, Stats, VirtualKey } from "./types";
 
 type View = "overview" | "accounts" | "keys" | "usage" | "balances" | "settings";
 
 const navItems: Array<{ id: View; label: string; icon: typeof Activity }> = [
   { id: "overview", label: "总览", icon: BarChart3 },
   { id: "accounts", label: "上游账号", icon: Server },
-  { id: "keys", label: "虚拟密钥", icon: KeyRound },
+  { id: "keys", label: "接入配置", icon: KeyRound },
   { id: "usage", label: "请求账本", icon: Activity },
   { id: "balances", label: "余额历史", icon: WalletCards },
   { id: "settings", label: "设置", icon: Settings },
@@ -53,6 +57,7 @@ export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [stats, setStats] = useState<Stats>(initialStats);
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [clientConfig, setClientConfig] = useState<ClientConfig | null>(null);
   const [keys, setKeys] = useState<VirtualKey[]>([]);
   const [usage, setUsage] = useState<RequestEvent[]>([]);
   const [balances, setBalances] = useState<BalanceSnapshot[]>([]);
@@ -60,23 +65,28 @@ export function App() {
   const [error, setError] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
   const [createdSecret, setCreatedSecret] = useState("");
+  const [accountEditor, setAccountEditor] = useState<Account | "new" | null>(null);
+  const [checkingAccount, setCheckingAccount] = useState("");
 
   const refresh = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
-      const [nextStats, nextAccounts, nextKeys, nextUsage, nextBalances] = await Promise.all([
+      const [nextStats, nextAccounts, nextConfig, nextKeys, nextUsage, nextBalances] = await Promise.all([
         api.stats(),
         api.accounts(),
+        api.clientConfig(),
         api.keys(),
         api.usage("limit=100"),
         api.balances("limit=100"),
       ]);
       setStats(nextStats);
       setAccounts(nextAccounts);
+      setClientConfig(nextConfig);
       setKeys(nextKeys);
       setUsage(nextUsage);
       setBalances(nextBalances);
+      if (!authorized && nextAccounts.length === 0) setView("accounts");
       setAuthorized(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载失败");
@@ -144,7 +154,7 @@ export function App() {
   const titles: Record<View, [string, string]> = {
     overview: ["运行总览", "代理流量、成本与健康状态"],
     accounts: ["上游账号", "DeepSeek 账号健康与余额状态"],
-    keys: ["虚拟密钥", "租户凭据、配额与当日消耗"],
+    keys: ["接入配置", "OpenAI 兼容地址、平台 Key 与租户密钥"],
     usage: ["请求账本", "持久化调用明细与 Token 用量"],
     balances: ["余额历史", "上游账号余额快照"],
     settings: ["系统设置", "管理员访问凭据与本地运行配置"],
@@ -175,14 +185,40 @@ export function App() {
         <div className="content">
           {error && <div className="error-banner"><AlertCircle size={17} />{error}</div>}
           {view === "overview" && <Overview stats={stats} accounts={accounts} usage={usage} />}
-          {view === "accounts" && <Accounts accounts={accounts} />}
-          {view === "keys" && <Keys keys={keys} onCreate={() => { setCreatedSecret(""); setCreateOpen(true); }} onRevoke={async (id) => { if (confirm("撤销后客户端将立即无法使用该密钥。继续吗？")) { await api.revokeKey(id); await refresh(); } }} />}
+          {view === "accounts" && <Accounts
+            accounts={accounts}
+            checkingAccount={checkingAccount}
+            onCreate={() => setAccountEditor("new")}
+            onEdit={(account) => setAccountEditor(account)}
+            onCheck={async (account) => {
+              setError("");
+              setCheckingAccount(account.id);
+              try {
+                const checked = await api.checkAccount(account.id);
+                setAccounts((current) => current.map((item) => item.id === checked.id ? checked : item));
+              } catch (err) {
+                setError(err instanceof Error ? err.message : "账号检测失败");
+              } finally {
+                setCheckingAccount("");
+              }
+            }}
+            onToggle={async (account) => { setError(""); try { await api.updateAccount(account.id, accountPayload(account, !account.enabled)); await refresh(); } catch (err) { setError(err instanceof Error ? err.message : "更新账号失败"); } }}
+            onDelete={async (account) => { if (confirm(`删除账号 ${account.name}？`)) { setError(""); try { await api.deleteAccount(account.id); await refresh(); } catch (err) { setError(err instanceof Error ? err.message : "删除账号失败"); } } }}
+          />}
+          {view === "keys" && <div className="stack"><AccessConfig config={clientConfig} /><Keys keys={keys} onCreate={() => { setCreatedSecret(""); setCreateOpen(true); }} onRevoke={async (id) => { if (confirm("撤销后客户端将立即无法使用该密钥。继续吗？")) { await api.revokeKey(id); await refresh(); } }} /></div>}
           {view === "usage" && <Usage events={usage} onFilter={async (query) => { setLoading(true); try { setUsage(await api.usage(query)); } finally { setLoading(false); } }} />}
           {view === "balances" && <Balances snapshots={balances} accounts={accounts} onFilter={async (query) => { setLoading(true); try { setBalances(await api.balances(query)); } finally { setLoading(false); } }} />}
           {view === "settings" && <SettingsPage onRotate={rotateAdminKey} />}
         </div>
       </main>
       {createOpen && <CreateKeyModal secret={createdSecret} onClose={() => setCreateOpen(false)} onCreate={async (body) => { const result = await api.createKey(body); setCreatedSecret(result.secret); await refresh(); }} />}
+      {accountEditor && <AccountModal account={accountEditor === "new" ? undefined : accountEditor} onClose={() => setAccountEditor(null)} onSave={async (body) => {
+        const firstHealthyAccount = !accounts.some((account) => account.healthy);
+        const saved = accountEditor === "new" ? await api.createAccount(body) : await api.updateAccount(accountEditor.id, body);
+        setAccountEditor(null);
+        await refresh();
+        if (firstHealthyAccount && saved.healthy) setView("keys");
+      }} />}
     </div>
   );
 }
@@ -235,12 +271,59 @@ function Metric({ icon: Icon, label, value, detail, tone }: { icon: typeof Activ
   return <div className="metric"><div className={`metric-icon ${tone}`}><Icon size={19} /></div><div><span>{label}</span><strong>{value}</strong><small>{detail}</small></div></div>;
 }
 
-function Accounts({ accounts }: { accounts: Account[] }) {
-  return <div className="panel"><PanelHead title="账号池" subtitle={`${accounts.length} 个上游账号`} /><div className="table-wrap"><table><thead><tr><th>账号</th><th>状态</th><th>余额</th><th>权重 / 活跃</th><th>最近同步</th></tr></thead><tbody>{accounts.map((a) => <tr key={a.id}><td><strong>{a.name}</strong><small>{a.id}</small></td><td><Status ok={a.healthy} label={a.healthy ? "健康" : "冷却中"} /></td><td>{a.balances?.length ? a.balances.map((b) => <div key={b.currency} className="money">{b.currency} {b.total_balance}</div>) : <span className="muted">暂无快照</span>}{a.balance_error && <small className="danger-text">{a.balance_error}</small>}</td><td>{a.weight} / {a.active}</td><td>{formatTime(a.balance_updated_at)}</td></tr>)}</tbody></table>{!accounts.length && <Empty label="尚未配置上游账号" />}</div></div>;
+function Accounts({ accounts, checkingAccount, onCreate, onEdit, onCheck, onToggle, onDelete }: { accounts: Account[]; checkingAccount: string; onCreate: () => void; onEdit: (account: Account) => void; onCheck: (account: Account) => Promise<void>; onToggle: (account: Account) => Promise<void>; onDelete: (account: Account) => Promise<void> }) {
+  return <div className="panel"><PanelHead title="账号池" subtitle={`${accounts.length} 个上游账号`} action={<button className="primary" onClick={onCreate}><Server size={16} />添加账号</button>} /><div className="table-wrap account-table"><table><thead><tr><th>账号</th><th>状态</th><th>余额</th><th>权重 / 活跃</th><th>来源</th><th></th></tr></thead><tbody>{accounts.map((a) => <tr key={a.id}><td><strong>{a.name}</strong><small>{a.id} · {a.api_key_prefix || "无 Key"}</small></td><td><Status ok={a.healthy} pending={a.check_status === "unchecked" || a.check_status === "disabled"} label={accountStatusLabel(a)} /></td><td>{a.balances?.length ? a.balances.map((b) => <div key={b.currency} className="money">{b.currency} {b.total_balance}</div>) : <span className="muted">暂无快照</span>}{a.balance_updated_at && <small>检测 {formatTime(a.balance_updated_at)}</small>}{a.balance_error && <small className="danger-text">{a.balance_error}</small>}</td><td>{a.weight} / {a.active}</td><td><span className={`source-tag ${a.managed ? "managed" : "env"}`}>{a.managed ? "控制台" : "环境变量"}</span></td><td><div className="row-actions"><button className="icon-button small" title="立即检测" disabled={!a.enabled || checkingAccount === a.id} onClick={() => onCheck(a)}><RefreshCw className={checkingAccount === a.id ? "spin" : ""} size={15} /></button>{a.managed && <><button className="icon-button small" title="编辑账号" onClick={() => onEdit(a)}><Pencil size={15} /></button><label className="switch" title={a.enabled ? "停用账号" : "启用账号"}><input type="checkbox" checked={a.enabled} onChange={() => onToggle(a)} /><span /></label><button className="icon-button small danger-icon" title="删除账号" onClick={() => onDelete(a)}><Trash2 size={15} /></button></>}</div></td></tr>)}</tbody></table>{!accounts.length && <Empty label="尚未配置上游账号" />}</div></div>;
+}
+
+function AccessConfig({ config }: { config: ClientConfig | null }) {
+  const [revealed, setRevealed] = useState(false);
+  const [copied, setCopied] = useState("");
+  if (!config) return null;
+  const command = [
+    `curl ${config.base_url}/chat/completions \\`,
+    `  -H "Authorization: Bearer $SEEKOPS_API_KEY" \\`,
+    `  -H "Content-Type: application/json" \\`,
+    `  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"你好"}]}'`,
+  ].join("\n");
+  const copy = async (key: string, value: string) => {
+    await navigator.clipboard.writeText(value);
+    setCopied(key);
+    window.setTimeout(() => setCopied(""), 1600);
+  };
+  return <div className="panel access-panel"><PanelHead title="客户端接入" subtitle="OpenAI 兼容代理地址与平台凭据" /><div className="access-content"><div className="access-fields"><div className="access-field"><span>Base URL</span><div className="access-value"><code>{config.base_url}</code><button className="icon-button small" title="复制 Base URL" onClick={() => copy("base", config.base_url)}>{copied === "base" ? <Check size={15} /> : <Clipboard size={15} />}</button></div></div><div className="access-field"><span>平台 API Key</span><div className="access-value"><code>{revealed ? config.api_key : `${config.api_key_prefix}••••••••`}</code><button className="icon-button small" title={revealed ? "隐藏 API Key" : "显示 API Key"} onClick={() => setRevealed((value) => !value)}>{revealed ? <EyeOff size={15} /> : <Eye size={15} />}</button><button className="icon-button small" title="复制平台 API Key" onClick={() => copy("key", config.api_key)}>{copied === "key" ? <Check size={15} /> : <Clipboard size={15} />}</button></div></div></div><div className="access-command"><div className="access-command-head"><span>请求示例</span><button className="icon-button small" title="复制请求示例" onClick={() => copy("command", command)}>{copied === "command" ? <Check size={15} /> : <Clipboard size={15} />}</button></div><pre>{command}</pre></div></div></div>;
 }
 
 function Keys({ keys, onCreate, onRevoke }: { keys: VirtualKey[]; onCreate: () => void; onRevoke: (id: string) => void }) {
   return <div className="panel"><PanelHead title="租户密钥" subtitle={`${keys.filter((k) => k.enabled).length} 个启用`} action={<button className="primary" onClick={onCreate}><KeyRound size={16} />创建密钥</button>} /><div className="table-wrap"><table><thead><tr><th>名称 / 租户</th><th>密钥</th><th>当日用量</th><th>配额</th><th>状态</th><th></th></tr></thead><tbody>{keys.map((k) => <tr key={k.id}><td><strong>{k.name}</strong><small>{k.tenant_id}</small></td><td className="mono">{k.prefix}</td><td><strong>{formatCompact(k.usage.daily_tokens)}</strong><small>¥ {k.usage.daily_cost_cny.toFixed(4)}</small></td><td><small>{quotaText(k.quota)}</small></td><td><Status ok={k.enabled} label={k.enabled ? "启用" : "已撤销"} /></td><td>{k.enabled && k.id !== "vk-default" && <button className="danger-action" onClick={() => onRevoke(k.id)}>撤销</button>}</td></tr>)}</tbody></table></div></div>;
+}
+
+function accountPayload(account: Account, enabled = account.enabled): AccountInput {
+  return { id: account.id, name: account.name, api_key: "", base_url: account.base_url, weight: account.weight, models: account.models ?? [], enabled };
+}
+
+function AccountModal({ account, onClose, onSave }: { account?: Account; onClose: () => void; onSave: (body: AccountInput) => Promise<void> }) {
+  const [id, setID] = useState(account?.id ?? "");
+  const [name, setName] = useState(account?.name ?? "");
+  const [apiKey, setAPIKey] = useState("");
+  const [baseURL, setBaseURL] = useState(account?.base_url ?? "https://api.deepseek.com");
+  const [weight, setWeight] = useState(String(account?.weight ?? 1));
+  const [models, setModels] = useState(account?.models?.join(", ") ?? "");
+  const [enabled, setEnabled] = useState(account?.enabled ?? true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await onSave({ id: id.trim() || undefined, name: name.trim(), api_key: apiKey.trim(), base_url: baseURL.trim(), weight: Number(weight) || 1, models: models.split(",").map((item) => item.trim()).filter(Boolean), enabled });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存账号失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><div><h2>{account ? "编辑上游账号" : "添加上游账号"}</h2><p>{account ? "修改账号参数，API Key 留空则保持不变。" : "添加一个可参与请求转发和余额轮询的账号。"}</p></div><button className="icon-button" title="关闭" onClick={onClose}><X size={19} /></button></div><form onSubmit={submit} className="create-form"><div className="form-grid">{!account && <label>账号 ID<input value={id} onChange={(e) => setID(e.target.value)} placeholder="acct-prod" /></label>}<label>名称<input value={name} onChange={(e) => setName(e.target.value)} required placeholder="生产主账号" /></label><label>API Key<input type="password" value={apiKey} onChange={(e) => setAPIKey(e.target.value)} placeholder={account ? "留空保持不变" : "sk-..."} required={!account} autoComplete="new-password" /></label><label>Base URL<input value={baseURL} onChange={(e) => setBaseURL(e.target.value)} required placeholder="https://api.deepseek.com" /></label><label>权重<input type="number" min="1" max="1000" value={weight} onChange={(e) => setWeight(e.target.value)} /></label><label>支持模型<input value={models} onChange={(e) => setModels(e.target.value)} placeholder="deepseek-chat, deepseek-reasoner" /></label></div><label className="check-row"><input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />启用账号</label>{error && <p className="form-error">{error}</p>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={busy}>{busy ? "正在保存" : "保存账号"}</button></div></form></div></div>;
 }
 
 function Usage({ events, onFilter }: { events: RequestEvent[]; onFilter: (query: string) => void }) {
@@ -265,7 +348,17 @@ function CreateKeyModal({ secret, onClose, onCreate }: { secret: string; onClose
 }
 
 function PanelHead({ title, subtitle, action }: { title: string; subtitle: string; action?: React.ReactNode }) { return <div className="panel-head"><div><h2>{title}</h2><p>{subtitle}</p></div>{action}</div>; }
-function Status({ ok, label }: { ok: boolean; label: string }) { return <span className={`status ${ok ? "ok" : "bad"}`}><span />{label}</span>; }
+function Status({ ok, label, pending = false }: { ok: boolean; label: string; pending?: boolean }) { return <span className={`status ${pending ? "pending" : ok ? "ok" : "bad"}`}><span />{label}</span>; }
+function accountStatusLabel(account: Account) {
+  switch (account.check_status) {
+    case "healthy": return "健康";
+    case "unchecked": return "待检测";
+    case "cooldown": return "冷却中";
+    case "unavailable": return "余额不可用";
+    case "disabled": return "已停用";
+    default: return "检测失败";
+  }
+}
 function Legend({ color, label, value }: { color: string; label: string; value: string }) { return <div><span className={`legend-dot ${color}`} /><span>{label}</span><strong>{value}</strong></div>; }
 function Empty({ label }: { label: string }) { return <div className="empty">{label}</div>; }
 function formatNumber(v = 0) { return new Intl.NumberFormat("zh-CN").format(v); }

@@ -29,12 +29,15 @@ import (
 var ConsoleAssets embed.FS
 
 type Account struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	APIKey  string   `json:"-"`
-	BaseURL string   `json:"base_url"`
-	Weight  int      `json:"weight"`
-	Models  []string `json:"models,omitempty"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	APIKey    string    `json:"-"`
+	BaseURL   string    `json:"base_url"`
+	Weight    int       `json:"weight"`
+	Models    []string  `json:"models,omitempty"`
+	Disabled  bool      `json:"-"`
+	Managed   bool      `json:"-"`
+	CreatedAt time.Time `json:"-"`
 
 	active  atomic.Int64
 	fails   atomic.Int64
@@ -431,6 +434,7 @@ func (r *Recorder) Snapshot() Stats {
 
 type Config struct {
 	ListenAddr     string
+	PublicBaseURL  string
 	PlatformAPIKey string
 	AdminAPIKey    string
 	RequestTimeout time.Duration
@@ -443,15 +447,17 @@ type Config struct {
 }
 
 type Server struct {
-	config    Config
-	recorder  *Recorder
-	keys      *KeyStore
-	proxy     *httputil.ReverseProxy
-	transport http.RoundTripper
-	server    *http.Server
-	sequence  atomic.Uint64
-	adminMu   sync.RWMutex
-	adminKey  *adminKeyCredential
+	config     Config
+	recorder   *Recorder
+	keys       *KeyStore
+	proxy      *httputil.ReverseProxy
+	transport  http.RoundTripper
+	server     *http.Server
+	sequence   atomic.Uint64
+	adminMu    sync.RWMutex
+	adminKey   *adminKeyCredential
+	accountsMu sync.RWMutex
+	accounts   []*Account
 }
 
 type contextKey string
@@ -647,21 +653,29 @@ func NewServer(cfg Config) *Server {
 		keys = NewKeyStoreWithDB(cfg.PlatformAPIKey, cfg.DB)
 	}
 	recorder := NewRecorder()
+	accounts := mergeAccounts(cfg.Accounts, nil)
 	if cfg.DB != nil {
 		recorder = NewRecorderWithDB(cfg.DB)
-		loadLatestBalances(cfg.DB, cfg.Accounts)
+		managedAccounts, err := loadManagedAccounts(cfg.DB)
+		if err != nil {
+			log.Printf("load managed accounts: %v", err)
+		} else {
+			accounts = mergeAccounts(cfg.Accounts, managedAccounts)
+		}
+		loadLatestBalances(cfg.DB, accounts)
 	}
 	adminKey, err := loadAdminKey(cfg.DB)
 	if err != nil {
 		log.Printf("load admin key: %v", err)
 	}
-	s := &Server{config: cfg, keys: keys, recorder: recorder, transport: http.DefaultTransport, adminKey: adminKey}
+	s := &Server{config: cfg, keys: keys, recorder: recorder, transport: http.DefaultTransport, adminKey: adminKey, accounts: accounts}
 	s.proxy = &httputil.ReverseProxy{Director: s.director, Transport: s.transport, ModifyResponse: s.modifyResponse, ErrorHandler: s.errorHandler, FlushInterval: -1}
 	s.server = &http.Server{Addr: cfg.ListenAddr, Handler: s, ReadHeaderTimeout: 10 * time.Second}
 	return s
 }
 func (s *Server) Recorder() *Recorder   { return s.recorder }
 func (s *Server) Handler() http.Handler { return s }
+func (s *Server) AccountCount() int     { return len(s.accountsSnapshot()) }
 func (s *Server) ListenAndServe() error {
 	log.Printf("deepseek proxy listening on %s", s.config.ListenAddr)
 	return s.server.ListenAndServe()
@@ -678,7 +692,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/readyz" {
-		if len(s.config.Accounts) == 0 {
+		if !s.hasEnabledAccount() {
 			writeJSON(w, 503, map[string]any{"status": "not_ready"})
 			return
 		}
@@ -787,12 +801,13 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) (*Principal, 
 }
 func (s *Server) selectAccount(r *http.Request, model string) *Account {
 	now := time.Now()
+	accounts := s.accountsSnapshot()
 	var selected *Account
 	var selectedScore float64
-	start := int(s.sequence.Add(1) % uint64(max(1, len(s.config.Accounts))))
-	for offset := 0; offset < len(s.config.Accounts); offset++ {
-		a := s.config.Accounts[(start+offset)%len(s.config.Accounts)]
-		if a == nil || a.APIKey == "" || !a.Healthy(now) || !a.SupportsModel(model) {
+	start := int(s.sequence.Add(1) % uint64(max(1, len(accounts))))
+	for offset := 0; offset < len(accounts); offset++ {
+		a := accounts[(start+offset)%len(accounts)]
+		if a == nil || a.Disabled || a.APIKey == "" || !a.Healthy(now) || !a.SupportsModel(model) {
 			continue
 		}
 		weight := a.Weight
@@ -947,6 +962,14 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 		s.handleAdminKeyRotation(w, r)
 		return
 	}
+	if r.URL.Path == "/admin/client-config" {
+		s.handleClientConfig(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/admin/accounts") {
+		s.handleAdminAccounts(w, r)
+		return
+	}
 	if r.URL.Path == "/admin/usage" && r.Method == http.MethodGet {
 		if s.config.DB == nil {
 			writeJSON(w, http.StatusOK, s.recorder.Snapshot().LastRequests)
@@ -1009,13 +1032,6 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/admin/stats":
 		writeJSON(w, 200, s.recorder.Snapshot())
-	case "/admin/accounts":
-		result := make([]map[string]any, 0, len(s.config.Accounts))
-		for _, a := range s.config.Accounts {
-			available, balances, updatedAt, balanceError := a.balanceSnapshot()
-			result = append(result, map[string]any{"id": a.ID, "name": a.Name, "base_url": a.BaseURL, "weight": a.Weight, "active": a.Active(), "healthy": a.Healthy(time.Now()), "failures": a.fails.Load(), "balance_available": available, "balances": balances, "balance_updated_at": updatedAt, "balance_error": balanceError})
-		}
-		writeJSON(w, 200, result)
 	default:
 		http.NotFound(w, r)
 	}
@@ -1039,8 +1055,8 @@ func (s *Server) StartBalancePoller(ctx context.Context, interval time.Duration)
 }
 
 func (s *Server) PollBalancesOnce(ctx context.Context) {
-	for _, account := range s.config.Accounts {
-		if account == nil || account.APIKey == "" {
+	for _, account := range s.accountsSnapshot() {
+		if account == nil || account.Disabled || account.APIKey == "" {
 			continue
 		}
 		s.pollAccountBalance(ctx, account)

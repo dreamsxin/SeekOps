@@ -386,3 +386,208 @@ func TestAdminSetupAndKeyPersistence(t *testing.T) {
 		t.Fatalf("restarted key stats status=%d body=%s", restartedStatsRec.Code, restartedStatsRec.Body.String())
 	}
 }
+
+func TestManagedAccountCRUDPersistence(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"10.00"}]}`)
+	}))
+	defer upstream.Close()
+	dbPath := filepath.Join(t.TempDir(), "seekops.db")
+	db, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(Config{PlatformAPIKey: "client-secret", AdminAPIKey: "admin-secret", DB: db})
+
+	createBody := fmt.Sprintf(`{"id":"managed-a","name":"Managed A","api_key":"upstream-a","base_url":%q,"weight":3,"models":["deepseek-chat"],"enabled":true}`, upstream.URL)
+	createReq := httptest.NewRequest(http.MethodPost, "/admin/accounts", strings.NewReader(createBody))
+	createReq.Header.Set("X-Admin-Key", "admin-secret")
+	createRec := httptest.NewRecorder()
+	s.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated || !strings.Contains(createRec.Body.String(), `"managed":true`) || !strings.Contains(createRec.Body.String(), `"api_key_prefix":"upstream"`) {
+		t.Fatalf("create status=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+
+	updateBody := fmt.Sprintf(`{"name":"Managed A Updated","base_url":%q,"weight":5,"models":["deepseek-chat","deepseek-reasoner"],"enabled":false}`, upstream.URL)
+	updateReq := httptest.NewRequest(http.MethodPut, "/admin/accounts/managed-a", strings.NewReader(updateBody))
+	updateReq.Header.Set("X-Admin-Key", "admin-secret")
+	updateRec := httptest.NewRecorder()
+	s.ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusOK || !strings.Contains(updateRec.Body.String(), `"enabled":false`) || !strings.Contains(updateRec.Body.String(), `"weight":5`) {
+		t.Fatalf("update status=%d body=%s", updateRec.Code, updateRec.Body.String())
+	}
+	readyReq := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	readyRec := httptest.NewRecorder()
+	s.ServeHTTP(readyRec, readyReq)
+	if readyRec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("disabled ready status=%d body=%s", readyRec.Code, readyRec.Body.String())
+	}
+
+	enableBody := fmt.Sprintf(`{"name":"Managed A Updated","base_url":%q,"weight":5,"models":["deepseek-chat","deepseek-reasoner"],"enabled":true}`, upstream.URL)
+	enableReq := httptest.NewRequest(http.MethodPut, "/admin/accounts/managed-a", strings.NewReader(enableBody))
+	enableReq.Header.Set("X-Admin-Key", "admin-secret")
+	enableRec := httptest.NewRecorder()
+	s.ServeHTTP(enableRec, enableReq)
+	if enableRec.Code != http.StatusOK || !strings.Contains(enableRec.Body.String(), `"enabled":true`) {
+		t.Fatalf("enable status=%d body=%s", enableRec.Code, enableRec.Body.String())
+	}
+	readyRec = httptest.NewRecorder()
+	s.ServeHTTP(readyRec, readyReq)
+	if readyRec.Code != http.StatusOK {
+		t.Fatalf("enabled ready status=%d body=%s", readyRec.Code, readyRec.Body.String())
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	restarted := NewServer(Config{PlatformAPIKey: "client-secret", AdminAPIKey: "admin-secret", DB: reopened})
+	if restarted.AccountCount() != 1 {
+		t.Fatalf("restarted account count=%d", restarted.AccountCount())
+	}
+	if restarted.accounts[0].APIKey != "upstream-a" || restarted.accounts[0].Weight != 5 {
+		t.Fatalf("restarted account id=%s api_key=%q weight=%d", restarted.accounts[0].ID, restarted.accounts[0].APIKey, restarted.accounts[0].Weight)
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/admin/accounts/managed-a", nil)
+	deleteReq.Header.Set("X-Admin-Key", "admin-secret")
+	deleteRec := httptest.NewRecorder()
+	restarted.ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusOK || restarted.AccountCount() != 0 {
+		t.Fatalf("delete status=%d body=%s accounts=%d", deleteRec.Code, deleteRec.Body.String(), restarted.AccountCount())
+	}
+}
+
+func TestManagedAccountImmediatelyJoinsProxyPool(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer managed-upstream-key" {
+			t.Fatalf("upstream authorization=%q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/user/balance") {
+			fmt.Fprint(w, `{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"10.00"}]}`)
+			return
+		}
+		fmt.Fprint(w, `{"model":"deepseek-chat","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+	db, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := NewServer(Config{PlatformAPIKey: "client-secret", AdminAPIKey: "admin-secret", DB: db})
+	createBody := fmt.Sprintf(`{"id":"runtime","name":"Runtime","api_key":"managed-upstream-key","base_url":%q,"enabled":true}`, upstream.URL)
+	createReq := httptest.NewRequest(http.MethodPost, "/admin/accounts", strings.NewReader(createBody))
+	createReq.Header.Set("X-Admin-Key", "admin-secret")
+	createRec := httptest.NewRecorder()
+	s.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+	proxyReq := httptest.NewRequest(http.MethodPost, "/chat/completions", strings.NewReader(`{"model":"deepseek-chat","messages":[]}`))
+	proxyReq.Header.Set("Authorization", "Bearer client-secret")
+	proxyReq.Header.Set("Content-Type", "application/json")
+	proxyRec := httptest.NewRecorder()
+	s.ServeHTTP(proxyRec, proxyReq)
+	if proxyRec.Code != http.StatusOK {
+		t.Fatalf("proxy status=%d body=%s", proxyRec.Code, proxyRec.Body.String())
+	}
+}
+
+func TestAccountAutomaticAndManualCheck(t *testing.T) {
+	checks := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/user/balance") {
+			http.NotFound(w, r)
+			return
+		}
+		checks++
+		if r.Header.Get("Authorization") != "Bearer valid-upstream-key" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"12.50"}]}`)
+	}))
+	defer upstream.Close()
+
+	s := NewServer(Config{PlatformAPIKey: "client-secret", AdminAPIKey: "admin-secret"})
+	createBody := fmt.Sprintf(`{"id":"checked","name":"Checked","api_key":"wrong-key","base_url":%q,"enabled":true}`, upstream.URL)
+	createReq := httptest.NewRequest(http.MethodPost, "/admin/accounts", strings.NewReader(createBody))
+	createReq.Header.Set("X-Admin-Key", "admin-secret")
+	createRec := httptest.NewRecorder()
+	s.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+	var created AccountView
+	if err := json.NewDecoder(createRec.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Healthy || created.CheckStatus != "error" || created.BalanceError == "" || created.Models == nil || checks != 1 {
+		t.Fatalf("created=%+v checks=%d", created, checks)
+	}
+
+	checkReq := httptest.NewRequest(http.MethodPost, "/admin/accounts/checked/check", nil)
+	checkReq.Header.Set("X-Admin-Key", "admin-secret")
+	checkRec := httptest.NewRecorder()
+	s.ServeHTTP(checkRec, checkReq)
+	if checkRec.Code != http.StatusOK || !strings.Contains(checkRec.Body.String(), `"check_status":"error"`) || checks != 2 {
+		t.Fatalf("manual check status=%d body=%s checks=%d", checkRec.Code, checkRec.Body.String(), checks)
+	}
+
+	updateBody := fmt.Sprintf(`{"name":"Checked","api_key":"valid-upstream-key","base_url":%q,"enabled":true}`, upstream.URL)
+	updateReq := httptest.NewRequest(http.MethodPut, "/admin/accounts/checked", strings.NewReader(updateBody))
+	updateReq.Header.Set("X-Admin-Key", "admin-secret")
+	updateRec := httptest.NewRecorder()
+	s.ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", updateRec.Code, updateRec.Body.String())
+	}
+	var updated AccountView
+	if err := json.NewDecoder(updateRec.Body).Decode(&updated); err != nil {
+		t.Fatal(err)
+	}
+	if !updated.Healthy || updated.CheckStatus != "healthy" || updated.BalanceError != "" || checks != 3 {
+		t.Fatalf("updated=%+v checks=%d", updated, checks)
+	}
+}
+
+func TestClientConfigUsesPublicURLAndPlatformKey(t *testing.T) {
+	s := NewServer(Config{
+		AdminAPIKey:    "admin-secret",
+		PlatformAPIKey: "client-secret",
+		PublicBaseURL:  "https://seekops.example.com/openai/v1/",
+	})
+	req := httptest.NewRequest(http.MethodGet, "/admin/client-config", nil)
+	req.Header.Set("X-Admin-Key", "admin-secret")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("client config status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var config ClientConfigView
+	if err := json.NewDecoder(rec.Body).Decode(&config); err != nil {
+		t.Fatal(err)
+	}
+	if config.BaseURL != "https://seekops.example.com/openai/v1" || config.APIKey != "client-secret" || config.APIKeyPrefix != "client-s..." {
+		t.Fatalf("client config=%+v", config)
+	}
+
+	derived := NewServer(Config{AdminAPIKey: "admin-secret", PlatformAPIKey: "derived-secret"})
+	derivedReq := httptest.NewRequest(http.MethodGet, "/admin/client-config", nil)
+	derivedReq.Host = "proxy.local:8080"
+	derivedReq.Header.Set("X-Admin-Key", "admin-secret")
+	derivedReq.Header.Set("X-Forwarded-Proto", "https")
+	derivedRec := httptest.NewRecorder()
+	derived.ServeHTTP(derivedRec, derivedReq)
+	if derivedRec.Code != http.StatusOK || !strings.Contains(derivedRec.Body.String(), `"base_url":"https://proxy.local:8080/v1"`) {
+		t.Fatalf("derived config status=%d body=%s", derivedRec.Code, derivedRec.Body.String())
+	}
+}

@@ -14,13 +14,13 @@ $env:PLATFORM_API_KEY = "proxy-demo-key"
 go run ./cmd/proxy
 ```
 
-客户端把 `proxy-demo-key` 作为 Bearer Token，并将 Base URL 指向 `http://localhost:8080`：
+打开 `http://localhost:8080/console/` 完成本地初始化和上游账号配置。客户端把 `proxy-demo-key` 作为 Bearer Token，并将 OpenAI 兼容 Base URL 指向 `http://localhost:8080/v1`：
 
 ```powershell
-curl http://localhost:8080/chat/completions `
+curl http://localhost:8080/v1/chat/completions `
   -H "Authorization: Bearer proxy-demo-key" `
   -H "Content-Type: application/json" `
-  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Hello"}],"stream":false}'
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Hello"}],"stream":false}'
 ```
 
 Docker Compose 本地部署：
@@ -36,6 +36,7 @@ SQLite 数据保存在 `seekops-data` 命名卷的 `/data/seekops.db`，重建�
 ## 配置
 
 - `LISTEN_ADDR`：监听地址，默认 `:8080`
+- `PUBLIC_BASE_URL`：控制台展示给客户端的 OpenAI 兼容 Base URL，例如 `https://proxy.example.com/v1`；未设置时根据请求地址推导
 - `UPSTREAM_API_KEY`：单个 DeepSeek 上游 Key
 - `UPSTREAM_ACCOUNTS_JSON`：多个上游账号配置，JSON 数组字段为 `id`、`name`、`api_key`、`base_url`、`weight`、`models`
 - `PLATFORM_API_KEY`：平台虚拟 Key，默认仅用于本地开发的 `proxy-demo-key`
@@ -61,8 +62,13 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `POST /admin/admin-key`：在已认证状态下轮换管理员 API Key，JSON 格式为 `{"api_key":"..."}`
 - `GET /metrics`：Prometheus 文本指标
 - `GET /admin/stats`：管理统计，需要 `X-Admin-Key` 或管理员 Bearer Token
+- `GET /admin/client-config`：获取当前平台 Base URL 和平台 API Key，需要管理员认证
 - `GET /admin/usage`：查询持久化用量事件，支持 `tenant_id`、`virtual_key_id`、`account_id`、`model`、`limit` 参数
-- `GET /admin/accounts`：上游账号状态，需要管理员权限
+- `GET /admin/accounts`：列出环境变量账号和 SQLite 托管账号
+- `POST /admin/accounts`：创建 SQLite 托管的上游账号
+- `PUT /admin/accounts/{id}`：更新或启停托管账号，`api_key` 留空时保留原值
+- `POST /admin/accounts/{id}/check`：立即调用上游余额接口检测账号凭据和可用状态
+- `DELETE /admin/accounts/{id}`：删除托管账号；环境变量账号为只读
 - `GET /admin/balance-history`：查询余额快照，支持 `account_id` 和 `limit` 参数
 - `GET /admin/virtual-keys`：列出虚拟 Key（只显示前缀）
 - `POST /admin/virtual-keys`：创建虚拟 Key，JSON 可包含 `quota.requests_per_minute`、`quota.concurrent_requests`、`quota.daily_tokens`、`quota.daily_cost_cny`，密钥只在创建响应中返回一次
@@ -72,6 +78,8 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `/models`、`/v1/models`：模型列表代理
 
 Chat JSON 请求体在 MVP 中限制为 32 MiB；流式 Chat 请求会在转发前确保 `stream_options.include_usage=true`，以便从最后一个 SSE 块记账。虚拟 Key、用量事件、统计恢复和余额快照会写入 SQLite。
+
+控制台创建或更新上游账号时会立即检测一次，后台还会按 `BALANCE_POLL_INTERVAL` 自动检测；账号列表也提供单账号手动检测。未完成检测的账号显示“待检测”，只有余额接口成功返回后才显示“健康”。控制台账号会立即加入代理池并写入 SQLite；环境变量账号继续作为只读基线。上游 API Key 必须可在重启后恢复，因此本地数据库包含可用凭据，部署时应限制 `data/seekops.db` 的文件访问权限。
 
 管理控制台源码位于 `web/`，生产构建会写入 `internal/proxy/web/` 并嵌入 Go 二进制：
 

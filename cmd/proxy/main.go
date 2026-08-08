@@ -20,6 +20,7 @@ func main() {
 	defer db.Close()
 	cfg := proxy.Config{
 		ListenAddr:     os.Getenv("LISTEN_ADDR"),
+		PublicBaseURL:  os.Getenv("PUBLIC_BASE_URL"),
 		PlatformAPIKey: envOr("PLATFORM_API_KEY", "proxy-demo-key"),
 		AdminAPIKey:    envOr("ADMIN_API_KEY", envOr("PLATFORM_API_KEY", "proxy-demo-key")),
 		RequestTimeout: durationOr("REQUEST_TIMEOUT", 10*time.Minute),
@@ -29,10 +30,10 @@ func main() {
 		PriceInputMiss: floatEnv("PRICE_INPUT_MISS_CNY_PER_MILLION", 1),
 		PriceOutput:    floatEnv("PRICE_OUTPUT_CNY_PER_MILLION", 2),
 	}
-	if len(cfg.Accounts) == 0 {
-		log.Print("warning: no UPSTREAM_API_KEY or UPSTREAM_ACCOUNTS_JSON configured; /readyz will fail")
-	}
 	server := proxy.NewServer(cfg)
+	if server.AccountCount() == 0 {
+		log.Print("warning: no upstream account configured; /readyz will fail")
+	}
 	go server.StartBalancePoller(context.Background(), durationOr("BALANCE_POLL_INTERVAL", 5*time.Minute))
 	log.Fatal(server.ListenAndServe())
 }

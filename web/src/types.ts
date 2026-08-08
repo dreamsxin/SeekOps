@@ -51,15 +51,36 @@ export interface BalanceInfo {
 export interface Account {
   id: string;
   name: string;
+  api_key_prefix: string;
   base_url: string;
   weight: number;
+  models: string[];
+  enabled: boolean;
+  managed: boolean;
   active: number;
   healthy: boolean;
+  check_status: "unchecked" | "healthy" | "cooldown" | "unavailable" | "error" | "disabled";
   failures: number;
   balance_available: boolean;
   balances: BalanceInfo[] | null;
   balance_updated_at?: string;
   balance_error?: string;
+}
+
+export interface AccountInput {
+  id?: string;
+  name: string;
+  api_key?: string;
+  base_url: string;
+  weight: number;
+  models: string[];
+  enabled: boolean;
+}
+
+export interface ClientConfig {
+  base_url: string;
+  api_key: string;
+  api_key_prefix: string;
 }
 
 export interface QuotaPolicy {
