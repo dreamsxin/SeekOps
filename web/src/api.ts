@@ -28,6 +28,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   setupStatus: () => request<AdminSetupStatus>("/admin/setup"),
   setup: (body: { api_key: string }) => request<AdminSetupStatus>("/admin/setup", { method: "POST", body: JSON.stringify(body) }),
+  rotateAdminKey: (api_key: string) => request<AdminSetupStatus>("/admin/admin-key", { method: "POST", body: JSON.stringify({ api_key }) }),
   stats: () => request<Stats>("/admin/stats"),
   accounts: () => request<Account[]>("/admin/accounts"),
   keys: () => request<VirtualKey[]>("/admin/virtual-keys"),

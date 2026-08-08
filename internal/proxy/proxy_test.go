@@ -341,6 +341,20 @@ func TestAdminSetupAndKeyPersistence(t *testing.T) {
 	if statsRec.Code != http.StatusOK {
 		t.Fatalf("configured key stats status=%d body=%s", statsRec.Code, statsRec.Body.String())
 	}
+	rotateReq := httptest.NewRequest(http.MethodPost, "/admin/admin-key", strings.NewReader(`{"api_key":"rotated-admin"}`))
+	rotateReq.Header.Set("X-Admin-Key", "admin")
+	rotateRec := httptest.NewRecorder()
+	s.ServeHTTP(rotateRec, rotateReq)
+	if rotateRec.Code != http.StatusOK {
+		t.Fatalf("rotate status=%d body=%s", rotateRec.Code, rotateRec.Body.String())
+	}
+	oldAfterRotate := httptest.NewRequest(http.MethodGet, "/admin/stats", nil)
+	oldAfterRotate.Header.Set("X-Admin-Key", "admin")
+	oldAfterRotateRec := httptest.NewRecorder()
+	s.ServeHTTP(oldAfterRotateRec, oldAfterRotate)
+	if oldAfterRotateRec.Code != http.StatusUnauthorized {
+		t.Fatalf("old key should be disabled after rotation, status=%d body=%s", oldAfterRotateRec.Code, oldAfterRotateRec.Body.String())
+	}
 	legacyReq := httptest.NewRequest(http.MethodGet, "/admin/stats", nil)
 	legacyReq.Header.Set("X-Admin-Key", "legacy-admin")
 	legacyRec := httptest.NewRecorder()
@@ -365,7 +379,7 @@ func TestAdminSetupAndKeyPersistence(t *testing.T) {
 		t.Fatalf("restarted setup status=%d body=%s", restartedStatusRec.Code, restartedStatusRec.Body.String())
 	}
 	restartedStats := httptest.NewRequest(http.MethodGet, "/admin/stats", nil)
-	restartedStats.Header.Set("X-Admin-Key", "admin")
+	restartedStats.Header.Set("X-Admin-Key", "rotated-admin")
 	restartedStatsRec := httptest.NewRecorder()
 	restarted.ServeHTTP(restartedStatsRec, restartedStats)
 	if restartedStatsRec.Code != http.StatusOK {

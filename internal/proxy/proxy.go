@@ -943,6 +943,10 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 401, map[string]any{"error": "admin authentication required"})
 		return
 	}
+	if r.URL.Path == "/admin/admin-key" {
+		s.handleAdminKeyRotation(w, r)
+		return
+	}
 	if r.URL.Path == "/admin/usage" && r.Method == http.MethodGet {
 		if s.config.DB == nil {
 			writeJSON(w, http.StatusOK, s.recorder.Snapshot().LastRequests)

@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import {
   Activity,
   AlertCircle,
@@ -12,6 +12,7 @@ import {
   Menu,
   RefreshCw,
   Server,
+  Settings,
   ShieldCheck,
   WalletCards,
   X,
@@ -19,7 +20,7 @@ import {
 import { api, auth } from "./api";
 import type { Account, AdminSetupStatus, BalanceSnapshot, QuotaPolicy, RequestEvent, Stats, VirtualKey } from "./types";
 
-type View = "overview" | "accounts" | "keys" | "usage" | "balances";
+type View = "overview" | "accounts" | "keys" | "usage" | "balances" | "settings";
 
 const navItems: Array<{ id: View; label: string; icon: typeof Activity }> = [
   { id: "overview", label: "总览", icon: BarChart3 },
@@ -27,6 +28,7 @@ const navItems: Array<{ id: View; label: string; icon: typeof Activity }> = [
   { id: "keys", label: "虚拟密钥", icon: KeyRound },
   { id: "usage", label: "请求账本", icon: Activity },
   { id: "balances", label: "余额历史", icon: WalletCards },
+  { id: "settings", label: "设置", icon: Settings },
 ];
 
 const initialStats: Stats = {
@@ -122,6 +124,14 @@ export function App() {
     }
   };
 
+  const rotateAdminKey = async (value: string) => {
+    const nextKey = value.trim();
+    if (!nextKey) throw new Error("请输入新的管理员 API Key");
+    await api.rotateAdminKey(nextKey);
+    auth.set(nextKey);
+    setAdminKey(nextKey);
+  };
+
   const logout = () => {
     auth.clear();
     setAdminKey("");
@@ -137,6 +147,7 @@ export function App() {
     keys: ["虚拟密钥", "租户凭据、配额与当日消耗"],
     usage: ["请求账本", "持久化调用明细与 Token 用量"],
     balances: ["余额历史", "上游账号余额快照"],
+    settings: ["系统设置", "管理员访问凭据与本地运行配置"],
   };
 
   return (
@@ -168,6 +179,7 @@ export function App() {
           {view === "keys" && <Keys keys={keys} onCreate={() => { setCreatedSecret(""); setCreateOpen(true); }} onRevoke={async (id) => { if (confirm("撤销后客户端将立即无法使用该密钥。继续吗？")) { await api.revokeKey(id); await refresh(); } }} />}
           {view === "usage" && <Usage events={usage} onFilter={async (query) => { setLoading(true); try { setUsage(await api.usage(query)); } finally { setLoading(false); } }} />}
           {view === "balances" && <Balances snapshots={balances} accounts={accounts} onFilter={async (query) => { setLoading(true); try { setBalances(await api.balances(query)); } finally { setLoading(false); } }} />}
+          {view === "settings" && <SettingsPage onRotate={rotateAdminKey} />}
         </div>
       </main>
       {createOpen && <CreateKeyModal secret={createdSecret} onClose={() => setCreateOpen(false)} onCreate={async (body) => { const result = await api.createKey(body); setCreatedSecret(result.secret); await refresh(); }} />}
@@ -177,6 +189,29 @@ export function App() {
 
 function Login({ setup, value, onChange, onSubmit, error, loading }: { setup: boolean; value: string; onChange: (v: string) => void; onSubmit: (e: FormEvent) => void; error: string; loading: boolean }) {
   return <div className="login-page"><div className="login-panel"><div className="brand login-brand"><div className="brand-mark">S</div><div><strong>SeekOps</strong><span>DeepSeek API Control Plane</span></div></div><div className="login-copy"><ShieldCheck size={30} /><h1>{setup ? "初始化管理员 Key" : "管理控制台"}</h1><p>{setup ? "首次运行，请设置管理 API Key。默认值为 admin，生产环境建议改为长随机字符串。" : "使用管理员 API Key 进入本地控制台。"}</p></div><form onSubmit={onSubmit}><label>管理员 API Key<input autoFocus type="password" value={value} onChange={(e) => onChange(e.target.value)} placeholder="admin" autoComplete={setup ? "new-password" : "current-password"} required /></label>{error && <p className="form-error">{error}</p>}<button className="primary full" disabled={loading}>{loading ? (setup ? "正在初始化" : "正在验证") : (setup ? "保存并进入" : "进入控制台")}</button></form></div></div>;
+}
+
+function SettingsPage({ onRotate }: { onRotate: (value: string) => Promise<void> }) {
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    setSaved(false);
+    try {
+      await onRotate(value);
+      setValue("");
+      setSaved(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "轮换失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <div className="panel settings-panel"><PanelHead title="管理员 API Key" subtitle="轮换本地管理控制台的访问凭据" /><form className="settings-form" onSubmit={submit}><label>新的管理员 API Key<input type="password" value={value} onChange={(e) => setValue(e.target.value)} placeholder="输入新的长随机字符串" required autoComplete="new-password" /></label><p className="settings-note">保存后旧 Key 会立即失效，当前浏览器会自动切换到新 Key。</p>{error && <p className="form-error">{error}</p>}{saved && <p className="form-success">管理员 API Key 已更新。</p>}<button className="primary" disabled={busy}>{busy ? "正在保存" : "保存新 Key"}</button></form></div>;
 }
 
 function Overview({ stats, accounts, usage }: { stats: Stats; accounts: Account[]; usage: RequestEvent[] }) {

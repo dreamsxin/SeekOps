@@ -143,3 +143,36 @@ func (s *Server) handleAdminSetup(w http.ResponseWriter, r *http.Request) {
 	s.adminKey = credential
 	writeJSON(w, http.StatusCreated, AdminSetupStatus{Initialized: true})
 }
+
+func (s *Server) handleAdminKeyRotation(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var input struct {
+		APIKey string `json:"api_key"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&input); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid api key payload"})
+		return
+	}
+	input.APIKey = strings.TrimSpace(input.APIKey)
+	if input.APIKey == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "api_key is required"})
+		return
+	}
+	credential, err := newAdminKeyCredential(input.APIKey)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	s.adminMu.Lock()
+	defer s.adminMu.Unlock()
+	if err := persistAdminKey(s.config.DB, credential); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "persist admin api key failed"})
+		return
+	}
+	s.adminKey = credential
+	writeJSON(w, http.StatusOK, AdminSetupStatus{Initialized: true})
+}
