@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -91,19 +92,36 @@ func TestAccountCooldown(t *testing.T) {
 
 func TestVirtualKeyLifecycle(t *testing.T) {
 	store := NewKeyStore("admin-secret")
-	view, secret, err := store.Create("Billing app", "tenant-a")
+	view, secret, err := store.CreateWithQuota("Billing app", "tenant-a", QuotaPolicy{DailyTokens: 100})
 	if err != nil || secret == "" || view.ID == "" {
 		t.Fatalf("create key: view=%+v secret=%q err=%v", view, secret, err)
+	}
+	if view.Secret != secret || !view.SecretAvailable {
+		t.Fatalf("created key is not recoverable: view=%+v", view)
 	}
 	principal, ok := store.Authenticate(secret)
 	if !ok || principal.TenantID != "tenant-a" || principal.ID != view.ID {
 		t.Fatalf("principal=%+v ok=%v", principal, ok)
 	}
-	if !store.Revoke(view.ID) {
-		t.Fatal("revoke failed")
+	updated, err := store.Update(view.ID, "Billing app v2", "tenant-b", QuotaPolicy{RequestsPerMinute: 5}, false)
+	if err != nil || updated.Enabled || updated.TenantID != "tenant-b" || updated.Quota.RequestsPerMinute != 5 {
+		t.Fatalf("update key: view=%+v err=%v", updated, err)
 	}
 	if _, ok := store.Authenticate(secret); ok {
-		t.Fatal("revoked key authenticated")
+		t.Fatal("disabled key authenticated")
+	}
+	if _, err := store.Update(view.ID, "Billing app v2", "tenant-b", updated.Quota, true); err != nil {
+		t.Fatal(err)
+	}
+	rotated, nextSecret, err := store.Rotate(view.ID)
+	if err != nil || nextSecret == "" || rotated.Secret != nextSecret || nextSecret == secret {
+		t.Fatalf("rotate key: view=%+v secret=%q err=%v", rotated, nextSecret, err)
+	}
+	if _, ok := store.Authenticate(secret); ok {
+		t.Fatal("old key authenticated after rotation")
+	}
+	if principal, ok := store.Authenticate(nextSecret); !ok || principal.TenantID != "tenant-b" {
+		t.Fatalf("rotated key principal=%+v ok=%v", principal, ok)
 	}
 }
 
@@ -182,8 +200,43 @@ func TestVirtualKeyAdminAndTenantStats(t *testing.T) {
 	if payload.Key.Quota.RequestsPerMinute != 12 || payload.Key.Quota.DailyTokens != 1000 {
 		t.Fatalf("quota=%+v", payload.Key.Quota)
 	}
+	if payload.Key.Secret != payload.Secret || !payload.Key.SecretAvailable {
+		t.Fatalf("created secret is not available in key view: %+v", payload.Key)
+	}
+	updateBody := `{"name":"App A Updated","tenant_id":"tenant-b","enabled":false,"quota":{"concurrent_requests":2,"daily_cost_cny":3.5}}`
+	update := httptest.NewRequest(http.MethodPut, "/admin/virtual-keys/"+payload.Key.ID, strings.NewReader(updateBody))
+	update.Header.Set("X-Admin-Key", "admin-secret")
+	updated := httptest.NewRecorder()
+	s.ServeHTTP(updated, update)
+	if updated.Code != http.StatusOK || !strings.Contains(updated.Body.String(), `"enabled":false`) || !strings.Contains(updated.Body.String(), `"tenant_id":"tenant-b"`) {
+		t.Fatalf("update status=%d body=%s", updated.Code, updated.Body.String())
+	}
+	if _, ok := s.keys.Authenticate(payload.Secret); ok {
+		t.Fatal("disabled key authenticated")
+	}
+	enable := httptest.NewRequest(http.MethodPut, "/admin/virtual-keys/"+payload.Key.ID, strings.NewReader(`{"name":"App A Updated","tenant_id":"tenant-b","enabled":true,"quota":{"concurrent_requests":2,"daily_cost_cny":3.5}}`))
+	enable.Header.Set("X-Admin-Key", "admin-secret")
+	enabled := httptest.NewRecorder()
+	s.ServeHTTP(enabled, enable)
+	if enabled.Code != http.StatusOK {
+		t.Fatalf("enable status=%d body=%s", enabled.Code, enabled.Body.String())
+	}
+	rotate := httptest.NewRequest(http.MethodPost, "/admin/virtual-keys/"+payload.Key.ID+"/rotate", nil)
+	rotate.Header.Set("X-Admin-Key", "admin-secret")
+	rotated := httptest.NewRecorder()
+	s.ServeHTTP(rotated, rotate)
+	var rotatedPayload struct {
+		Key    VirtualKeyView `json:"key"`
+		Secret string         `json:"secret"`
+	}
+	if rotated.Code != http.StatusOK || json.Unmarshal(rotated.Body.Bytes(), &rotatedPayload) != nil || rotatedPayload.Secret == "" {
+		t.Fatalf("rotate status=%d body=%s", rotated.Code, rotated.Body.String())
+	}
+	if _, ok := s.keys.Authenticate(payload.Secret); ok {
+		t.Fatal("old key authenticated after API rotation")
+	}
 	req := httptest.NewRequest(http.MethodPost, "/chat/completions", strings.NewReader(`{"model":"deepseek-v4-flash","messages":[]}`))
-	req.Header.Set("Authorization", "Bearer "+payload.Secret)
+	req.Header.Set("Authorization", "Bearer "+rotatedPayload.Secret)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	s.ServeHTTP(rec, req)
@@ -191,7 +244,7 @@ func TestVirtualKeyAdminAndTenantStats(t *testing.T) {
 		t.Fatalf("proxy status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	stats := s.Recorder().Snapshot()
-	if len(stats.LastRequests) != 1 || stats.LastRequests[0].TenantID != "tenant-a" || stats.LastRequests[0].VirtualKeyID != payload.Key.ID {
+	if len(stats.LastRequests) != 1 || stats.LastRequests[0].TenantID != "tenant-b" || stats.LastRequests[0].VirtualKeyID != payload.Key.ID {
 		t.Fatalf("stats=%+v", stats)
 	}
 }
@@ -247,6 +300,16 @@ func TestSQLitePersistenceAcrossServerRestart(t *testing.T) {
 	if _, ok := restarted.keys.Authenticate(secret); !ok {
 		t.Fatal("persisted virtual key did not authenticate after restart")
 	}
+	var restored VirtualKeyView
+	for _, candidate := range restarted.keys.List() {
+		if candidate.ID == view.ID {
+			restored = candidate
+			break
+		}
+	}
+	if restored.Secret != secret || !restored.SecretAvailable {
+		t.Fatalf("restored virtual key secret unavailable: %+v", restored)
+	}
 	var persistedTokens int64
 	if err := reopened.QueryRow("SELECT daily_tokens FROM virtual_keys WHERE id = ?", view.ID).Scan(&persistedTokens); err != nil {
 		t.Fatal(err)
@@ -277,6 +340,53 @@ func TestSQLitePersistenceAcrossServerRestart(t *testing.T) {
 	var history []BalanceSnapshot
 	if balanceRec.Code != http.StatusOK || json.Unmarshal(balanceRec.Body.Bytes(), &history) != nil || len(history) != 1 || history[0].TotalBalance != "88.00" {
 		t.Fatalf("balance query status=%d body=%s", balanceRec.Code, balanceRec.Body.String())
+	}
+}
+
+func TestSQLiteMigratesLegacyVirtualKeys(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE virtual_keys (
+		id TEXT PRIMARY KEY, name TEXT NOT NULL, tenant_id TEXT NOT NULL, prefix TEXT NOT NULL,
+		secret_hash TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL,
+		quota_rpm INTEGER NOT NULL DEFAULT 0, quota_concurrent INTEGER NOT NULL DEFAULT 0,
+		quota_daily_tokens INTEGER NOT NULL DEFAULT 0, quota_daily_cost_cny REAL NOT NULL DEFAULT 0,
+		usage_date TEXT NOT NULL DEFAULT '', daily_tokens INTEGER NOT NULL DEFAULT 0,
+		daily_cost_cny REAL NOT NULL DEFAULT 0
+	)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	var secretColumn int
+	rows, err := migrated.Query(`PRAGMA table_info(virtual_keys)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		if name == "secret" {
+			secretColumn++
+		}
+	}
+	if secretColumn != 1 {
+		t.Fatalf("secret column count=%d", secretColumn)
 	}
 }
 

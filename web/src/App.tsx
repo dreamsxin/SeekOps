@@ -13,6 +13,7 @@ import {
   LogOut,
   Menu,
   Pencil,
+  Plug,
   RefreshCw,
   Server,
   Settings,
@@ -22,14 +23,15 @@ import {
   X,
 } from "lucide-react";
 import { api, auth } from "./api";
-import type { Account, AccountInput, AdminSetupStatus, BalanceSnapshot, ClientConfig, QuotaPolicy, RequestEvent, Stats, VirtualKey } from "./types";
+import type { Account, AccountInput, AdminSetupStatus, BalanceSnapshot, ClientConfig, QuotaPolicy, RequestEvent, Stats, VirtualKey, VirtualKeyInput } from "./types";
 
-type View = "overview" | "accounts" | "keys" | "usage" | "balances" | "settings";
+type View = "overview" | "accounts" | "access" | "keys" | "usage" | "balances" | "settings";
 
 const navItems: Array<{ id: View; label: string; icon: typeof Activity }> = [
   { id: "overview", label: "总览", icon: BarChart3 },
   { id: "accounts", label: "上游账号", icon: Server },
-  { id: "keys", label: "接入配置", icon: KeyRound },
+  { id: "access", label: "接入配置", icon: Plug },
+  { id: "keys", label: "租户密钥", icon: KeyRound },
   { id: "usage", label: "请求账本", icon: Activity },
   { id: "balances", label: "余额历史", icon: WalletCards },
   { id: "settings", label: "设置", icon: Settings },
@@ -66,6 +68,7 @@ export function App() {
   const [createOpen, setCreateOpen] = useState(false);
   const [createdSecret, setCreatedSecret] = useState("");
   const [accountEditor, setAccountEditor] = useState<Account | "new" | null>(null);
+  const [keyEditor, setKeyEditor] = useState<VirtualKey | null>(null);
   const [checkingAccount, setCheckingAccount] = useState("");
 
   const refresh = useCallback(async () => {
@@ -154,7 +157,8 @@ export function App() {
   const titles: Record<View, [string, string]> = {
     overview: ["运行总览", "代理流量、成本与健康状态"],
     accounts: ["上游账号", "DeepSeek 账号健康与余额状态"],
-    keys: ["接入配置", "OpenAI 兼容地址、平台 Key 与租户密钥"],
+    access: ["接入配置", "OpenAI 兼容地址与平台 Key"],
+    keys: ["租户密钥", "凭据、配额与实时用量"],
     usage: ["请求账本", "持久化调用明细与 Token 用量"],
     balances: ["余额历史", "上游账号余额快照"],
     settings: ["系统设置", "管理员访问凭据与本地运行配置"],
@@ -205,19 +209,35 @@ export function App() {
             onToggle={async (account) => { setError(""); try { await api.updateAccount(account.id, accountPayload(account, !account.enabled)); await refresh(); } catch (err) { setError(err instanceof Error ? err.message : "更新账号失败"); } }}
             onDelete={async (account) => { if (confirm(`删除账号 ${account.name}？`)) { setError(""); try { await api.deleteAccount(account.id); await refresh(); } catch (err) { setError(err instanceof Error ? err.message : "删除账号失败"); } } }}
           />}
-          {view === "keys" && <div className="stack"><AccessConfig config={clientConfig} /><Keys keys={keys} onCreate={() => { setCreatedSecret(""); setCreateOpen(true); }} onRevoke={async (id) => { if (confirm("撤销后客户端将立即无法使用该密钥。继续吗？")) { await api.revokeKey(id); await refresh(); } }} /></div>}
+          {view === "access" && <AccessConfig config={clientConfig} />}
+          {view === "keys" && <Keys keys={keys} onCreate={() => { setCreatedSecret(""); setCreateOpen(true); }} onEdit={setKeyEditor} />}
           {view === "usage" && <Usage events={usage} onFilter={async (query) => { setLoading(true); try { setUsage(await api.usage(query)); } finally { setLoading(false); } }} />}
           {view === "balances" && <Balances snapshots={balances} accounts={accounts} onFilter={async (query) => { setLoading(true); try { setBalances(await api.balances(query)); } finally { setLoading(false); } }} />}
           {view === "settings" && <SettingsPage onRotate={rotateAdminKey} />}
         </div>
       </main>
       {createOpen && <CreateKeyModal secret={createdSecret} onClose={() => setCreateOpen(false)} onCreate={async (body) => { const result = await api.createKey(body); setCreatedSecret(result.secret); await refresh(); }} />}
+      {keyEditor && <KeyModal keyItem={keyEditor} onClose={() => setKeyEditor(null)} onSave={async (body) => {
+        const saved = await api.updateKey(keyEditor.id, body);
+        setKeys((current) => current.map((item) => item.id === saved.id ? saved : item));
+        setKeyEditor(saved);
+        return saved;
+      }} onRotate={async () => {
+        const result = await api.rotateKey(keyEditor.id);
+        setKeys((current) => current.map((item) => item.id === result.key.id ? result.key : item));
+        setKeyEditor(result.key);
+        return result.key;
+      }} onRevoke={async () => {
+        await api.revokeKey(keyEditor.id);
+        setKeyEditor(null);
+        await refresh();
+      }} />}
       {accountEditor && <AccountModal account={accountEditor === "new" ? undefined : accountEditor} onClose={() => setAccountEditor(null)} onSave={async (body) => {
         const firstHealthyAccount = !accounts.some((account) => account.healthy);
         const saved = accountEditor === "new" ? await api.createAccount(body) : await api.updateAccount(accountEditor.id, body);
         setAccountEditor(null);
         await refresh();
-        if (firstHealthyAccount && saved.healthy) setView("keys");
+        if (firstHealthyAccount && saved.healthy) setView("access");
       }} />}
     </div>
   );
@@ -293,8 +313,62 @@ function AccessConfig({ config }: { config: ClientConfig | null }) {
   return <div className="panel access-panel"><PanelHead title="客户端接入" subtitle="OpenAI 兼容代理地址与平台凭据" /><div className="access-content"><div className="access-fields"><div className="access-field"><span>Base URL</span><div className="access-value"><code>{config.base_url}</code><button className="icon-button small" title="复制 Base URL" onClick={() => copy("base", config.base_url)}>{copied === "base" ? <Check size={15} /> : <Clipboard size={15} />}</button></div></div><div className="access-field"><span>平台 API Key</span><div className="access-value"><code>{revealed ? config.api_key : `${config.api_key_prefix}••••••••`}</code><button className="icon-button small" title={revealed ? "隐藏 API Key" : "显示 API Key"} onClick={() => setRevealed((value) => !value)}>{revealed ? <EyeOff size={15} /> : <Eye size={15} />}</button><button className="icon-button small" title="复制平台 API Key" onClick={() => copy("key", config.api_key)}>{copied === "key" ? <Check size={15} /> : <Clipboard size={15} />}</button></div></div></div><div className="access-command"><div className="access-command-head"><span>请求示例</span><button className="icon-button small" title="复制请求示例" onClick={() => copy("command", command)}>{copied === "command" ? <Check size={15} /> : <Clipboard size={15} />}</button></div><pre>{command}</pre></div></div></div>;
 }
 
-function Keys({ keys, onCreate, onRevoke }: { keys: VirtualKey[]; onCreate: () => void; onRevoke: (id: string) => void }) {
-  return <div className="panel"><PanelHead title="租户密钥" subtitle={`${keys.filter((k) => k.enabled).length} 个启用`} action={<button className="primary" onClick={onCreate}><KeyRound size={16} />创建密钥</button>} /><div className="table-wrap"><table><thead><tr><th>名称 / 租户</th><th>密钥</th><th>当日用量</th><th>配额</th><th>状态</th><th></th></tr></thead><tbody>{keys.map((k) => <tr key={k.id}><td><strong>{k.name}</strong><small>{k.tenant_id}</small></td><td className="mono">{k.prefix}</td><td><strong>{formatCompact(k.usage.daily_tokens)}</strong><small>¥ {k.usage.daily_cost_cny.toFixed(4)}</small></td><td><small>{quotaText(k.quota)}</small></td><td><Status ok={k.enabled} label={k.enabled ? "启用" : "已撤销"} /></td><td>{k.enabled && k.id !== "vk-default" && <button className="danger-action" onClick={() => onRevoke(k.id)}>撤销</button>}</td></tr>)}</tbody></table></div></div>;
+function Keys({ keys, onCreate, onEdit }: { keys: VirtualKey[]; onCreate: () => void; onEdit: (key: VirtualKey) => void }) {
+  const [revealed, setRevealed] = useState<Record<string, boolean>>({});
+  const [copied, setCopied] = useState("");
+  const copy = async (key: VirtualKey) => {
+    if (!key.secret_available) return;
+    await navigator.clipboard.writeText(key.secret);
+    setCopied(key.id);
+    window.setTimeout(() => setCopied(""), 1600);
+  };
+  return <div className="panel key-panel"><PanelHead title="租户密钥" subtitle={`${keys.filter((k) => k.enabled).length} 个启用 · ${keys.length} 个密钥`} action={<button className="primary" onClick={onCreate}><KeyRound size={16} />创建密钥</button>} /><div className="table-wrap key-table"><table><thead><tr><th>名称 / 租户</th><th>密钥</th><th>实时请求</th><th>当日用量</th><th>配额</th><th>状态</th><th></th></tr></thead><tbody>{keys.map((k) => <tr key={k.id}><td><strong>{k.name}</strong><small>{k.tenant_id} · {k.id}</small></td><td><div className="key-secret"><code>{k.secret_available ? (revealed[k.id] ? k.secret : `${k.prefix}••••••••`) : "历史密钥不可恢复"}</code><button className="icon-button small" title={revealed[k.id] ? "隐藏密钥" : "查看密钥"} disabled={!k.secret_available} onClick={() => setRevealed((current) => ({ ...current, [k.id]: !current[k.id] }))}>{revealed[k.id] ? <EyeOff size={15} /> : <Eye size={15} />}</button><button className="icon-button small" title="复制密钥" disabled={!k.secret_available} onClick={() => copy(k)}>{copied === k.id ? <Check size={15} /> : <Clipboard size={15} />}</button></div></td><td><strong>{formatNumber(k.usage.requests_this_minute)} 次/分钟</strong><small>{formatNumber(k.usage.active_requests)} 个处理中</small></td><td><strong>{formatCompact(k.usage.daily_tokens)} Token</strong><small>¥ {k.usage.daily_cost_cny.toFixed(4)}</small></td><td><small className="quota-copy">{quotaText(k.quota)}</small></td><td><Status ok={k.enabled} label={k.enabled ? "启用" : "已停用"} /></td><td><button className="icon-button small" title="管理密钥" onClick={() => onEdit(k)}><Pencil size={15} /></button></td></tr>)}</tbody></table>{!keys.length && <Empty label="尚未创建租户密钥" />}</div></div>;
+}
+
+function KeyModal({ keyItem, onClose, onSave, onRotate, onRevoke }: { keyItem: VirtualKey; onClose: () => void; onSave: (body: VirtualKeyInput) => Promise<VirtualKey>; onRotate: () => Promise<VirtualKey>; onRevoke: () => Promise<void> }) {
+  const [current, setCurrent] = useState(keyItem);
+  const [name, setName] = useState(keyItem.name);
+  const [tenant, setTenant] = useState(keyItem.tenant_id);
+  const [rpm, setRpm] = useState(String(keyItem.quota.requests_per_minute || ""));
+  const [concurrent, setConcurrent] = useState(String(keyItem.quota.concurrent_requests || ""));
+  const [tokens, setTokens] = useState(String(keyItem.quota.daily_tokens || ""));
+  const [cost, setCost] = useState(String(keyItem.quota.daily_cost_cny || ""));
+  const [enabled, setEnabled] = useState(keyItem.enabled);
+  const [revealed, setRevealed] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const payload = (): VirtualKeyInput => ({ name: name.trim(), tenant_id: tenant.trim(), enabled: current.id === "vk-default" ? true : enabled, quota: { requests_per_minute: numberOrZero(rpm), concurrent_requests: numberOrZero(concurrent), daily_tokens: numberOrZero(tokens), daily_cost_cny: numberOrZero(cost) } });
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy("save");
+    setError("");
+    try {
+      const saved = await onSave(payload());
+      setCurrent(saved);
+      setEnabled(saved.enabled);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存密钥失败");
+    } finally {
+      setBusy("");
+    }
+  };
+  const rotate = async () => {
+    if (!confirm("轮换后旧密钥会立即失效。继续吗？")) return;
+    setBusy("rotate");
+    setError("");
+    try {
+      const rotated = await onRotate();
+      setCurrent(rotated);
+      setEnabled(true);
+      setRevealed(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "轮换密钥失败");
+    } finally {
+      setBusy("");
+    }
+  };
+  return <div className="modal-backdrop"><div className="modal key-modal"><div className="modal-head"><div><h2>管理租户密钥</h2><p>{current.id} · 创建于 {formatTime(current.created_at)}</p></div><button className="icon-button" title="关闭" onClick={onClose}><X size={19} /></button></div><div className="key-modal-body"><section className="key-credential"><div className="section-label">API Key</div><div className="key-credential-value"><code>{current.secret_available ? (revealed ? current.secret : `${current.prefix}••••••••`) : "此密钥由旧版本创建，当前无法恢复"}</code><button className="icon-button small" title={revealed ? "隐藏密钥" : "查看密钥"} disabled={!current.secret_available} onClick={() => setRevealed((value) => !value)}>{revealed ? <EyeOff size={15} /> : <Eye size={15} />}</button><button className="icon-button small" title="复制密钥" disabled={!current.secret_available} onClick={async () => { await navigator.clipboard.writeText(current.secret); setCopied(true); window.setTimeout(() => setCopied(false), 1600); }}>{copied ? <Check size={15} /> : <Clipboard size={15} />}</button></div>{!current.secret_available && current.id !== "vk-default" && <p className="settings-note">轮换后会生成可查看的新密钥，旧密钥立即失效。</p>}</section><section><div className="section-label">当前用量</div><div className="key-usage-grid"><div><span>本分钟请求</span><strong>{formatNumber(current.usage.requests_this_minute)}</strong></div><div><span>处理中</span><strong>{formatNumber(current.usage.active_requests)}</strong></div><div><span>今日 Token</span><strong>{formatCompact(current.usage.daily_tokens)}</strong></div><div><span>今日费用</span><strong>¥ {current.usage.daily_cost_cny.toFixed(4)}</strong></div></div></section><form onSubmit={submit} className="create-form key-form"><div className="section-label">租户与配额</div><div className="form-grid"><label>名称<input value={name} onChange={(e) => setName(e.target.value)} required /></label><label>租户 ID<input value={tenant} onChange={(e) => setTenant(e.target.value)} required /></label><label>每分钟请求<input type="number" min="0" value={rpm} onChange={(e) => setRpm(e.target.value)} placeholder="不限" /></label><label>最大并发<input type="number" min="0" value={concurrent} onChange={(e) => setConcurrent(e.target.value)} placeholder="不限" /></label><label>每日 Token<input type="number" min="0" value={tokens} onChange={(e) => setTokens(e.target.value)} placeholder="不限" /></label><label>每日费用（元）<input type="number" min="0" step="0.01" value={cost} onChange={(e) => setCost(e.target.value)} placeholder="不限" /></label></div><label className={`check-row ${current.id === "vk-default" ? "disabled" : ""}`}><input type="checkbox" checked={enabled} disabled={current.id === "vk-default"} onChange={(e) => setEnabled(e.target.checked)} />启用密钥{current.id === "vk-default" && "（平台默认 Key 始终启用）"}</label>{error && <p className="form-error">{error}</p>}<div className="modal-actions key-modal-actions">{current.id !== "vk-default" && <><button type="button" className="secondary" disabled={Boolean(busy)} onClick={rotate}><RefreshCw size={15} />{busy === "rotate" ? "正在轮换" : "轮换密钥"}</button><button type="button" className="danger-action" disabled={Boolean(busy)} onClick={async () => { if (!confirm("撤销后客户端将立即无法使用该密钥。继续吗？")) return; setBusy("revoke"); setError(""); try { await onRevoke(); } catch (err) { setError(err instanceof Error ? err.message : "撤销密钥失败"); setBusy(""); } }}>撤销</button></>}<span className="modal-action-spacer" /><button type="button" className="secondary" onClick={onClose}>关闭</button><button className="primary" disabled={Boolean(busy)}>{busy === "save" ? "正在保存" : "保存配置"}</button></div></form></div></div></div>;
 }
 
 function accountPayload(account: Account, enabled = account.enabled): AccountInput {
@@ -341,10 +415,10 @@ function Balances({ snapshots, accounts, onFilter }: { snapshots: BalanceSnapsho
   return <div className="panel"><PanelHead title="余额快照" subtitle={`显示 ${snapshots.length} 条记录`} action={<div className="filters"><select value={account} onChange={(e) => { setAccount(e.target.value); onFilter(e.target.value ? `account_id=${encodeURIComponent(e.target.value)}&limit=200` : "limit=200"); }}><option value="">全部账号</option>{accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}</select></div>} /><div className="table-wrap"><table><thead><tr><th>采集时间</th><th>账号</th><th>币种</th><th>总余额</th><th>赠金</th><th>充值余额</th></tr></thead><tbody>{snapshots.map((s, index) => <tr key={`${s.account_id}-${s.observed_at}-${index}`}><td>{formatTime(s.observed_at)}</td><td>{s.account_id}</td><td>{s.currency}</td><td className="money">{s.total_balance}</td><td>{s.granted_balance}</td><td>{s.topped_up_balance}</td></tr>)}</tbody></table>{!snapshots.length && <Empty label="暂无余额快照" />}</div></div>;
 }
 
-function CreateKeyModal({ secret, onClose, onCreate }: { secret: string; onClose: () => void; onCreate: (body: unknown) => Promise<void> }) {
+function CreateKeyModal({ secret, onClose, onCreate }: { secret: string; onClose: () => void; onCreate: (body: VirtualKeyInput) => Promise<void> }) {
   const [name, setName] = useState(""); const [tenant, setTenant] = useState(""); const [rpm, setRpm] = useState(""); const [concurrent, setConcurrent] = useState(""); const [tokens, setTokens] = useState(""); const [cost, setCost] = useState(""); const [busy, setBusy] = useState(false); const [copied, setCopied] = useState(false);
-  const submit = async (e: FormEvent) => { e.preventDefault(); setBusy(true); try { await onCreate({ name, tenant_id: tenant, quota: { requests_per_minute: numberOrZero(rpm), concurrent_requests: numberOrZero(concurrent), daily_tokens: numberOrZero(tokens), daily_cost_cny: numberOrZero(cost) } }); } finally { setBusy(false); } };
-  return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><div><h2>{secret ? "密钥已创建" : "创建虚拟密钥"}</h2><p>{secret ? "请立即保存，关闭后不再显示。" : "为租户设置独立凭据和用量边界。"}</p></div><button className="icon-button" title="关闭" onClick={onClose}><X size={19} /></button></div>{secret ? <div className="secret-result"><label>虚拟 API Key</label><div><code>{secret}</code><button className="icon-button" title="复制密钥" onClick={async () => { await navigator.clipboard.writeText(secret); setCopied(true); }} >{copied ? <Check size={18} /> : <Clipboard size={18} />}</button></div><button className="primary full" onClick={onClose}>完成</button></div> : <form onSubmit={submit} className="create-form"><div className="form-grid"><label>名称<input value={name} onChange={(e) => setName(e.target.value)} required placeholder="生产应用" /></label><label>租户 ID<input value={tenant} onChange={(e) => setTenant(e.target.value)} required placeholder="tenant-prod" /></label><label>每分钟请求<input type="number" min="0" value={rpm} onChange={(e) => setRpm(e.target.value)} placeholder="不限" /></label><label>最大并发<input type="number" min="0" value={concurrent} onChange={(e) => setConcurrent(e.target.value)} placeholder="不限" /></label><label>每日 Token<input type="number" min="0" value={tokens} onChange={(e) => setTokens(e.target.value)} placeholder="不限" /></label><label>每日费用（元）<input type="number" min="0" step="0.01" value={cost} onChange={(e) => setCost(e.target.value)} placeholder="不限" /></label></div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={busy}>{busy ? "正在创建" : "创建"}</button></div></form>}</div></div>;
+  const submit = async (e: FormEvent) => { e.preventDefault(); setBusy(true); try { await onCreate({ name, tenant_id: tenant, enabled: true, quota: { requests_per_minute: numberOrZero(rpm), concurrent_requests: numberOrZero(concurrent), daily_tokens: numberOrZero(tokens), daily_cost_cny: numberOrZero(cost) } }); } finally { setBusy(false); } };
+  return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><div><h2>{secret ? "密钥已创建" : "创建租户密钥"}</h2><p>{secret ? "可在租户密钥菜单中随时查看、复制或轮换。" : "为租户设置独立凭据和用量边界。"}</p></div><button className="icon-button" title="关闭" onClick={onClose}><X size={19} /></button></div>{secret ? <div className="secret-result"><label>租户 API Key</label><div><code>{secret}</code><button className="icon-button" title="复制密钥" onClick={async () => { await navigator.clipboard.writeText(secret); setCopied(true); }} >{copied ? <Check size={18} /> : <Clipboard size={18} />}</button></div><button className="primary full" onClick={onClose}>完成</button></div> : <form onSubmit={submit} className="create-form"><div className="form-grid"><label>名称<input value={name} onChange={(e) => setName(e.target.value)} required placeholder="生产应用" /></label><label>租户 ID<input value={tenant} onChange={(e) => setTenant(e.target.value)} required placeholder="tenant-prod" /></label><label>每分钟请求<input type="number" min="0" value={rpm} onChange={(e) => setRpm(e.target.value)} placeholder="不限" /></label><label>最大并发<input type="number" min="0" value={concurrent} onChange={(e) => setConcurrent(e.target.value)} placeholder="不限" /></label><label>每日 Token<input type="number" min="0" value={tokens} onChange={(e) => setTokens(e.target.value)} placeholder="不限" /></label><label>每日费用（元）<input type="number" min="0" step="0.01" value={cost} onChange={(e) => setCost(e.target.value)} placeholder="不限" /></label></div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={busy}>{busy ? "正在创建" : "创建"}</button></div></form>}</div></div>;
 }
 
 function PanelHead({ title, subtitle, action }: { title: string; subtitle: string; action?: React.ReactNode }) { return <div className="panel-head"><div><h2>{title}</h2><p>{subtitle}</p></div>{action}</div>; }

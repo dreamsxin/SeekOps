@@ -153,14 +153,16 @@ type QuotaUsage struct {
 }
 
 type VirtualKeyView struct {
-	ID        string      `json:"id"`
-	Name      string      `json:"name"`
-	TenantID  string      `json:"tenant_id"`
-	Prefix    string      `json:"prefix"`
-	Enabled   bool        `json:"enabled"`
-	CreatedAt time.Time   `json:"created_at"`
-	Quota     QuotaPolicy `json:"quota"`
-	Usage     QuotaUsage  `json:"usage"`
+	ID              string      `json:"id"`
+	Name            string      `json:"name"`
+	TenantID        string      `json:"tenant_id"`
+	Prefix          string      `json:"prefix"`
+	Secret          string      `json:"secret"`
+	SecretAvailable bool        `json:"secret_available"`
+	Enabled         bool        `json:"enabled"`
+	CreatedAt       time.Time   `json:"created_at"`
+	Quota           QuotaPolicy `json:"quota"`
+	Usage           QuotaUsage  `json:"usage"`
 }
 
 type virtualKey struct {
@@ -194,15 +196,20 @@ func NewKeyStoreWithDB(defaultSecret string, db *sql.DB) *KeyStore {
 	if defaultSecret != "" {
 		store.mu.Lock()
 		hash := hashSecret(defaultSecret)
-		if _, exists := store.byHash[hash]; !exists {
-			if old, exists := store.byID["vk-default"]; exists {
-				delete(store.byHash, old.Hash)
-			}
-			key := store.add("vk-default", "Default platform key", "default", defaultSecret)
-			if db != nil {
-				if err := store.persistKeyLocked(db, key); err != nil {
-					log.Printf("persist default virtual key: %v", err)
-				}
+		key, exists := store.byID["vk-default"]
+		if exists {
+			delete(store.byHash, key.Hash)
+			key.Hash = hash
+			key.Secret = defaultSecret
+			key.Prefix = secretPrefix(defaultSecret)
+			key.Enabled = true
+			store.byHash[hash] = key
+		} else {
+			key = store.add("vk-default", "Default platform key", "default", defaultSecret)
+		}
+		if db != nil {
+			if err := store.persistKeyLocked(db, key); err != nil {
+				log.Printf("persist default virtual key: %v", err)
 			}
 		}
 		store.mu.Unlock()
@@ -211,7 +218,7 @@ func NewKeyStoreWithDB(defaultSecret string, db *sql.DB) *KeyStore {
 }
 func (s *KeyStore) add(id, name, tenant, secret string) *virtualKey {
 	hash := hashSecret(secret)
-	key := &virtualKey{VirtualKeyView: VirtualKeyView{ID: id, Name: name, TenantID: tenant, Prefix: secretPrefix(secret), Enabled: true, CreatedAt: time.Now()}, Hash: hash}
+	key := &virtualKey{VirtualKeyView: VirtualKeyView{ID: id, Name: name, TenantID: tenant, Prefix: secretPrefix(secret), Secret: secret, Enabled: true, CreatedAt: time.Now()}, Hash: hash}
 	s.byHash[hash] = key
 	s.byID[id] = key
 	return key
@@ -239,6 +246,9 @@ func (s *KeyStore) CreateWithQuota(name, tenant string, quota QuotaPolicy) (Virt
 	if name == "" || tenant == "" {
 		return VirtualKeyView{}, "", fmt.Errorf("name and tenant_id are required")
 	}
+	if quota.RequestsPerMinute < 0 || quota.ConcurrentRequests < 0 || quota.DailyTokens < 0 || quota.DailyCostCNY < 0 {
+		return VirtualKeyView{}, "", fmt.Errorf("quota values must not be negative")
+	}
 	secret := "sk-proxy-" + newID()
 	id := "vk-" + newID()[:16]
 	s.mu.Lock()
@@ -256,10 +266,17 @@ func (s *KeyStore) CreateWithQuota(name, tenant string, quota QuotaPolicy) (Virt
 	return key.view(), secret, nil
 }
 func (s *KeyStore) List() []VirtualKeyView {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
 	result := make([]VirtualKeyView, 0, len(s.byID))
 	for _, key := range s.byID {
+		key.resetUsage(now)
+		minute := now.Unix() / 60
+		if key.minute != minute {
+			key.minute = minute
+			key.minuteRequests = 0
+		}
 		result = append(result, key.view())
 	}
 	for i := 0; i < len(result); i++ {
@@ -343,10 +360,76 @@ func (key *virtualKey) resetUsage(now time.Time) {
 }
 func (key *virtualKey) view() VirtualKeyView {
 	view := key.VirtualKeyView
+	view.SecretAvailable = view.Secret != ""
 	view.Usage = QuotaUsage{Date: key.usageDate, RequestsThisMinute: key.minuteRequests, ActiveRequests: key.active, DailyTokens: key.dailyTokens, DailyCostCNY: key.dailyCostCNY}
 	return view
 }
+
+func (s *KeyStore) Update(id, name, tenant string, quota QuotaPolicy, enabled bool) (VirtualKeyView, error) {
+	name = strings.TrimSpace(name)
+	tenant = strings.TrimSpace(tenant)
+	if name == "" || tenant == "" {
+		return VirtualKeyView{}, fmt.Errorf("name and tenant_id are required")
+	}
+	if quota.RequestsPerMinute < 0 || quota.ConcurrentRequests < 0 || quota.DailyTokens < 0 || quota.DailyCostCNY < 0 {
+		return VirtualKeyView{}, fmt.Errorf("quota values must not be negative")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, ok := s.byID[id]
+	if !ok {
+		return VirtualKeyView{}, fmt.Errorf("virtual key not found")
+	}
+	if id == "vk-default" {
+		enabled = true
+	}
+	previous := key.VirtualKeyView
+	key.Name = name
+	key.TenantID = tenant
+	key.Quota = quota
+	key.Enabled = enabled
+	if s.db != nil {
+		if err := s.persistKeyLocked(s.db, key); err != nil {
+			key.VirtualKeyView = previous
+			return VirtualKeyView{}, err
+		}
+	}
+	return key.view(), nil
+}
+
+func (s *KeyStore) Rotate(id string) (VirtualKeyView, string, error) {
+	if id == "vk-default" {
+		return VirtualKeyView{}, "", fmt.Errorf("default platform key is configured by PLATFORM_API_KEY")
+	}
+	secret := "sk-proxy-" + newID()
+	hash := hashSecret(secret)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, ok := s.byID[id]
+	if !ok {
+		return VirtualKeyView{}, "", fmt.Errorf("virtual key not found")
+	}
+	oldHash, oldPrefix, oldSecret, oldEnabled := key.Hash, key.Prefix, key.Secret, key.Enabled
+	delete(s.byHash, oldHash)
+	key.Hash = hash
+	key.Prefix = secretPrefix(secret)
+	key.Secret = secret
+	key.Enabled = true
+	s.byHash[hash] = key
+	if s.db != nil {
+		if err := s.persistKeyLocked(s.db, key); err != nil {
+			delete(s.byHash, hash)
+			key.Hash, key.Prefix, key.Secret, key.Enabled = oldHash, oldPrefix, oldSecret, oldEnabled
+			s.byHash[oldHash] = key
+			return VirtualKeyView{}, "", err
+		}
+	}
+	return key.view(), secret, nil
+}
 func (s *KeyStore) Revoke(id string) bool {
+	if id == "vk-default" {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key, ok := s.byID[id]
@@ -367,6 +450,9 @@ func hashSecret(secret string) string {
 	return hex.EncodeToString(hash[:])
 }
 func secretPrefix(secret string) string {
+	if strings.HasPrefix(secret, "sk-proxy-") && len(secret) > 17 {
+		return secret[:17] + "..."
+	}
 	if len(secret) <= 8 {
 		return secret
 	}
@@ -1018,6 +1104,48 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]any{"key": view, "secret": secret})
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/admin/virtual-keys/") && r.Method == http.MethodPut {
+		id := strings.TrimPrefix(r.URL.Path, "/admin/virtual-keys/")
+		if id == "" || strings.Contains(id, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		var input struct {
+			Name     string      `json:"name"`
+			TenantID string      `json:"tenant_id"`
+			Quota    QuotaPolicy `json:"quota"`
+			Enabled  bool        `json:"enabled"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&input); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		view, err := s.keys.Update(id, input.Name, input.TenantID, input.Quota, input.Enabled)
+		if err != nil {
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "not found") {
+				status = http.StatusNotFound
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, view)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/admin/virtual-keys/") && r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/rotate") {
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/admin/virtual-keys/"), "/rotate")
+		view, secret, err := s.keys.Rotate(id)
+		if err != nil {
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "not found") {
+				status = http.StatusNotFound
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"key": view, "secret": secret})
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/admin/virtual-keys/") && r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/revoke") {

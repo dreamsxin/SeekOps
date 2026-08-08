@@ -1,4 +1,4 @@
-import type { Account, AccountInput, AdminSetupStatus, BalanceSnapshot, ClientConfig, RequestEvent, Stats, VirtualKey } from "./types";
+import type { Account, AccountInput, AdminSetupStatus, BalanceSnapshot, ClientConfig, RequestEvent, Stats, VirtualKey, VirtualKeyInput } from "./types";
 
 const keyName = "seekops.adminKey";
 
@@ -39,6 +39,8 @@ export const api = {
   keys: () => request<VirtualKey[]>("/admin/virtual-keys"),
   usage: (query = "") => request<RequestEvent[]>(`/admin/usage${query ? `?${query}` : ""}`),
   balances: (query = "") => request<BalanceSnapshot[]>(`/admin/balance-history${query ? `?${query}` : ""}`),
-  createKey: (body: unknown) => request<{ key: VirtualKey; secret: string }>("/admin/virtual-keys", { method: "POST", body: JSON.stringify(body) }),
+  createKey: (body: VirtualKeyInput) => request<{ key: VirtualKey; secret: string }>("/admin/virtual-keys", { method: "POST", body: JSON.stringify(body) }),
+  updateKey: (id: string, body: VirtualKeyInput) => request<VirtualKey>(`/admin/virtual-keys/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(body) }),
+  rotateKey: (id: string) => request<{ key: VirtualKey; secret: string }>(`/admin/virtual-keys/${encodeURIComponent(id)}/rotate`, { method: "POST" }),
   revokeKey: (id: string) => request<{ id: string; revoked: boolean }>(`/admin/virtual-keys/${encodeURIComponent(id)}/revoke`, { method: "POST" }),
 };

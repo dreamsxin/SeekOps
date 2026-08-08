@@ -70,8 +70,10 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `POST /admin/accounts/{id}/check`：立即调用上游余额接口检测账号凭据和可用状态
 - `DELETE /admin/accounts/{id}`：删除托管账号；环境变量账号为只读
 - `GET /admin/balance-history`：查询余额快照，支持 `account_id` 和 `limit` 参数
-- `GET /admin/virtual-keys`：列出虚拟 Key（只显示前缀）
-- `POST /admin/virtual-keys`：创建虚拟 Key，JSON 可包含 `quota.requests_per_minute`、`quota.concurrent_requests`、`quota.daily_tokens`、`quota.daily_cost_cny`，密钥只在创建响应中返回一次
+- `GET /admin/virtual-keys`：列出租户虚拟 Key、可恢复密钥、配额和当前用量
+- `POST /admin/virtual-keys`：创建虚拟 Key，JSON 可包含 `quota.requests_per_minute`、`quota.concurrent_requests`、`quota.daily_tokens`、`quota.daily_cost_cny`
+- `PUT /admin/virtual-keys/{id}`：更新名称、租户、启用状态和四类配额
+- `POST /admin/virtual-keys/{id}/rotate`：轮换租户密钥，旧密钥立即失效
 - `POST /admin/virtual-keys/{id}/revoke`：撤销虚拟 Key
 - `/chat/completions`、`/v1/chat/completions`：Chat Completions 代理
 - `/responses`、`/v1/responses`：Responses 代理
@@ -79,7 +81,7 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 
 Chat JSON 请求体在 MVP 中限制为 32 MiB；流式 Chat 请求会在转发前确保 `stream_options.include_usage=true`，以便从最后一个 SSE 块记账。虚拟 Key、用量事件、统计恢复和余额快照会写入 SQLite。
 
-控制台创建或更新上游账号时会立即检测一次，后台还会按 `BALANCE_POLL_INTERVAL` 自动检测；账号列表也提供单账号手动检测。未完成检测的账号显示“待检测”，只有余额接口成功返回后才显示“健康”。控制台账号会立即加入代理池并写入 SQLite；环境变量账号继续作为只读基线。上游 API Key 必须可在重启后恢复，因此本地数据库包含可用凭据，部署时应限制 `data/seekops.db` 的文件访问权限。
+控制台创建或更新上游账号时会立即检测一次，后台还会按 `BALANCE_POLL_INTERVAL` 自动检测；账号列表也提供单账号手动检测。未完成检测的账号显示“待检测”，只有余额接口成功返回后才显示“健康”。控制台账号会立即加入代理池并写入 SQLite；环境变量账号继续作为只读基线。上游 API Key 和控制台创建的租户 Key 必须可在重启后恢复，因此本地数据库包含可用凭据，部署时应严格限制 `data/seekops.db` 的文件访问权限并纳入安全备份。历史版本创建且只保存哈希的租户 Key 会显示为不可恢复，可通过轮换生成可查看的新密钥。
 
 管理控制台源码位于 `web/`，生产构建会写入 `internal/proxy/web/` 并嵌入 Go 二进制：
 

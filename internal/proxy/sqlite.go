@@ -70,6 +70,7 @@ func migrateSQLite(db *sql.DB) error {
 			name TEXT NOT NULL,
 			tenant_id TEXT NOT NULL,
 			prefix TEXT NOT NULL,
+			secret TEXT NOT NULL DEFAULT '',
 			secret_hash TEXT NOT NULL UNIQUE,
 			enabled INTEGER NOT NULL DEFAULT 1,
 			created_at TEXT NOT NULL,
@@ -122,11 +123,38 @@ func migrateSQLite(db *sql.DB) error {
 			return fmt.Errorf("migrate sqlite: %w", err)
 		}
 	}
+	if err := ensureVirtualKeySecretColumn(db); err != nil {
+		return fmt.Errorf("migrate sqlite virtual key secret: %w", err)
+	}
 	return nil
 }
 
+func ensureVirtualKeySecretColumn(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(virtual_keys)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == "secret" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec(`ALTER TABLE virtual_keys ADD COLUMN secret TEXT NOT NULL DEFAULT ''`)
+	return err
+}
+
 func (s *KeyStore) loadSQLite(db *sql.DB) {
-	rows, err := db.Query(`SELECT id, name, tenant_id, prefix, secret_hash, enabled, created_at,
+	rows, err := db.Query(`SELECT id, name, tenant_id, prefix, secret, secret_hash, enabled, created_at,
 		quota_rpm, quota_concurrent, quota_daily_tokens, quota_daily_cost_cny,
 		usage_date, daily_tokens, daily_cost_cny FROM virtual_keys`)
 	if err != nil {
@@ -138,7 +166,7 @@ func (s *KeyStore) loadSQLite(db *sql.DB) {
 		var key virtualKey
 		var enabled int
 		var createdAt string
-		if err := rows.Scan(&key.ID, &key.Name, &key.TenantID, &key.Prefix, &key.Hash, &enabled, &createdAt,
+		if err := rows.Scan(&key.ID, &key.Name, &key.TenantID, &key.Prefix, &key.Secret, &key.Hash, &enabled, &createdAt,
 			&key.Quota.RequestsPerMinute, &key.Quota.ConcurrentRequests, &key.Quota.DailyTokens, &key.Quota.DailyCostCNY,
 			&key.usageDate, &key.dailyTokens, &key.dailyCostCNY); err != nil {
 			log.Printf("scan virtual key from sqlite: %v", err)
@@ -153,16 +181,17 @@ func (s *KeyStore) loadSQLite(db *sql.DB) {
 
 func (s *KeyStore) persistKeyLocked(db *sql.DB, key *virtualKey) error {
 	_, err := db.Exec(`INSERT INTO virtual_keys
-		(id, name, tenant_id, prefix, secret_hash, enabled, created_at, quota_rpm, quota_concurrent,
+		(id, name, tenant_id, prefix, secret, secret_hash, enabled, created_at, quota_rpm, quota_concurrent,
 		 quota_daily_tokens, quota_daily_cost_cny, usage_date, daily_tokens, daily_cost_cny)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, tenant_id=excluded.tenant_id,
-		prefix=excluded.prefix, secret_hash=excluded.secret_hash, enabled=excluded.enabled, created_at=excluded.created_at,
+		prefix=excluded.prefix, secret=excluded.secret, secret_hash=excluded.secret_hash,
+		enabled=excluded.enabled, created_at=excluded.created_at,
 		quota_rpm=excluded.quota_rpm,
 		quota_concurrent=excluded.quota_concurrent, quota_daily_tokens=excluded.quota_daily_tokens,
 		quota_daily_cost_cny=excluded.quota_daily_cost_cny, usage_date=excluded.usage_date,
 		daily_tokens=excluded.daily_tokens, daily_cost_cny=excluded.daily_cost_cny`,
-		key.ID, key.Name, key.TenantID, key.Prefix, key.Hash, boolInt(key.Enabled), key.CreatedAt.UTC().Format(time.RFC3339Nano),
+		key.ID, key.Name, key.TenantID, key.Prefix, key.Secret, key.Hash, boolInt(key.Enabled), key.CreatedAt.UTC().Format(time.RFC3339Nano),
 		key.Quota.RequestsPerMinute, key.Quota.ConcurrentRequests, key.Quota.DailyTokens, key.Quota.DailyCostCNY,
 		key.usageDate, key.dailyTokens, key.dailyCostCNY)
 	return err

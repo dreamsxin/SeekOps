@@ -103,10 +103,19 @@ export interface VirtualKey {
   name: string;
   tenant_id: string;
   prefix: string;
+  secret: string;
+  secret_available: boolean;
   enabled: boolean;
   created_at: string;
   quota: QuotaPolicy;
   usage: QuotaUsage;
+}
+
+export interface VirtualKeyInput {
+  name: string;
+  tenant_id: string;
+  enabled: boolean;
+  quota: QuotaPolicy;
 }
 
 export interface BalanceSnapshot extends BalanceInfo {
