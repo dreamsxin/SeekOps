@@ -3,3 +3,5 @@ dist/
 .env
 *.log
 data/
+web/node_modules/
+web/*.tsbuildinfo

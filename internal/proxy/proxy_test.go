@@ -279,3 +279,26 @@ func TestSQLitePersistenceAcrossServerRestart(t *testing.T) {
 		t.Fatalf("balance query status=%d body=%s", balanceRec.Code, balanceRec.Body.String())
 	}
 }
+
+func TestConsoleAssets(t *testing.T) {
+	s := NewServer(Config{PlatformAPIKey: "admin-secret"})
+	paths := []string{"/console/"}
+	entries, err := ConsoleAssets.ReadDir("web/assets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".js") {
+			paths = append(paths, "/console/assets/"+entry.Name())
+			break
+		}
+	}
+	for _, path := range paths {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || rec.Body.Len() == 0 {
+			t.Fatalf("console path=%s status=%d bytes=%d", path, rec.Code, rec.Body.Len())
+		}
+	}
+}

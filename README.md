@@ -55,6 +55,7 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 
 - `GET /healthz`：进程健康检查
 - `GET /readyz`：是否至少配置一个上游账号
+- `GET /console/`：本地管理控制台
 - `GET /metrics`：Prometheus 文本指标
 - `GET /admin/stats`：管理统计，需要 `X-Admin-Key` 或管理员 Bearer Token
 - `GET /admin/usage`：查询持久化用量事件，支持 `tenant_id`、`virtual_key_id`、`account_id`、`model`、`limit` 参数
@@ -68,6 +69,14 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `/models`、`/v1/models`：模型列表代理
 
 Chat JSON 请求体在 MVP 中限制为 32 MiB；流式 Chat 请求会在转发前确保 `stream_options.include_usage=true`，以便从最后一个 SSE 块记账。虚拟 Key、用量事件、统计恢复和余额快照会写入 SQLite。
+
+管理控制台源码位于 `web/`，生产构建会写入 `internal/proxy/web/` 并嵌入 Go 二进制：
+
+```powershell
+cd web
+npm install
+npm run build
+```
 
 ## 已知边界
 

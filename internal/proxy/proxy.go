@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -21,6 +22,11 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// ConsoleAssets is populated by the frontend build at internal/proxy/web.
+//
+//go:embed web/* web/assets/*
+var ConsoleAssets embed.FS
 
 type Account struct {
 	ID      string   `json:"id"`
@@ -657,6 +663,10 @@ func (s *Server) ListenAndServe() error {
 func (s *Server) Shutdown(ctx context.Context) error { return s.server.Shutdown(ctx) }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/console") {
+		s.console(w, r)
+		return
+	}
 	if r.URL.Path == "/healthz" {
 		writeJSON(w, 200, map[string]any{"status": "ok"})
 		return
@@ -706,6 +716,37 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(ctx)
 	w.Header().Set("X-Proxy-Request-ID", requestID)
 	s.proxy.ServeHTTP(w, r)
+}
+
+func (s *Server) console(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/console")
+	if path == "" || path == "/" {
+		path = "index.html"
+	} else {
+		path = strings.TrimPrefix(path, "/")
+	}
+	if _, err := ConsoleAssets.ReadFile("web/" + path); err != nil {
+		path = "index.html"
+	}
+	data, err := ConsoleAssets.ReadFile("web/" + path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	contentType := "text/plain; charset=utf-8"
+	switch {
+	case strings.HasSuffix(path, ".html"):
+		contentType = "text/html; charset=utf-8"
+	case strings.HasSuffix(path, ".js"):
+		contentType = "text/javascript; charset=utf-8"
+	case strings.HasSuffix(path, ".css"):
+		contentType = "text/css; charset=utf-8"
+	case strings.HasSuffix(path, ".svg"):
+		contentType = "image/svg+xml"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(data)
 }
 
 func isProxyPath(path string) bool {
