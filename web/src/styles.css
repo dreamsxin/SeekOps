@@ -84,6 +84,7 @@ main { min-width: 0; flex: 1; }
 .test-result-head span { margin-top: 3px; color: var(--muted); font-size: 10px; }
 .account-test-result p { margin: 12px 0 0; color: #4c4c48; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
 .model-sync-button { margin-top: 12px; }
+.model-sync-state { color: var(--green) !important; }
 .scrim { display: none; }
 @media (min-width: 701px) { .overview-grid .table-wrap table { min-width: 0; } }
 @media (max-width: 1020px) { .sidebar { width: 205px; flex-basis: 205px; }.content { padding-left: 24px; padding-right: 24px; }.topbar { padding-left: 24px; padding-right: 24px; }.metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.overview-grid { grid-template-columns: 1fr; } }
