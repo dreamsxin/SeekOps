@@ -1,0 +1,614 @@
+package proxy
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type Account struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	APIKey  string   `json:"-"`
+	BaseURL string   `json:"base_url"`
+	Weight  int      `json:"weight"`
+	Models  []string `json:"models,omitempty"`
+
+	active  atomic.Int64
+	fails   atomic.Int64
+	blocked atomic.Int64
+}
+
+func (a *Account) Active() int64 { return a.active.Load() }
+func (a *Account) Healthy(now time.Time) bool {
+	return a.blocked.Load() <= now.Unix()
+}
+func (a *Account) SupportsModel(model string) bool {
+	if model == "" || len(a.Models) == 0 {
+		return true
+	}
+	for _, candidate := range a.Models {
+		if candidate == model {
+			return true
+		}
+	}
+	return false
+}
+func (a *Account) markStatus(status int) {
+	switch {
+	case status == http.StatusUnauthorized:
+		a.blocked.Store(time.Now().Add(10 * time.Minute).Unix())
+	case status == http.StatusPaymentRequired:
+		a.blocked.Store(time.Now().Add(30 * time.Minute).Unix())
+	case status == http.StatusTooManyRequests:
+		a.blocked.Store(time.Now().Add(5 * time.Second).Unix())
+	case status >= 500:
+		a.fails.Add(1)
+		a.blocked.Store(time.Now().Add(3 * time.Second).Unix())
+	default:
+		a.fails.Store(0)
+	}
+}
+
+type Usage struct {
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CacheHitTokens   int64 `json:"cache_hit_tokens"`
+	CacheMissTokens  int64 `json:"cache_miss_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	ReasoningTokens  int64 `json:"reasoning_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
+	UsagePresent     bool  `json:"usage_present"`
+}
+
+type RequestStats struct {
+	RequestID        string    `json:"request_id"`
+	AccountID        string    `json:"account_id"`
+	Model            string    `json:"model,omitempty"`
+	Path             string    `json:"path"`
+	Status           int       `json:"status"`
+	DurationMS       int64     `json:"duration_ms"`
+	FirstByteMS      int64     `json:"first_byte_ms"`
+	Usage            Usage     `json:"usage"`
+	UsageStatus      string    `json:"usage_status"`
+	EstimatedCostCNY float64   `json:"estimated_cost_cny"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+type Stats struct {
+	Requests         int64          `json:"requests"`
+	Successes        int64          `json:"successes"`
+	Errors           int64          `json:"errors"`
+	TotalTokens      int64          `json:"total_tokens"`
+	PromptTokens     int64          `json:"prompt_tokens"`
+	CompletionTokens int64          `json:"completion_tokens"`
+	CacheHitTokens   int64          `json:"cache_hit_tokens"`
+	CacheMissTokens  int64          `json:"cache_miss_tokens"`
+	EstimatedCostCNY float64        `json:"estimated_cost_cny"`
+	LastRequests     []RequestStats `json:"last_requests"`
+}
+
+type Recorder struct {
+	mu     sync.Mutex
+	stats  Stats
+	latest []RequestStats
+}
+
+func NewRecorder() *Recorder { return &Recorder{latest: make([]RequestStats, 0, 50)} }
+func (r *Recorder) Record(event RequestStats) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stats.Requests++
+	if event.Status >= 200 && event.Status < 400 {
+		r.stats.Successes++
+	} else {
+		r.stats.Errors++
+	}
+	r.stats.TotalTokens += event.Usage.TotalTokens
+	r.stats.PromptTokens += event.Usage.PromptTokens
+	r.stats.CompletionTokens += event.Usage.CompletionTokens
+	r.stats.CacheHitTokens += event.Usage.CacheHitTokens
+	r.stats.CacheMissTokens += event.Usage.CacheMissTokens
+	r.stats.EstimatedCostCNY += event.EstimatedCostCNY
+	r.latest = append([]RequestStats{event}, r.latest...)
+	if len(r.latest) > 50 {
+		r.latest = r.latest[:50]
+	}
+}
+func (r *Recorder) Snapshot() Stats {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	snapshot := r.stats
+	snapshot.LastRequests = append([]RequestStats(nil), r.latest...)
+	return snapshot
+}
+
+type Config struct {
+	ListenAddr     string
+	PlatformAPIKey string
+	AdminAPIKey    string
+	RequestTimeout time.Duration
+	Accounts       []*Account
+	PriceInputHit  float64
+	PriceInputMiss float64
+	PriceOutput    float64
+}
+
+type Server struct {
+	config    Config
+	recorder  *Recorder
+	proxy     *httputil.ReverseProxy
+	transport http.RoundTripper
+	server    *http.Server
+	sequence  atomic.Uint64
+}
+
+type contextKey string
+
+const (
+	requestMetaKey contextKey = "request-meta"
+)
+
+type requestMeta struct {
+	requestID string
+	account   *Account
+	path      string
+	started   time.Time
+	recorder  *Recorder
+	priceHit  float64
+	priceMiss float64
+	priceOut  float64
+	firstByte atomic.Int64
+	status    atomic.Int64
+	usage     usageCollector
+	recorded  atomic.Bool
+}
+
+type usageCollector struct {
+	mu    sync.Mutex
+	usage Usage
+	model string
+}
+
+func (u *usageCollector) merge(v Usage, model string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if v.UsagePresent {
+		u.usage = v
+	}
+	if model != "" {
+		u.model = model
+	}
+}
+func (u *usageCollector) snapshot() (Usage, string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.usage, u.model
+}
+
+type trackingBody struct {
+	body io.ReadCloser
+	meta *requestMeta
+	buf  []byte
+}
+
+func (b *trackingBody) Read(p []byte) (int, error) {
+	if b.meta.firstByte.Load() == 0 {
+		b.meta.firstByte.CompareAndSwap(0, time.Since(b.meta.started).Milliseconds())
+	}
+	n, err := b.body.Read(p)
+	if n > 0 {
+		b.buf = append(b.buf, p[:n]...)
+		b.parse()
+	}
+	return n, err
+}
+func (b *trackingBody) Close() error {
+	err := b.body.Close()
+	b.parse()
+	recordMeta(b.meta)
+	return err
+}
+func (b *trackingBody) parse() {
+	if len(b.buf) == 0 {
+		return
+	}
+	if len(b.buf) > 2*1024*1024 {
+		b.buf = b.buf[len(b.buf)-2*1024*1024:]
+	}
+	scanUsage(bytesReader(b.buf), b.meta)
+}
+
+type byteReader struct {
+	data   []byte
+	offset int
+}
+
+func bytesReader(data []byte) *byteReader { return &byteReader{data: data} }
+func (r *byteReader) Read(p []byte) (int, error) {
+	if r.offset >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.offset:])
+	r.offset += n
+	return n, nil
+}
+
+func scanUsage(reader io.Reader, meta *requestMeta) {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 1024), 2*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "data:") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		}
+		if line == "" || line == "[DONE]" || !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var payload map[string]any
+		if json.Unmarshal([]byte(line), &payload) != nil {
+			continue
+		}
+		if value, ok := payload["usage"].(map[string]any); ok {
+			meta.usage.merge(parseUsage(value), stringValue(payload["model"]))
+		}
+		if response, ok := payload["response"].(map[string]any); ok {
+			if value, ok := response["usage"].(map[string]any); ok {
+				meta.usage.merge(parseResponsesUsage(value), stringValue(response["model"]))
+			}
+		}
+	}
+}
+
+func parseUsage(v map[string]any) Usage {
+	prompt := intValue(v["prompt_tokens"])
+	hit := intValue(v["prompt_cache_hit_tokens"])
+	miss := intValue(v["prompt_cache_miss_tokens"])
+	if miss == 0 && prompt > hit {
+		miss = prompt - hit
+	}
+	completion := intValue(v["completion_tokens"])
+	total := intValue(v["total_tokens"])
+	if total == 0 {
+		total = prompt + completion
+	}
+	return Usage{PromptTokens: prompt, CacheHitTokens: hit, CacheMissTokens: miss, CompletionTokens: completion, ReasoningTokens: intValue(nested(v, "completion_tokens_details", "reasoning_tokens")), TotalTokens: total, UsagePresent: true}
+}
+func parseResponsesUsage(v map[string]any) Usage {
+	prompt := intValue(v["input_tokens"])
+	hit := intValue(nested(v, "input_tokens_details", "cached_tokens"))
+	completion := intValue(v["output_tokens"])
+	total := intValue(v["total_tokens"])
+	if total == 0 {
+		total = prompt + completion
+	}
+	return Usage{PromptTokens: prompt, CacheHitTokens: hit, CacheMissTokens: prompt - hit, CompletionTokens: completion, ReasoningTokens: intValue(nested(v, "output_tokens_details", "reasoning_tokens")), TotalTokens: total, UsagePresent: true}
+}
+func nested(m map[string]any, first, second string) any {
+	child, ok := m[first].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return child[second]
+}
+func intValue(v any) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case json.Number:
+		i, _ := n.Int64()
+		return i
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	}
+	return 0
+}
+func stringValue(v any) string { s, _ := v.(string); return s }
+
+func NewServer(cfg Config) *Server {
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = ":8080"
+	}
+	if cfg.PlatformAPIKey == "" {
+		cfg.PlatformAPIKey = "proxy-demo-key"
+	}
+	if cfg.AdminAPIKey == "" {
+		cfg.AdminAPIKey = cfg.PlatformAPIKey
+	}
+	if cfg.RequestTimeout <= 0 {
+		cfg.RequestTimeout = 10 * time.Minute
+	}
+	if cfg.PriceInputHit == 0 {
+		cfg.PriceInputHit = 0.02
+	}
+	if cfg.PriceInputMiss == 0 {
+		cfg.PriceInputMiss = 1
+	}
+	if cfg.PriceOutput == 0 {
+		cfg.PriceOutput = 2
+	}
+	s := &Server{config: cfg, recorder: NewRecorder(), transport: http.DefaultTransport}
+	s.proxy = &httputil.ReverseProxy{Director: s.director, Transport: s.transport, ModifyResponse: s.modifyResponse, ErrorHandler: s.errorHandler, FlushInterval: -1}
+	s.server = &http.Server{Addr: cfg.ListenAddr, Handler: s, ReadHeaderTimeout: 10 * time.Second}
+	return s
+}
+func (s *Server) Recorder() *Recorder   { return s.recorder }
+func (s *Server) Handler() http.Handler { return s }
+func (s *Server) ListenAndServe() error {
+	log.Printf("deepseek proxy listening on %s", s.config.ListenAddr)
+	return s.server.ListenAndServe()
+}
+func (s *Server) Shutdown(ctx context.Context) error { return s.server.Shutdown(ctx) }
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/healthz" {
+		writeJSON(w, 200, map[string]any{"status": "ok"})
+		return
+	}
+	if r.URL.Path == "/readyz" {
+		if len(s.config.Accounts) == 0 {
+			writeJSON(w, 503, map[string]any{"status": "not_ready"})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"status": "ready"})
+		return
+	}
+	if r.URL.Path == "/metrics" {
+		s.writeMetrics(w)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/admin/") {
+		s.admin(w, r)
+		return
+	}
+	if !isProxyPath(r.URL.Path) {
+		http.NotFound(w, r)
+		return
+	}
+	if !s.authorize(w, r) {
+		return
+	}
+	model, status, err := s.prepareRequest(r)
+	if err != nil {
+		writeJSON(w, status, map[string]any{"error": map[string]any{"message": err.Error(), "type": "invalid_request_error"}})
+		return
+	}
+	account := s.selectAccount(r, model)
+	if account == nil {
+		writeJSON(w, 503, map[string]any{"error": map[string]any{"message": "no healthy upstream account available", "type": "proxy_error"}})
+		return
+	}
+	account.active.Add(1)
+	defer account.active.Add(-1)
+	requestID := newID()
+	meta := &requestMeta{requestID: requestID, account: account, path: r.URL.Path, started: time.Now(), recorder: s.recorder, priceHit: s.config.PriceInputHit, priceMiss: s.config.PriceInputMiss, priceOut: s.config.PriceOutput}
+	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
+	defer cancel()
+	ctx = context.WithValue(ctx, requestMetaKey, meta)
+	r = r.WithContext(ctx)
+	w.Header().Set("X-Proxy-Request-ID", requestID)
+	s.proxy.ServeHTTP(w, r)
+}
+
+func isProxyPath(path string) bool {
+	for _, suffix := range []string{"/chat/completions", "/responses", "/models"} {
+		if path == suffix || path == "/v1"+suffix {
+			return true
+		}
+	}
+	return false
+}
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
+	token := r.Header.Get("Authorization")
+	if strings.HasPrefix(token, "Bearer ") {
+		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+	}
+	if token == "" {
+		token = r.Header.Get("X-Proxy-API-Key")
+	}
+	if token != s.config.PlatformAPIKey {
+		writeJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid proxy API key", "type": "authentication_error"}})
+		return false
+	}
+	return true
+}
+func (s *Server) selectAccount(r *http.Request, model string) *Account {
+	now := time.Now()
+	var selected *Account
+	var selectedScore float64
+	start := int(s.sequence.Add(1) % uint64(max(1, len(s.config.Accounts))))
+	for offset := 0; offset < len(s.config.Accounts); offset++ {
+		a := s.config.Accounts[(start+offset)%len(s.config.Accounts)]
+		if a == nil || a.APIKey == "" || !a.Healthy(now) || !a.SupportsModel(model) {
+			continue
+		}
+		weight := a.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		score := float64(a.Active()+1) / float64(weight)
+		if selected == nil || score < selectedScore {
+			selected, selectedScore = a, score
+		}
+	}
+	return selected
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+func (s *Server) prepareRequest(r *http.Request) (string, int, error) {
+	isJSON := strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json")
+	isSupportedBody := strings.HasSuffix(r.URL.Path, "/chat/completions") || strings.HasSuffix(r.URL.Path, "/responses")
+	if r.Body == nil || !isJSON || !isSupportedBody {
+		return r.Header.Get("X-Proxy-Model"), 0, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 32*1024*1024+1))
+	if err != nil {
+		return "", http.StatusBadRequest, fmt.Errorf("read request body: %w", err)
+	}
+	if len(body) > 32*1024*1024 {
+		return "", http.StatusRequestEntityTooLarge, fmt.Errorf("request body exceeds the 32 MiB MVP limit")
+	}
+	r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", http.StatusBadRequest, fmt.Errorf("invalid JSON request body: %w", err)
+	}
+	model := r.Header.Get("X-Proxy-Model")
+	if model == "" {
+		model = stringValue(payload["model"])
+	}
+	if strings.HasSuffix(r.URL.Path, "/chat/completions") {
+		if stream, ok := payload["stream"].(bool); ok && stream {
+			options, _ := payload["stream_options"].(map[string]any)
+			if options == nil {
+				options = map[string]any{}
+				payload["stream_options"] = options
+			}
+			options["include_usage"] = true
+			body, err = json.Marshal(payload)
+			if err != nil {
+				return model, http.StatusBadRequest, fmt.Errorf("encode streaming request: %w", err)
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			r.ContentLength = int64(len(body))
+		}
+	}
+	return model, 0, nil
+}
+func (s *Server) director(r *http.Request) {
+	meta, _ := r.Context().Value(requestMetaKey).(*requestMeta)
+	if meta == nil || meta.account == nil {
+		return
+	}
+	target, err := url.Parse(meta.account.BaseURL)
+	if err != nil {
+		return
+	}
+	path := r.URL.Path
+	if strings.HasPrefix(path, "/v1/") {
+		path = strings.TrimPrefix(path, "/v1")
+	}
+	r.URL.Scheme, r.URL.Host = target.Scheme, target.Host
+	r.URL.Path = joinPath(target.Path, path)
+	r.URL.RawPath = ""
+	r.Host = target.Host
+	r.Header.Set("Authorization", "Bearer "+meta.account.APIKey)
+	r.Header.Del("X-Proxy-API-Key")
+	r.Header.Del("X-Admin-Key")
+	r.Header.Del("X-Proxy-Model")
+	r.Header.Set("X-Proxy-Request-ID", meta.requestID)
+}
+func joinPath(base, path string) string {
+	return strings.TrimRight(base, "/") + "/" + strings.TrimLeft(path, "/")
+}
+
+func (s *Server) modifyResponse(resp *http.Response) error {
+	if resp.Request == nil {
+		return nil
+	}
+	meta, _ := resp.Request.Context().Value(requestMetaKey).(*requestMeta)
+	if meta == nil {
+		return nil
+	}
+	meta.status.Store(int64(resp.StatusCode))
+	meta.account.markStatus(resp.StatusCode)
+	resp.Body = &trackingBody{body: resp.Body, meta: meta}
+	resp.Header.Set("X-Proxy-Request-ID", meta.requestID)
+	return nil
+}
+func (s *Server) errorHandler(w http.ResponseWriter, r *http.Request, err error) {
+	meta, _ := r.Context().Value(requestMetaKey).(*requestMeta)
+	if meta != nil {
+		meta.status.Store(502)
+		recordMeta(meta)
+	}
+	log.Printf("proxy request failed: %v", err)
+	writeJSON(w, 502, map[string]any{"error": map[string]any{"message": "upstream request failed", "type": "proxy_error"}})
+}
+func recordMeta(meta *requestMeta) {
+	if meta == nil || !meta.recorded.CompareAndSwap(false, true) {
+		return
+	}
+	usage, model := meta.usage.snapshot()
+	status := int(meta.status.Load())
+	if status == 0 {
+		status = 502
+	}
+	cost := (float64(usage.CacheHitTokens)/1e6)*meta.priceHit + (float64(usage.CacheMissTokens)/1e6)*meta.priceMiss + (float64(usage.CompletionTokens)/1e6)*meta.priceOut
+	usageStatus := "missing"
+	if usage.UsagePresent {
+		usageStatus = "complete"
+	}
+	first := meta.firstByte.Load()
+	if first == 0 {
+		first = time.Since(meta.started).Milliseconds()
+	}
+	meta.recorder.Record(RequestStats{RequestID: meta.requestID, AccountID: meta.account.ID, Model: model, Path: meta.path, Status: status, DurationMS: time.Since(meta.started).Milliseconds(), FirstByteMS: first, Usage: usage, UsageStatus: usageStatus, EstimatedCostCNY: cost, CreatedAt: meta.started})
+}
+
+func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
+	key := r.Header.Get("X-Admin-Key")
+	if key == "" {
+		key = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	}
+	if key != s.config.AdminAPIKey {
+		writeJSON(w, 401, map[string]any{"error": "admin authentication required"})
+		return
+	}
+	switch r.URL.Path {
+	case "/admin/stats":
+		writeJSON(w, 200, s.recorder.Snapshot())
+	case "/admin/accounts":
+		result := make([]map[string]any, 0, len(s.config.Accounts))
+		for _, a := range s.config.Accounts {
+			result = append(result, map[string]any{"id": a.ID, "name": a.Name, "base_url": a.BaseURL, "weight": a.Weight, "active": a.Active(), "healthy": a.Healthy(time.Now()), "failures": a.fails.Load()})
+		}
+		writeJSON(w, 200, result)
+	default:
+		http.NotFound(w, r)
+	}
+}
+func (s *Server) writeMetrics(w http.ResponseWriter) {
+	snapshot := s.recorder.Snapshot()
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	fmt.Fprintf(w, "deepseek_proxy_requests_total %d\n", snapshot.Requests)
+	fmt.Fprintf(w, "deepseek_proxy_successes_total %d\n", snapshot.Successes)
+	fmt.Fprintf(w, "deepseek_proxy_errors_total %d\n", snapshot.Errors)
+	fmt.Fprintf(w, "deepseek_proxy_tokens_total %d\n", snapshot.TotalTokens)
+	fmt.Fprintf(w, "deepseek_proxy_estimated_cost_cny_total %.8f\n", snapshot.EstimatedCostCNY)
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+func newID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 10)
+	}
+	return hex.EncodeToString(b[:])
+}
