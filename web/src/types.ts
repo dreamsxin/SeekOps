@@ -212,3 +212,32 @@ export interface BalanceSnapshot extends BalanceInfo {
   available: boolean;
   observed_at: string;
 }
+
+export type AlertStatus = "open" | "acknowledged" | "silenced" | "resolved";
+export type AlertSeverity = "warning" | "critical";
+
+export interface Alert {
+  id: string;
+  source_key: string;
+  type: "account_check" | "low_balance" | "quota" | "error_rate";
+  scope_type: "account" | "virtual_key" | "platform";
+  scope_id: string;
+  severity: AlertSeverity;
+  title: string;
+  message: string;
+  status: AlertStatus;
+  first_seen_at: string;
+  last_seen_at: string;
+  acknowledged_at?: string;
+  silenced_until?: string;
+  resolved_at?: string;
+}
+
+export interface AlertSettings {
+  balance_threshold_cny: number;
+  quota_warning_percent: number;
+  error_rate_threshold_percent: number;
+  error_rate_min_requests: number;
+  error_rate_window_minutes: number;
+  silence_minutes: number;
+}

@@ -320,6 +320,17 @@ func (s *KeyStore) List() []VirtualKeyView {
 	return result
 }
 
+func (s *KeyStore) View(id string, now time.Time) (VirtualKeyView, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, ok := s.byID[id]
+	if !ok {
+		return VirtualKeyView{}, false
+	}
+	key.resetUsage(now)
+	return key.view(), true
+}
+
 type QuotaRejection struct {
 	Reason     string
 	RetryAfter int
@@ -576,6 +587,7 @@ type Server struct {
 	recorder   *Recorder
 	keys       *KeyStore
 	prices     *PriceStore
+	alerts     *AlertStore
 	proxy      *httputil.ReverseProxy
 	transport  http.RoundTripper
 	server     *http.Server
@@ -602,6 +614,7 @@ type requestMeta struct {
 	started   time.Time
 	recorder  *Recorder
 	prices    *PriceStore
+	alerts    *AlertStore
 	firstByte atomic.Int64
 	status    atomic.Int64
 	attempts  atomic.Int64
@@ -920,6 +933,10 @@ func NewServerChecked(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load price rules: %w", err)
 	}
+	alerts, err := NewAlertStore(cfg.DB)
+	if err != nil {
+		return nil, fmt.Errorf("load alerts: %w", err)
+	}
 	recorder := NewRecorder()
 	accounts := mergeAccounts(cfg.Accounts, nil)
 	if cfg.DB != nil {
@@ -942,7 +959,7 @@ func NewServerChecked(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load admin key: %w", err)
 	}
-	s := &Server{config: cfg, keys: keys, prices: prices, recorder: recorder, transport: http.DefaultTransport, adminKey: adminKey, accounts: accounts}
+	s := &Server{config: cfg, keys: keys, prices: prices, alerts: alerts, recorder: recorder, transport: http.DefaultTransport, adminKey: adminKey, accounts: accounts}
 	s.proxy = &httputil.ReverseProxy{Director: s.director, Transport: &failoverTransport{server: s, base: s.transport}, ModifyResponse: s.modifyResponse, ErrorHandler: s.errorHandler, FlushInterval: -1}
 	s.server = &http.Server{Addr: cfg.ListenAddr, Handler: s, ReadHeaderTimeout: 10 * time.Second}
 	return s, nil
@@ -1001,7 +1018,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	requestID := newID()
-	meta := &requestMeta{requestID: requestID, principal: principal, account: account, model: model, keys: s.keys, prices: s.prices, path: r.URL.Path, started: time.Now(), recorder: s.recorder}
+	meta := &requestMeta{requestID: requestID, principal: principal, account: account, model: model, keys: s.keys, prices: s.prices, alerts: s.alerts, path: r.URL.Path, started: time.Now(), recorder: s.recorder}
 	meta.attempts.Store(1)
 	account.active.Add(1)
 	defer func() { meta.account.active.Add(-1) }()
@@ -1275,9 +1292,19 @@ func recordMeta(meta *requestMeta) {
 		tenantID = meta.principal.TenantID
 		virtualKeyID = meta.principal.ID
 	}
-	meta.recorder.Record(RequestStats{RequestID: meta.requestID, TenantID: tenantID, VirtualKeyID: virtualKeyID, AccountID: meta.account.ID, Attempts: int(meta.attempts.Load()), Model: model, Path: meta.path, Status: status, DurationMS: time.Since(meta.started).Milliseconds(), FirstByteMS: first, Usage: usage, UsageStatus: usageStatus, PriceRuleID: priceRuleID, PriceStatus: priceStatus, EstimatedCostCNY: cost, CreatedAt: meta.started})
+	event := RequestStats{RequestID: meta.requestID, TenantID: tenantID, VirtualKeyID: virtualKeyID, AccountID: meta.account.ID, Attempts: int(meta.attempts.Load()), Model: model, Path: meta.path, Status: status, DurationMS: time.Since(meta.started).Milliseconds(), FirstByteMS: first, Usage: usage, UsageStatus: usageStatus, PriceRuleID: priceRuleID, PriceStatus: priceStatus, EstimatedCostCNY: cost, CreatedAt: meta.started}
+	meta.recorder.Record(event)
+	now := time.Now()
 	if meta.keys != nil && meta.principal != nil {
-		meta.keys.RecordUsage(meta.principal.ID, usage.TotalTokens, cost, time.Now())
+		meta.keys.RecordUsage(meta.principal.ID, usage.TotalTokens, cost, now)
+		if meta.alerts != nil {
+			if key, ok := meta.keys.View(meta.principal.ID, now); ok {
+				meta.alerts.EvaluateQuota(key, now)
+			}
+		}
+	}
+	if meta.alerts != nil {
+		meta.alerts.RecordRequest(event, now)
 	}
 }
 
@@ -1300,6 +1327,10 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(r.URL.Path, "/admin/prices") {
 		s.handlePrices(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/admin/alerts") {
+		s.handleAlerts(w, r)
 		return
 	}
 	if r.URL.Path == "/admin/client-config" {
@@ -1394,6 +1425,9 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, status, map[string]any{"error": err.Error()})
 			return
 		}
+		if s.alerts != nil {
+			s.alerts.EvaluateQuota(view, time.Now())
+		}
 		writeJSON(w, http.StatusOK, view)
 		return
 	}
@@ -1416,6 +1450,9 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 		if !s.keys.Revoke(id) {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "virtual key not found"})
 			return
+		}
+		if s.alerts != nil {
+			s.alerts.ResolveScope("virtual_key", id, time.Now())
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"id": id, "revoked": true})
 		return
@@ -1455,6 +1492,11 @@ func (s *Server) PollBalancesOnce(ctx context.Context) {
 }
 
 func (s *Server) pollAccountBalance(ctx context.Context, account *Account) {
+	defer func() {
+		if s.alerts != nil {
+			s.alerts.EvaluateAccount(accountView(account), time.Now())
+		}
+	}()
 	target, err := url.Parse(account.BaseURL)
 	if err != nil {
 		account.setBalance(false, nil, fmt.Errorf("invalid base_url: %w", err))

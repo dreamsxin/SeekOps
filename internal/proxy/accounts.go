@@ -405,6 +405,8 @@ func (s *Server) updateManagedAccount(w http.ResponseWriter, r *http.Request, id
 		s.accountsMu.Unlock()
 		if !account.Disabled {
 			s.pollAccountBalance(r.Context(), account)
+		} else if s.alerts != nil {
+			s.alerts.EvaluateAccount(accountView(account), time.Now())
 		}
 		writeJSON(w, http.StatusOK, accountView(account))
 		return
@@ -610,6 +612,9 @@ func (s *Server) removeManagedAccount(w http.ResponseWriter, _ *http.Request, id
 			return
 		}
 		s.accounts = append(s.accounts[:index], s.accounts[index+1:]...)
+		if s.alerts != nil {
+			s.alerts.ResolveScope("account", id, time.Now())
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"id": id, "deleted": true})
 		return
 	}

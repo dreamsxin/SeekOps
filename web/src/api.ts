@@ -1,4 +1,4 @@
-import type { Account, AccountInput, AccountTestInput, AccountTestResult, AdminSetupStatus, BalanceSnapshot, ClientConfig, PriceRule, PriceRuleInput, RequestEvent, SecurityStatus, Stats, UsageSummary, VirtualKey, VirtualKeyInput } from "./types";
+import type { Account, AccountInput, AccountTestInput, AccountTestResult, AdminSetupStatus, Alert, AlertSettings, BalanceSnapshot, ClientConfig, PriceRule, PriceRuleInput, RequestEvent, SecurityStatus, Stats, UsageSummary, VirtualKey, VirtualKeyInput } from "./types";
 
 const keyName = "seekops.adminKey";
 
@@ -34,6 +34,12 @@ export const api = {
   prices: () => request<PriceRule[]>("/admin/prices"),
   createPrice: (body: PriceRuleInput) => request<PriceRule>("/admin/prices", { method: "POST", body: JSON.stringify(body) }),
   deletePrice: (id: string) => request<{ id: string; deleted: boolean }>(`/admin/prices/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  alerts: () => request<Alert[]>("/admin/alerts"),
+  alertSettings: () => request<AlertSettings>("/admin/alerts/settings"),
+  updateAlertSettings: (body: AlertSettings) => request<AlertSettings>("/admin/alerts/settings", { method: "PUT", body: JSON.stringify(body) }),
+  acknowledgeAlert: (id: string) => request<Alert>(`/admin/alerts/${encodeURIComponent(id)}/acknowledge`, { method: "POST" }),
+  silenceAlert: (id: string, minutes?: number) => request<Alert>(`/admin/alerts/${encodeURIComponent(id)}/silence`, { method: "POST", body: JSON.stringify({ minutes }) }),
+  resolveAlert: (id: string) => request<Alert>(`/admin/alerts/${encodeURIComponent(id)}/resolve`, { method: "POST" }),
   stats: () => request<Stats>("/admin/stats"),
   clientConfig: () => request<ClientConfig>("/admin/client-config"),
   accounts: () => request<Account[]>("/admin/accounts"),

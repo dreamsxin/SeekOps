@@ -130,6 +130,33 @@ func migrateSQLite(db *sql.DB) error {
 			observed_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_balance_snapshots_account ON balance_snapshots(account_id, observed_at)`,
+		`CREATE TABLE IF NOT EXISTS alert_settings (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			balance_threshold_cny REAL NOT NULL DEFAULT 10,
+			quota_warning_percent REAL NOT NULL DEFAULT 80,
+			error_rate_threshold_percent REAL NOT NULL DEFAULT 20,
+			error_rate_min_requests INTEGER NOT NULL DEFAULT 10,
+			error_rate_window_minutes INTEGER NOT NULL DEFAULT 15,
+			silence_minutes INTEGER NOT NULL DEFAULT 60,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS alerts (
+			id TEXT PRIMARY KEY,
+			source_key TEXT NOT NULL UNIQUE,
+			type TEXT NOT NULL,
+			scope_type TEXT NOT NULL,
+			scope_id TEXT NOT NULL,
+			severity TEXT NOT NULL,
+			title TEXT NOT NULL,
+			message TEXT NOT NULL,
+			status TEXT NOT NULL,
+			first_seen_at TEXT NOT NULL,
+			last_seen_at TEXT NOT NULL,
+			acknowledged_at TEXT NOT NULL DEFAULT '',
+			silenced_until TEXT NOT NULL DEFAULT '',
+			resolved_at TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_alerts_status_last_seen ON alerts(status, last_seen_at DESC)`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {

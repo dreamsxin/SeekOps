@@ -3,7 +3,10 @@ import {
   Activity,
   AlertCircle,
   BarChart3,
+  Bell,
+  BellOff,
   Check,
+  CheckCheck,
   CircleDollarSign,
   Clipboard,
   Download,
@@ -26,13 +29,14 @@ import {
   X,
 } from "lucide-react";
 import { api, auth } from "./api";
-import type { Account, AccountInput, AccountTestResult, AdminSetupStatus, BalanceSnapshot, ClientConfig, PriceRule, PriceRuleInput, QuotaPolicy, RequestEvent, SecurityStatus, Stats, UsageBreakdown, UsageSummary, VirtualKey, VirtualKeyInput } from "./types";
+import type { Account, AccountInput, AccountTestResult, AdminSetupStatus, Alert, AlertSettings, BalanceSnapshot, ClientConfig, PriceRule, PriceRuleInput, QuotaPolicy, RequestEvent, SecurityStatus, Stats, UsageBreakdown, UsageSummary, VirtualKey, VirtualKeyInput } from "./types";
 
-type View = "overview" | "accounts" | "access" | "keys" | "usage" | "balances" | "settings";
+type View = "overview" | "accounts" | "alerts" | "access" | "keys" | "usage" | "balances" | "settings";
 
 const navItems: Array<{ id: View; label: string; icon: typeof Activity }> = [
   { id: "overview", label: "总览", icon: BarChart3 },
   { id: "accounts", label: "上游账号", icon: Server },
+  { id: "alerts", label: "告警中心", icon: Bell },
   { id: "access", label: "接入配置", icon: Plug },
   { id: "keys", label: "租户密钥", icon: KeyRound },
   { id: "usage", label: "请求账本", icon: Activity },
@@ -52,6 +56,15 @@ const initialStats: Stats = {
   estimated_cost_cny: 0,
   unpriced_requests: 0,
   last_requests: [],
+};
+
+const initialAlertSettings: AlertSettings = {
+  balance_threshold_cny: 10,
+  quota_warning_percent: 80,
+  error_rate_threshold_percent: 20,
+  error_rate_min_requests: 10,
+  error_rate_window_minutes: 15,
+  silence_minutes: 60,
 };
 
 function BrandMark() {
@@ -74,6 +87,8 @@ export function App() {
   const [balances, setBalances] = useState<BalanceSnapshot[]>([]);
   const [security, setSecurity] = useState<SecurityStatus | null>(null);
   const [prices, setPrices] = useState<PriceRule[]>([]);
+  const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [alertSettings, setAlertSettings] = useState<AlertSettings>(initialAlertSettings);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
@@ -88,7 +103,7 @@ export function App() {
     setError("");
     try {
       const defaultUsageQuery = recentUsageQuery();
-      const [nextStats, nextAccounts, nextConfig, nextKeys, nextUsage, nextUsageSummary, nextBalances, nextSecurity, nextPrices] = await Promise.all([
+      const [nextStats, nextAccounts, nextConfig, nextKeys, nextUsage, nextUsageSummary, nextBalances, nextSecurity, nextPrices, nextAlerts, nextAlertSettings] = await Promise.all([
         api.stats(),
         api.accounts(),
         api.clientConfig(),
@@ -98,6 +113,8 @@ export function App() {
         api.balances("limit=100"),
         api.security(),
         api.prices(),
+        api.alerts(),
+        api.alertSettings(),
       ]);
       setStats(nextStats);
       setAccounts(nextAccounts);
@@ -108,6 +125,8 @@ export function App() {
       setBalances(nextBalances);
       setSecurity(nextSecurity);
       setPrices(nextPrices);
+      setAlerts(nextAlerts);
+      setAlertSettings(nextAlertSettings);
       if (!authorized && nextAccounts.length === 0) setView("accounts");
       setAuthorized(true);
     } catch (err) {
@@ -132,6 +151,14 @@ export function App() {
       setChecking(false);
     });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!authorized) return;
+    const timer = window.setInterval(() => {
+      api.alerts().then(setAlerts).catch(() => undefined);
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, [authorized]);
 
   const submitAdminKey = async (event: FormEvent) => {
     event.preventDefault();
@@ -176,12 +203,14 @@ export function App() {
   const titles: Record<View, [string, string]> = {
     overview: ["运行总览", "代理流量、成本与健康状态"],
     accounts: ["上游账号", "DeepSeek 账号健康与余额状态"],
+    alerts: ["告警中心", "需要处理的账号、配额与流量异常"],
     access: ["接入配置", "OpenAI 与 Anthropic 兼容地址"],
     keys: ["租户密钥", "凭据、配额与实时用量"],
     usage: ["请求账本", "持久化调用明细与 Token 用量"],
     balances: ["余额历史", "上游账号余额快照"],
     settings: ["系统设置", "管理员访问凭据与本地运行配置"],
   };
+  const openAlertCount = alerts.filter((item) => item.status === "open").length;
 
   return (
     <div className="shell">
@@ -190,7 +219,7 @@ export function App() {
         <nav>
           {navItems.map((item) => {
             const Icon = item.icon;
-            return <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => { setView(item.id); setSidebarOpen(false); }}><Icon size={18} /><span>{item.label}</span></button>;
+            return <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => { setView(item.id); setSidebarOpen(false); }}><Icon size={18} /><span>{item.label}</span>{item.id === "alerts" && openAlertCount > 0 && <b className="nav-badge">{openAlertCount > 99 ? "99+" : openAlertCount}</b>}</button>;
           })}
         </nav>
         <div className="sidebar-footer"><span className="status-dot" />本地 SQLite 已连接</div>
@@ -220,6 +249,7 @@ export function App() {
               try {
                 const checked = await api.checkAccount(account.id);
                 setAccounts((current) => current.map((item) => item.id === checked.id ? checked : item));
+                setAlerts(await api.alerts());
               } catch (err) {
                 setError(err instanceof Error ? err.message : "账号检测失败");
               } finally {
@@ -229,6 +259,20 @@ export function App() {
             onToggle={async (account) => { setError(""); try { await api.updateAccount(account.id, accountPayload(account, !account.enabled)); await refresh(); } catch (err) { setError(err instanceof Error ? err.message : "更新账号失败"); } }}
             onDelete={async (account) => { if (confirm(`删除账号 ${account.name}？`)) { setError(""); try { await api.deleteAccount(account.id); await refresh(); } catch (err) { setError(err instanceof Error ? err.message : "删除账号失败"); } } }}
           />}
+          {view === "alerts" && <AlertsPage alerts={alerts} settings={alertSettings} onAcknowledge={async (id) => {
+            const updated = await api.acknowledgeAlert(id);
+            setAlerts((current) => current.map((item) => item.id === updated.id ? updated : item));
+          }} onSilence={async (id) => {
+            const updated = await api.silenceAlert(id, alertSettings.silence_minutes);
+            setAlerts((current) => current.map((item) => item.id === updated.id ? updated : item));
+          }} onResolve={async (id) => {
+            const updated = await api.resolveAlert(id);
+            setAlerts((current) => current.map((item) => item.id === updated.id ? updated : item));
+          }} onSaveSettings={async (next) => {
+            const saved = await api.updateAlertSettings(next);
+            setAlertSettings(saved);
+            setAlerts(await api.alerts());
+          }} />}
           {view === "access" && <AccessConfig config={clientConfig} />}
           {view === "keys" && <Keys keys={keys} onCreate={() => { setCreatedSecret(""); setCreateOpen(true); }} onEdit={setKeyEditor} />}
           {view === "usage" && <Usage events={usage} summary={usageSummary} onApply={async (query) => { setLoading(true); setError(""); try { const [nextSummary, nextUsage] = await Promise.all([api.usageSummary(query), api.usage(query)]); setUsageSummary(nextSummary); setUsage(nextUsage); } catch (err) { setError(err instanceof Error ? err.message : "加载用量失败"); } finally { setLoading(false); } }} onExport={api.exportUsage} />}
@@ -396,6 +440,60 @@ function Overview({ stats, accounts, usage }: { stats: Stats; accounts: Account[
 function Metric({ icon: Icon, label, value, detail, tone }: { icon: typeof Activity; label: string; value: string; detail: string; tone: string }) {
   return <div className="metric"><div className={`metric-icon ${tone}`}><Icon size={19} /></div><div><span>{label}</span><strong>{value}</strong><small>{detail}</small></div></div>;
 }
+
+function AlertsPage({ alerts, settings, onAcknowledge, onSilence, onResolve, onSaveSettings }: { alerts: Alert[]; settings: AlertSettings; onAcknowledge: (id: string) => Promise<void>; onSilence: (id: string) => Promise<void>; onResolve: (id: string) => Promise<void>; onSaveSettings: (settings: AlertSettings) => Promise<void> }) {
+  const [filter, setFilter] = useState<"active" | "all">("active");
+  const [draft, setDraft] = useState(settings);
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+  useEffect(() => setDraft(settings), [settings]);
+  const active = alerts.filter((item) => item.status !== "resolved");
+  const visible = filter === "active" ? active : alerts;
+  const counts = {
+    open: alerts.filter((item) => item.status === "open").length,
+    acknowledged: alerts.filter((item) => item.status === "acknowledged").length,
+    silenced: alerts.filter((item) => item.status === "silenced").length,
+    resolved: alerts.filter((item) => item.status === "resolved").length,
+  };
+  const runAction = async (id: string, action: "acknowledge" | "silence" | "resolve") => {
+    setBusy(`${id}:${action}`);
+    setError("");
+    try {
+      if (action === "acknowledge") await onAcknowledge(id);
+      if (action === "silence") await onSilence(id);
+      if (action === "resolve") await onResolve(id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "处理告警失败");
+    } finally {
+      setBusy("");
+    }
+  };
+  const updateNumber = (key: keyof AlertSettings, value: string) => setDraft((current) => ({ ...current, [key]: Number(value) }));
+  return <div className="alert-stack">
+    <section className="panel alert-panel">
+      <PanelHead title="告警事件" subtitle={`${active.length} 个活动告警 · ${counts.open} 个未处理`} action={<div className="protocol-tabs"><button className={filter === "active" ? "active" : ""} onClick={() => setFilter("active")}>活动</button><button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>全部</button></div>} />
+      <div className="alert-summary"><div><span>未处理</span><strong>{counts.open}</strong></div><div><span>已确认</span><strong>{counts.acknowledged}</strong></div><div><span>静默中</span><strong>{counts.silenced}</strong></div><div><span>已恢复</span><strong>{counts.resolved}</strong></div></div>
+      {error && <div className="error-banner alert-error"><AlertCircle size={16} />{error}</div>}
+      <div className="table-wrap alert-table"><table><thead><tr><th>级别</th><th>告警</th><th>范围</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody>{visible.map((item) => <tr key={item.id}><td><span className={`severity-pill ${item.severity}`}>{item.severity === "critical" ? "严重" : "警告"}</span></td><td className="alert-copy"><strong>{item.title}</strong><small>{item.message}</small></td><td><span>{alertScopeLabel(item.scope_type)}</span><small className="mono">{item.scope_id}</small></td><td><span className={`alert-state ${item.status}`}>{alertStatusLabel(item.status)}</span>{item.status === "silenced" && <small>至 {formatTime(item.silenced_until)}</small>}{item.status === "resolved" && <small>{formatTime(item.resolved_at)}</small>}</td><td><span>{formatTime(item.first_seen_at)}</span><small>最近 {formatTime(item.last_seen_at)}</small></td><td><div className="alert-actions">{item.status !== "resolved" && <><button className="secondary compact" title="确认告警" disabled={Boolean(busy) || item.status === "acknowledged"} onClick={() => runAction(item.id, "acknowledge")}><CheckCheck size={14} />确认</button><button className="secondary compact" title={`静默 ${settings.silence_minutes} 分钟`} disabled={Boolean(busy) || item.status === "silenced"} onClick={() => runAction(item.id, "silence")}><BellOff size={14} />静默</button><button className="secondary compact" title="标记为已恢复" disabled={Boolean(busy)} onClick={() => runAction(item.id, "resolve")}><Check size={14} />恢复</button></>}</div></td></tr>)}</tbody></table>{!visible.length && <Empty label={filter === "active" ? "当前没有活动告警" : "尚无告警记录"} />}</div>
+    </section>
+    <section className="panel alert-settings-panel">
+      <PanelHead title="告警阈值" subtitle="账号余额、租户配额与近期错误率" />
+      <form className="alert-settings-form" onSubmit={async (event) => { event.preventDefault(); setBusy("settings"); setError(""); setSaved(false); try { await onSaveSettings(draft); setSaved(true); } catch (err) { setError(err instanceof Error ? err.message : "保存告警设置失败"); } finally { setBusy(""); } }}>
+        <label>余额下限（元）<input type="number" min="0" step="0.01" value={draft.balance_threshold_cny} onChange={(event) => updateNumber("balance_threshold_cny", event.target.value)} required /></label>
+        <label>配额预警（%）<input type="number" min="1" max="99" step="1" value={draft.quota_warning_percent} onChange={(event) => updateNumber("quota_warning_percent", event.target.value)} required /></label>
+        <label>错误率阈值（%）<input type="number" min="1" max="100" step="1" value={draft.error_rate_threshold_percent} onChange={(event) => updateNumber("error_rate_threshold_percent", event.target.value)} required /></label>
+        <label>最少请求数<input type="number" min="1" max="10000" step="1" value={draft.error_rate_min_requests} onChange={(event) => updateNumber("error_rate_min_requests", event.target.value)} required /></label>
+        <label>统计窗口（分钟）<input type="number" min="1" max="1440" step="1" value={draft.error_rate_window_minutes} onChange={(event) => updateNumber("error_rate_window_minutes", event.target.value)} required /></label>
+        <label>默认静默（分钟）<input type="number" min="1" max="10080" step="1" value={draft.silence_minutes} onChange={(event) => updateNumber("silence_minutes", event.target.value)} required /></label>
+        <div className="alert-settings-footer">{saved && <span className="form-success">告警阈值已保存。</span>}<button className="primary" disabled={busy === "settings"}>{busy === "settings" ? "正在保存" : "保存阈值"}</button></div>
+      </form>
+    </section>
+  </div>;
+}
+
+function alertScopeLabel(scope: Alert["scope_type"]) { return scope === "account" ? "上游账号" : scope === "virtual_key" ? "租户密钥" : "平台流量"; }
+function alertStatusLabel(status: Alert["status"]) { return status === "open" ? "未处理" : status === "acknowledged" ? "已确认" : status === "silenced" ? "静默中" : "已恢复"; }
 
 function Accounts({ accounts, checkingAccount, onCreate, onEdit, onCheck, onTest, onToggle, onDelete }: { accounts: Account[]; checkingAccount: string; onCreate: () => void; onEdit: (account: Account) => void; onCheck: (account: Account) => Promise<void>; onTest: (account: Account) => void; onToggle: (account: Account) => Promise<void>; onDelete: (account: Account) => Promise<void> }) {
   return <div className="panel"><PanelHead title="账号池" subtitle={`${accounts.length} 个上游账号`} action={<button className="primary" onClick={onCreate}><Server size={16} />添加账号</button>} /><div className="table-wrap account-table"><table><thead><tr><th>账号</th><th>状态</th><th>余额</th><th>权重 / 活跃</th><th>来源</th><th></th></tr></thead><tbody>{accounts.map((a) => <tr key={a.id}><td><strong>{a.name}</strong><small>{a.id} · {a.api_key_prefix || "无 Key"}</small><small className="account-models" title={a.models?.join(", ") || "支持全部模型"}>支持模型：{a.models?.length ? a.models.join(", ") : "全部"}</small></td><td><Status ok={a.healthy} pending={a.check_status === "unchecked" || a.check_status === "disabled"} label={accountStatusLabel(a)} /></td><td>{a.balances?.length ? a.balances.map((b) => <div key={b.currency} className="money">{b.currency} {b.total_balance}</div>) : <span className="muted">暂无快照</span>}{a.balance_updated_at && <small>检测 {formatTime(a.balance_updated_at)}</small>}{a.balance_error && <small className="danger-text">{a.balance_error}</small>}</td><td>{a.weight} / {a.active}</td><td><span className={`source-tag ${a.managed ? "managed" : "env"}`}>{a.managed ? "控制台" : "环境变量"}</span></td><td><div className="row-actions"><button className="icon-button small" title="检测余额" disabled={!a.enabled || checkingAccount === a.id} onClick={() => onCheck(a)}><RefreshCw className={checkingAccount === a.id ? "spin" : ""} size={15} /></button><button className="icon-button small" title="测试 API" disabled={!a.enabled} onClick={() => onTest(a)}><FlaskConical size={15} /></button>{a.managed && <><button className="icon-button small" title="编辑账号" onClick={() => onEdit(a)}><Pencil size={15} /></button><label className="switch" title={a.enabled ? "停用账号" : "启用账号"}><input type="checkbox" checked={a.enabled} onChange={() => onToggle(a)} /><span /></label><button className="icon-button small danger-icon" title="删除账号" onClick={() => onDelete(a)}><Trash2 size={15} /></button></>}</div></td></tr>)}</tbody></table>{!accounts.length && <Empty label="尚未配置上游账号" />}</div></div>;
