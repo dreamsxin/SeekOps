@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -31,6 +32,36 @@ type Account struct {
 	active  atomic.Int64
 	fails   atomic.Int64
 	blocked atomic.Int64
+
+	balanceMu        sync.RWMutex
+	Balances         []BalanceInfo `json:"-"`
+	BalanceAvailable bool          `json:"balance_available"`
+	BalanceUpdatedAt time.Time     `json:"balance_updated_at,omitempty"`
+	BalanceError     string        `json:"balance_error,omitempty"`
+}
+
+type BalanceInfo struct {
+	Currency        string `json:"currency"`
+	TotalBalance    string `json:"total_balance"`
+	GrantedBalance  string `json:"granted_balance"`
+	ToppedUpBalance string `json:"topped_up_balance"`
+}
+
+func (a *Account) setBalance(available bool, balances []BalanceInfo, err error) {
+	a.balanceMu.Lock()
+	defer a.balanceMu.Unlock()
+	a.BalanceAvailable = available
+	a.Balances = append([]BalanceInfo(nil), balances...)
+	a.BalanceUpdatedAt = time.Now()
+	a.BalanceError = ""
+	if err != nil {
+		a.BalanceError = err.Error()
+	}
+}
+func (a *Account) balanceSnapshot() (bool, []BalanceInfo, time.Time, string) {
+	a.balanceMu.RLock()
+	defer a.balanceMu.RUnlock()
+	return a.BalanceAvailable, append([]BalanceInfo(nil), a.Balances...), a.BalanceUpdatedAt, a.BalanceError
 }
 
 func (a *Account) Active() int64 { return a.active.Load() }
@@ -76,6 +107,8 @@ type Usage struct {
 
 type RequestStats struct {
 	RequestID        string    `json:"request_id"`
+	TenantID         string    `json:"tenant_id"`
+	VirtualKeyID     string    `json:"virtual_key_id"`
 	AccountID        string    `json:"account_id"`
 	Model            string    `json:"model,omitempty"`
 	Path             string    `json:"path"`
@@ -86,6 +119,112 @@ type RequestStats struct {
 	UsageStatus      string    `json:"usage_status"`
 	EstimatedCostCNY float64   `json:"estimated_cost_cny"`
 	CreatedAt        time.Time `json:"created_at"`
+}
+
+type Principal struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	TenantID string `json:"tenant_id"`
+}
+
+type VirtualKeyView struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	TenantID  string    `json:"tenant_id"`
+	Prefix    string    `json:"prefix"`
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type virtualKey struct {
+	VirtualKeyView
+	Hash string
+}
+
+type KeyStore struct {
+	mu     sync.RWMutex
+	byHash map[string]*virtualKey
+	byID   map[string]*virtualKey
+}
+
+func NewKeyStore(defaultSecret string) *KeyStore {
+	store := &KeyStore{byHash: make(map[string]*virtualKey), byID: make(map[string]*virtualKey)}
+	if defaultSecret != "" {
+		store.mu.Lock()
+		store.add("vk-default", "Default platform key", "default", defaultSecret)
+		store.mu.Unlock()
+	}
+	return store
+}
+func (s *KeyStore) add(id, name, tenant, secret string) *virtualKey {
+	hash := hashSecret(secret)
+	key := &virtualKey{VirtualKeyView: VirtualKeyView{ID: id, Name: name, TenantID: tenant, Prefix: secretPrefix(secret), Enabled: true, CreatedAt: time.Now()}, Hash: hash}
+	s.byHash[hash] = key
+	s.byID[id] = key
+	return key
+}
+func (s *KeyStore) Authenticate(secret string) (*Principal, bool) {
+	hash := hashSecret(secret)
+	s.mu.RLock()
+	key, ok := s.byHash[hash]
+	if ok && !key.Enabled {
+		ok = false
+	}
+	var principal *Principal
+	if ok {
+		principal = &Principal{ID: key.ID, Name: key.Name, TenantID: key.TenantID}
+	}
+	s.mu.RUnlock()
+	return principal, ok
+}
+func (s *KeyStore) Create(name, tenant string) (VirtualKeyView, string, error) {
+	name = strings.TrimSpace(name)
+	tenant = strings.TrimSpace(tenant)
+	if name == "" || tenant == "" {
+		return VirtualKeyView{}, "", fmt.Errorf("name and tenant_id are required")
+	}
+	secret := "sk-proxy-" + newID()
+	id := "vk-" + newID()[:16]
+	s.mu.Lock()
+	key := s.add(id, name, tenant, secret)
+	s.mu.Unlock()
+	return key.VirtualKeyView, secret, nil
+}
+func (s *KeyStore) List() []VirtualKeyView {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]VirtualKeyView, 0, len(s.byID))
+	for _, key := range s.byID {
+		result = append(result, key.VirtualKeyView)
+	}
+	for i := 0; i < len(result); i++ {
+		for j := i + 1; j < len(result); j++ {
+			if result[j].ID < result[i].ID {
+				result[i], result[j] = result[j], result[i]
+			}
+		}
+	}
+	return result
+}
+func (s *KeyStore) Revoke(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, ok := s.byID[id]
+	if !ok {
+		return false
+	}
+	key.Enabled = false
+	return true
+}
+func hashSecret(secret string) string {
+	hash := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(hash[:])
+}
+func secretPrefix(secret string) string {
+	if len(secret) <= 8 {
+		return secret
+	}
+	return secret[:8] + "..."
 }
 
 type Stats struct {
@@ -142,6 +281,7 @@ type Config struct {
 	AdminAPIKey    string
 	RequestTimeout time.Duration
 	Accounts       []*Account
+	VirtualKeys    *KeyStore
 	PriceInputHit  float64
 	PriceInputMiss float64
 	PriceOutput    float64
@@ -150,6 +290,7 @@ type Config struct {
 type Server struct {
 	config    Config
 	recorder  *Recorder
+	keys      *KeyStore
 	proxy     *httputil.ReverseProxy
 	transport http.RoundTripper
 	server    *http.Server
@@ -164,6 +305,7 @@ const (
 
 type requestMeta struct {
 	requestID string
+	principal *Principal
 	account   *Account
 	path      string
 	started   time.Time
@@ -342,7 +484,11 @@ func NewServer(cfg Config) *Server {
 	if cfg.PriceOutput == 0 {
 		cfg.PriceOutput = 2
 	}
-	s := &Server{config: cfg, recorder: NewRecorder(), transport: http.DefaultTransport}
+	keys := cfg.VirtualKeys
+	if keys == nil {
+		keys = NewKeyStore(cfg.PlatformAPIKey)
+	}
+	s := &Server{config: cfg, keys: keys, recorder: NewRecorder(), transport: http.DefaultTransport}
 	s.proxy = &httputil.ReverseProxy{Director: s.director, Transport: s.transport, ModifyResponse: s.modifyResponse, ErrorHandler: s.errorHandler, FlushInterval: -1}
 	s.server = &http.Server{Addr: cfg.ListenAddr, Handler: s, ReadHeaderTimeout: 10 * time.Second}
 	return s
@@ -380,7 +526,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.authorize(w, r) {
+	principal, ok := s.authorize(w, r)
+	if !ok {
 		return
 	}
 	model, status, err := s.prepareRequest(r)
@@ -396,7 +543,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	account.active.Add(1)
 	defer account.active.Add(-1)
 	requestID := newID()
-	meta := &requestMeta{requestID: requestID, account: account, path: r.URL.Path, started: time.Now(), recorder: s.recorder, priceHit: s.config.PriceInputHit, priceMiss: s.config.PriceInputMiss, priceOut: s.config.PriceOutput}
+	meta := &requestMeta{requestID: requestID, principal: principal, account: account, path: r.URL.Path, started: time.Now(), recorder: s.recorder, priceHit: s.config.PriceInputHit, priceMiss: s.config.PriceInputMiss, priceOut: s.config.PriceOutput}
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
 	defer cancel()
 	ctx = context.WithValue(ctx, requestMetaKey, meta)
@@ -413,7 +560,7 @@ func isProxyPath(path string) bool {
 	}
 	return false
 }
-func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request) (*Principal, bool) {
 	token := r.Header.Get("Authorization")
 	if strings.HasPrefix(token, "Bearer ") {
 		token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
@@ -421,11 +568,12 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
 	if token == "" {
 		token = r.Header.Get("X-Proxy-API-Key")
 	}
-	if token != s.config.PlatformAPIKey {
+	principal, ok := s.keys.Authenticate(token)
+	if !ok {
 		writeJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid proxy API key", "type": "authentication_error"}})
-		return false
+		return nil, false
 	}
-	return true
+	return principal, true
 }
 func (s *Server) selectAccount(r *http.Request, model string) *Account {
 	now := time.Now()
@@ -565,7 +713,12 @@ func recordMeta(meta *requestMeta) {
 	if first == 0 {
 		first = time.Since(meta.started).Milliseconds()
 	}
-	meta.recorder.Record(RequestStats{RequestID: meta.requestID, AccountID: meta.account.ID, Model: model, Path: meta.path, Status: status, DurationMS: time.Since(meta.started).Milliseconds(), FirstByteMS: first, Usage: usage, UsageStatus: usageStatus, EstimatedCostCNY: cost, CreatedAt: meta.started})
+	var tenantID, virtualKeyID string
+	if meta.principal != nil {
+		tenantID = meta.principal.TenantID
+		virtualKeyID = meta.principal.ID
+	}
+	meta.recorder.Record(RequestStats{RequestID: meta.requestID, TenantID: tenantID, VirtualKeyID: virtualKeyID, AccountID: meta.account.ID, Model: model, Path: meta.path, Status: status, DurationMS: time.Since(meta.started).Milliseconds(), FirstByteMS: first, Usage: usage, UsageStatus: usageStatus, EstimatedCostCNY: cost, CreatedAt: meta.started})
 }
 
 func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
@@ -577,19 +730,114 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 401, map[string]any{"error": "admin authentication required"})
 		return
 	}
+	if r.URL.Path == "/admin/virtual-keys" && r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, s.keys.List())
+		return
+	}
+	if r.URL.Path == "/admin/virtual-keys" && r.Method == http.MethodPost {
+		var input struct {
+			Name     string `json:"name"`
+			TenantID string `json:"tenant_id"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&input); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		view, secret, err := s.keys.Create(input.Name, input.TenantID)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"key": view, "secret": secret})
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/admin/virtual-keys/") && r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/revoke") {
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/admin/virtual-keys/"), "/revoke")
+		if !s.keys.Revoke(id) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "virtual key not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "revoked": true})
+		return
+	}
 	switch r.URL.Path {
 	case "/admin/stats":
 		writeJSON(w, 200, s.recorder.Snapshot())
 	case "/admin/accounts":
 		result := make([]map[string]any, 0, len(s.config.Accounts))
 		for _, a := range s.config.Accounts {
-			result = append(result, map[string]any{"id": a.ID, "name": a.Name, "base_url": a.BaseURL, "weight": a.Weight, "active": a.Active(), "healthy": a.Healthy(time.Now()), "failures": a.fails.Load()})
+			available, balances, updatedAt, balanceError := a.balanceSnapshot()
+			result = append(result, map[string]any{"id": a.ID, "name": a.Name, "base_url": a.BaseURL, "weight": a.Weight, "active": a.Active(), "healthy": a.Healthy(time.Now()), "failures": a.fails.Load(), "balance_available": available, "balances": balances, "balance_updated_at": updatedAt, "balance_error": balanceError})
 		}
 		writeJSON(w, 200, result)
 	default:
 		http.NotFound(w, r)
 	}
 }
+
+func (s *Server) StartBalancePoller(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	s.PollBalancesOnce(ctx)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.PollBalancesOnce(ctx)
+		}
+	}
+}
+
+func (s *Server) PollBalancesOnce(ctx context.Context) {
+	for _, account := range s.config.Accounts {
+		if account == nil || account.APIKey == "" {
+			continue
+		}
+		s.pollAccountBalance(ctx, account)
+	}
+}
+
+func (s *Server) pollAccountBalance(ctx context.Context, account *Account) {
+	target, err := url.Parse(account.BaseURL)
+	if err != nil {
+		account.setBalance(false, nil, fmt.Errorf("invalid base_url: %w", err))
+		return
+	}
+	target.Path = joinPath(target.Path, "/user/balance")
+	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		account.setBalance(false, nil, err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+account.APIKey)
+	resp, err := (&http.Client{Transport: s.transport}).Do(req)
+	if err != nil {
+		account.setBalance(false, nil, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		account.markStatus(resp.StatusCode)
+		account.setBalance(false, nil, fmt.Errorf("balance endpoint returned HTTP %d", resp.StatusCode))
+		return
+	}
+	var payload struct {
+		IsAvailable  bool          `json:"is_available"`
+		BalanceInfos []BalanceInfo `json:"balance_infos"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		account.setBalance(false, nil, fmt.Errorf("decode balance response: %w", err))
+		return
+	}
+	account.setBalance(payload.IsAvailable, payload.BalanceInfos, nil)
+}
+
 func (s *Server) writeMetrics(w http.ResponseWriter) {
 	snapshot := s.recorder.Snapshot()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")

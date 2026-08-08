@@ -32,6 +32,7 @@ curl http://localhost:8080/chat/completions `
 - `ADMIN_API_KEY`：管理接口 Key，默认复用 `PLATFORM_API_KEY`
 - `REQUEST_TIMEOUT`：上游请求超时，默认 `10m`
 - `PRICE_INPUT_HIT_CNY_PER_MILLION`、`PRICE_INPUT_MISS_CNY_PER_MILLION`、`PRICE_OUTPUT_CNY_PER_MILLION`：MVP 估算价格，默认分别为 `0.02`、`1`、`2`
+- `BALANCE_POLL_INTERVAL`：上游余额轮询间隔，默认 `5m`
 
 示例：
 
@@ -46,11 +47,14 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `GET /metrics`：Prometheus 文本指标
 - `GET /admin/stats`：管理统计，需要 `X-Admin-Key` 或管理员 Bearer Token
 - `GET /admin/accounts`：上游账号状态，需要管理员权限
+- `GET /admin/virtual-keys`：列出虚拟 Key（只显示前缀）
+- `POST /admin/virtual-keys`：创建虚拟 Key，JSON 为 `{"name":"应用 A","tenant_id":"tenant-a"}`，密钥只在创建响应中返回一次
+- `POST /admin/virtual-keys/{id}/revoke`：撤销虚拟 Key
 - `/chat/completions`、`/v1/chat/completions`：Chat Completions 代理
 - `/responses`、`/v1/responses`：Responses 代理
 - `/models`、`/v1/models`：模型列表代理
 
-Chat JSON 请求体在 MVP 中限制为 32 MiB；流式 Chat 请求会在转发前确保 `stream_options.include_usage=true`，以便从最后一个 SSE 块记账。
+Chat JSON 请求体在 MVP 中限制为 32 MiB；流式 Chat 请求会在转发前确保 `stream_options.include_usage=true`，以便从最后一个 SSE 块记账。当前 Key、统计和余额快照仍保存在进程内存中。
 
 ## 已知边界
 

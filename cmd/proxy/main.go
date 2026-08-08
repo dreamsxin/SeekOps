@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"os"
@@ -26,6 +27,7 @@ func main() {
 		log.Print("warning: no UPSTREAM_API_KEY or UPSTREAM_ACCOUNTS_JSON configured; /readyz will fail")
 	}
 	server := proxy.NewServer(cfg)
+	go server.StartBalancePoller(context.Background(), durationOr("BALANCE_POLL_INTERVAL", 5*time.Minute))
 	log.Fatal(server.ListenAndServe())
 }
 
