@@ -23,7 +23,7 @@ import {
   X,
 } from "lucide-react";
 import { api, auth } from "./api";
-import type { Account, AccountInput, AdminSetupStatus, BalanceSnapshot, ClientConfig, QuotaPolicy, RequestEvent, Stats, VirtualKey, VirtualKeyInput } from "./types";
+import type { Account, AccountInput, AdminSetupStatus, BalanceSnapshot, ClientConfig, QuotaPolicy, RequestEvent, SecurityStatus, Stats, VirtualKey, VirtualKeyInput } from "./types";
 
 type View = "overview" | "accounts" | "access" | "keys" | "usage" | "balances" | "settings";
 
@@ -63,6 +63,7 @@ export function App() {
   const [keys, setKeys] = useState<VirtualKey[]>([]);
   const [usage, setUsage] = useState<RequestEvent[]>([]);
   const [balances, setBalances] = useState<BalanceSnapshot[]>([]);
+  const [security, setSecurity] = useState<SecurityStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
@@ -75,13 +76,14 @@ export function App() {
     setLoading(true);
     setError("");
     try {
-      const [nextStats, nextAccounts, nextConfig, nextKeys, nextUsage, nextBalances] = await Promise.all([
+      const [nextStats, nextAccounts, nextConfig, nextKeys, nextUsage, nextBalances, nextSecurity] = await Promise.all([
         api.stats(),
         api.accounts(),
         api.clientConfig(),
         api.keys(),
         api.usage("limit=100"),
         api.balances("limit=100"),
+        api.security(),
       ]);
       setStats(nextStats);
       setAccounts(nextAccounts);
@@ -89,6 +91,7 @@ export function App() {
       setKeys(nextKeys);
       setUsage(nextUsage);
       setBalances(nextBalances);
+      setSecurity(nextSecurity);
       if (!authorized && nextAccounts.length === 0) setView("accounts");
       setAuthorized(true);
     } catch (err) {
@@ -213,7 +216,11 @@ export function App() {
           {view === "keys" && <Keys keys={keys} onCreate={() => { setCreatedSecret(""); setCreateOpen(true); }} onEdit={setKeyEditor} />}
           {view === "usage" && <Usage events={usage} onFilter={async (query) => { setLoading(true); try { setUsage(await api.usage(query)); } finally { setLoading(false); } }} />}
           {view === "balances" && <Balances snapshots={balances} accounts={accounts} onFilter={async (query) => { setLoading(true); try { setBalances(await api.balances(query)); } finally { setLoading(false); } }} />}
-          {view === "settings" && <SettingsPage onRotate={rotateAdminKey} />}
+          {view === "settings" && <SettingsPage security={security} onRotateAdmin={rotateAdminKey} onRotateMaster={async () => {
+            const next = await api.rotateMasterKey();
+            setSecurity(next);
+            return next;
+          }} />}
         </div>
       </main>
       {createOpen && <CreateKeyModal secret={createdSecret} onClose={() => setCreateOpen(false)} onCreate={async (body) => { const result = await api.createKey(body); setCreatedSecret(result.secret); await refresh(); }} />}
@@ -247,27 +254,48 @@ function Login({ setup, value, onChange, onSubmit, error, loading }: { setup: bo
   return <div className="login-page"><div className="login-panel"><div className="brand login-brand"><div className="brand-mark">S</div><div><strong>SeekOps</strong><span>DeepSeek API Control Plane</span></div></div><div className="login-copy"><ShieldCheck size={30} /><h1>{setup ? "初始化管理员 Key" : "管理控制台"}</h1><p>{setup ? "首次运行，请设置管理 API Key。默认值为 admin，生产环境建议改为长随机字符串。" : "使用管理员 API Key 进入本地控制台。"}</p></div><form onSubmit={onSubmit}><label>管理员 API Key<input autoFocus type="password" value={value} onChange={(e) => onChange(e.target.value)} placeholder="admin" autoComplete={setup ? "new-password" : "current-password"} required /></label>{error && <p className="form-error">{error}</p>}<button className="primary full" disabled={loading}>{loading ? (setup ? "正在初始化" : "正在验证") : (setup ? "保存并进入" : "进入控制台")}</button></form></div></div>;
 }
 
-function SettingsPage({ onRotate }: { onRotate: (value: string) => Promise<void> }) {
+function SettingsPage({ security, onRotateAdmin, onRotateMaster }: { security: SecurityStatus | null; onRotateAdmin: (value: string) => Promise<void>; onRotateMaster: () => Promise<SecurityStatus> }) {
   const [value, setValue] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [saved, setSaved] = useState(false);
+  const [adminBusy, setAdminBusy] = useState(false);
+  const [masterBusy, setMasterBusy] = useState(false);
+  const [adminError, setAdminError] = useState("");
+  const [masterError, setMasterError] = useState("");
+  const [adminSaved, setAdminSaved] = useState(false);
+  const [masterSaved, setMasterSaved] = useState(false);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    setBusy(true);
-    setError("");
-    setSaved(false);
+    setAdminBusy(true);
+    setAdminError("");
+    setAdminSaved(false);
     try {
-      await onRotate(value);
+      await onRotateAdmin(value);
       setValue("");
-      setSaved(true);
+      setAdminSaved(true);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "轮换失败");
+      setAdminError(err instanceof Error ? err.message : "轮换失败");
     } finally {
-      setBusy(false);
+      setAdminBusy(false);
     }
   };
-  return <div className="panel settings-panel"><PanelHead title="管理员 API Key" subtitle="轮换本地管理控制台的访问凭据" /><form className="settings-form" onSubmit={submit}><label>新的管理员 API Key<input type="password" value={value} onChange={(e) => setValue(e.target.value)} placeholder="输入新的长随机字符串" required autoComplete="new-password" /></label><p className="settings-note">保存后旧 Key 会立即失效，当前浏览器会自动切换到新 Key。</p>{error && <p className="form-error">{error}</p>}{saved && <p className="form-success">管理员 API Key 已更新。</p>}<button className="primary" disabled={busy}>{busy ? "正在保存" : "保存新 Key"}</button></form></div>;
+  const rotateMaster = async () => {
+    if (!confirm("轮换后将使用新主密钥重写全部 SQLite 凭据。继续吗？")) return;
+    setMasterBusy(true);
+    setMasterError("");
+    setMasterSaved(false);
+    try {
+      await onRotateMaster();
+      setMasterSaved(true);
+    } catch (err) {
+      setMasterError(err instanceof Error ? err.message : "主密钥轮换失败");
+    } finally {
+      setMasterBusy(false);
+    }
+  };
+  const storageLabel = security?.key_storage === "local_file" ? "本地密钥文件" : security?.key_storage === "external" ? "外部主密钥" : "未启用";
+  return <div className="settings-stack">
+    <section className="panel settings-panel"><PanelHead title="SQLite 凭据加密" subtitle="上游 API Key 与可恢复租户密钥" /><div className="security-content"><div className="security-state"><div className={`security-icon ${security?.encryption_enabled ? "ok" : "bad"}`}><ShieldCheck size={20} /></div><div><strong>{security?.encryption_enabled ? "AES-256-GCM 已启用" : "凭据加密未启用"}</strong><span>{storageLabel}</span></div></div><dl className="security-details"><div><dt>主密钥 ID</dt><dd><code>{security?.key_id || "-"}</code></dd></div><div><dt>密钥位置</dt><dd><code>{security?.key_file || (security?.key_storage === "external" ? "SECRETS_MASTER_KEY" : "-")}</code></dd></div></dl><p className="settings-note">备份 SQLite 时需同时备份密钥文件；缺失或不匹配时服务会拒绝启动。</p>{masterError && <p className="form-error">{masterError}</p>}{masterSaved && <p className="form-success">主密钥已轮换，SQLite 凭据已重新加密。</p>}<button className="secondary" disabled={masterBusy || !security?.rotation_supported} onClick={rotateMaster}><RefreshCw className={masterBusy ? "spin" : ""} size={15} />{masterBusy ? "正在轮换" : "轮换本地主密钥"}</button></div></section>
+    <section className="panel settings-panel"><PanelHead title="管理员 API Key" subtitle="本地管理控制台访问凭据" /><form className="settings-form" onSubmit={submit}><label>新的管理员 API Key<input type="password" value={value} onChange={(e) => setValue(e.target.value)} placeholder="输入新的长随机字符串" required autoComplete="new-password" /></label><p className="settings-note">保存后旧 Key 会立即失效，当前浏览器会自动切换到新 Key。</p>{adminError && <p className="form-error">{adminError}</p>}{adminSaved && <p className="form-success">管理员 API Key 已更新。</p>}<button className="primary" disabled={adminBusy}>{adminBusy ? "正在保存" : "保存新 Key"}</button></form></section>
+  </div>;
 }
 
 function Overview({ stats, accounts, usage }: { stats: Stats; accounts: Account[]; usage: RequestEvent[] }) {

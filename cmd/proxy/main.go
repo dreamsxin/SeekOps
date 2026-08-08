@@ -13,11 +13,22 @@ import (
 )
 
 func main() {
-	db, err := proxy.OpenSQLite(envOr("SQLITE_PATH", "data/seekops.db"))
+	sqlitePath := envOr("SQLITE_PATH", "data/seekops.db")
+	db, err := proxy.OpenSQLite(sqlitePath)
 	if err != nil {
 		log.Fatalf("open sqlite: %v", err)
 	}
 	defer db.Close()
+	var secrets *proxy.SecretCipher
+	if masterKey := os.Getenv("SECRETS_MASTER_KEY"); masterKey != "" {
+		secrets, err = proxy.NewSecretCipherFromBase64(masterKey)
+	} else {
+		keyPath := envOr("SECRETS_MASTER_KEY_FILE", proxy.DefaultSecretKeyPath(sqlitePath))
+		secrets, err = proxy.OpenSecretCipher(db, keyPath)
+	}
+	if err != nil {
+		log.Fatalf("open secrets master key: %v", err)
+	}
 	cfg := proxy.Config{
 		ListenAddr:     os.Getenv("LISTEN_ADDR"),
 		PublicBaseURL:  os.Getenv("PUBLIC_BASE_URL"),
@@ -26,11 +37,15 @@ func main() {
 		RequestTimeout: durationOr("REQUEST_TIMEOUT", 10*time.Minute),
 		Accounts:       loadAccounts(),
 		DB:             db,
+		SecretCipher:   secrets,
 		PriceInputHit:  floatEnv("PRICE_INPUT_HIT_CNY_PER_MILLION", 0.02),
 		PriceInputMiss: floatEnv("PRICE_INPUT_MISS_CNY_PER_MILLION", 1),
 		PriceOutput:    floatEnv("PRICE_OUTPUT_CNY_PER_MILLION", 2),
 	}
-	server := proxy.NewServer(cfg)
+	server, err := proxy.NewServerChecked(cfg)
+	if err != nil {
+		log.Fatalf("initialize proxy: %v", err)
+	}
 	if server.AccountCount() == 0 {
 		log.Print("warning: no upstream account configured; /readyz will fail")
 	}

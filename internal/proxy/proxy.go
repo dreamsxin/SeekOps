@@ -177,20 +177,31 @@ type virtualKey struct {
 }
 
 type KeyStore struct {
-	mu     sync.RWMutex
-	byHash map[string]*virtualKey
-	byID   map[string]*virtualKey
-	db     *sql.DB
+	mu      sync.RWMutex
+	byHash  map[string]*virtualKey
+	byID    map[string]*virtualKey
+	db      *sql.DB
+	secrets *SecretCipher
 }
 
 func NewKeyStore(defaultSecret string) *KeyStore {
 	return NewKeyStoreWithDB(defaultSecret, nil)
 }
 func NewKeyStoreWithDB(defaultSecret string, db *sql.DB) *KeyStore {
-	store := &KeyStore{byHash: make(map[string]*virtualKey), byID: make(map[string]*virtualKey), db: db}
+	store, err := NewKeyStoreWithDBAndCipher(defaultSecret, db, nil)
+	if err != nil {
+		panic(err)
+	}
+	return store
+}
+func NewKeyStoreWithDBAndCipher(defaultSecret string, db *sql.DB, secrets *SecretCipher) (*KeyStore, error) {
+	store := &KeyStore{byHash: make(map[string]*virtualKey), byID: make(map[string]*virtualKey), db: db, secrets: secrets}
 	if db != nil {
 		store.mu.Lock()
-		store.loadSQLite(db)
+		if err := store.loadSQLite(db); err != nil {
+			store.mu.Unlock()
+			return nil, err
+		}
 		store.mu.Unlock()
 	}
 	if defaultSecret != "" {
@@ -209,12 +220,23 @@ func NewKeyStoreWithDB(defaultSecret string, db *sql.DB) *KeyStore {
 		}
 		if db != nil {
 			if err := store.persistKeyLocked(db, key); err != nil {
-				log.Printf("persist default virtual key: %v", err)
+				store.mu.Unlock()
+				return nil, fmt.Errorf("persist default virtual key: %w", err)
 			}
 		}
 		store.mu.Unlock()
 	}
-	return store
+	if db != nil && secrets != nil {
+		store.mu.Lock()
+		for _, key := range store.byID {
+			if err := store.persistKeyLocked(db, key); err != nil {
+				store.mu.Unlock()
+				return nil, fmt.Errorf("migrate virtual key %s secret: %w", key.ID, err)
+			}
+		}
+		store.mu.Unlock()
+	}
+	return store, nil
 }
 func (s *KeyStore) add(id, name, tenant, secret string) *virtualKey {
 	hash := hashSecret(secret)
@@ -527,6 +549,7 @@ type Config struct {
 	Accounts       []*Account
 	VirtualKeys    *KeyStore
 	DB             *sql.DB
+	SecretCipher   *SecretCipher
 	PriceInputHit  float64
 	PriceInputMiss float64
 	PriceOutput    float64
@@ -760,6 +783,14 @@ func intValue(v any) int64 {
 func stringValue(v any) string { s, _ := v.(string); return s }
 
 func NewServer(cfg Config) *Server {
+	server, err := NewServerChecked(cfg)
+	if err != nil {
+		panic(err)
+	}
+	return server
+}
+
+func NewServerChecked(cfg Config) (*Server, error) {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":8080"
 	}
@@ -781,30 +812,43 @@ func NewServer(cfg Config) *Server {
 	if cfg.PriceOutput == 0 {
 		cfg.PriceOutput = 2
 	}
+	if err := ValidateStoredSecrets(cfg.DB, cfg.SecretCipher); err != nil {
+		return nil, err
+	}
 	keys := cfg.VirtualKeys
 	if keys == nil {
-		keys = NewKeyStoreWithDB(cfg.PlatformAPIKey, cfg.DB)
+		var err error
+		keys, err = NewKeyStoreWithDBAndCipher(cfg.PlatformAPIKey, cfg.DB, cfg.SecretCipher)
+		if err != nil {
+			return nil, fmt.Errorf("load virtual keys: %w", err)
+		}
 	}
 	recorder := NewRecorder()
 	accounts := mergeAccounts(cfg.Accounts, nil)
 	if cfg.DB != nil {
 		recorder = NewRecorderWithDB(cfg.DB)
-		managedAccounts, err := loadManagedAccounts(cfg.DB)
+		managedAccounts, err := loadManagedAccounts(cfg.DB, cfg.SecretCipher)
 		if err != nil {
-			log.Printf("load managed accounts: %v", err)
-		} else {
-			accounts = mergeAccounts(cfg.Accounts, managedAccounts)
+			return nil, fmt.Errorf("load managed accounts: %w", err)
 		}
+		if cfg.SecretCipher != nil {
+			for _, account := range managedAccounts {
+				if err := persistManagedAccount(cfg.DB, cfg.SecretCipher, account); err != nil {
+					return nil, fmt.Errorf("migrate account %s api key: %w", account.ID, err)
+				}
+			}
+		}
+		accounts = mergeAccounts(cfg.Accounts, managedAccounts)
 		loadLatestBalances(cfg.DB, accounts)
 	}
 	adminKey, err := loadAdminKey(cfg.DB)
 	if err != nil {
-		log.Printf("load admin key: %v", err)
+		return nil, fmt.Errorf("load admin key: %w", err)
 	}
 	s := &Server{config: cfg, keys: keys, recorder: recorder, transport: http.DefaultTransport, adminKey: adminKey, accounts: accounts}
 	s.proxy = &httputil.ReverseProxy{Director: s.director, Transport: s.transport, ModifyResponse: s.modifyResponse, ErrorHandler: s.errorHandler, FlushInterval: -1}
 	s.server = &http.Server{Addr: cfg.ListenAddr, Handler: s, ReadHeaderTimeout: 10 * time.Second}
-	return s
+	return s, nil
 }
 func (s *Server) Recorder() *Recorder   { return s.recorder }
 func (s *Server) Handler() http.Handler { return s }
@@ -1121,6 +1165,10 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/admin/admin-key" {
 		s.handleAdminKeyRotation(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/admin/security") {
+		s.handleSecurity(w, r)
 		return
 	}
 	if r.URL.Path == "/admin/client-config" {

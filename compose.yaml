@@ -7,6 +7,7 @@ services:
     environment:
       LISTEN_ADDR: ":8080"
       SQLITE_PATH: "/data/seekops.db"
+      SECRETS_MASTER_KEY_FILE: "/data/seekops.key"
       PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-http://localhost:8080/v1}"
       PLATFORM_API_KEY: "${PLATFORM_API_KEY:-change-me}"
       ADMIN_API_KEY: "${ADMIN_API_KEY:-change-me}"

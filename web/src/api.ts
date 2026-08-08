@@ -1,4 +1,4 @@
-import type { Account, AccountInput, AdminSetupStatus, BalanceSnapshot, ClientConfig, RequestEvent, Stats, VirtualKey, VirtualKeyInput } from "./types";
+import type { Account, AccountInput, AdminSetupStatus, BalanceSnapshot, ClientConfig, RequestEvent, SecurityStatus, Stats, VirtualKey, VirtualKeyInput } from "./types";
 
 const keyName = "seekops.adminKey";
 
@@ -29,6 +29,8 @@ export const api = {
   setupStatus: () => request<AdminSetupStatus>("/admin/setup"),
   setup: (body: { api_key: string }) => request<AdminSetupStatus>("/admin/setup", { method: "POST", body: JSON.stringify(body) }),
   rotateAdminKey: (api_key: string) => request<AdminSetupStatus>("/admin/admin-key", { method: "POST", body: JSON.stringify({ api_key }) }),
+  security: () => request<SecurityStatus>("/admin/security"),
+  rotateMasterKey: () => request<SecurityStatus>("/admin/security/rotate", { method: "POST" }),
   stats: () => request<Stats>("/admin/stats"),
   clientConfig: () => request<ClientConfig>("/admin/client-config"),
   accounts: () => request<Account[]>("/admin/accounts"),

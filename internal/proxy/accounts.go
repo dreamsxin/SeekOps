@@ -39,7 +39,7 @@ type accountInput struct {
 	Enabled *bool    `json:"enabled"`
 }
 
-func loadManagedAccounts(db *sql.DB) ([]*Account, error) {
+func loadManagedAccounts(db *sql.DB, secrets *SecretCipher) ([]*Account, error) {
 	if db == nil {
 		return nil, nil
 	}
@@ -57,6 +57,10 @@ func loadManagedAccounts(db *sql.DB) ([]*Account, error) {
 		if err := rows.Scan(&account.ID, &account.Name, &account.APIKey, &account.BaseURL, &account.Weight, &modelsJSON, &enabled, &createdAt); err != nil {
 			return nil, err
 		}
+		account.APIKey, err = secrets.Decrypt("upstream:"+account.ID, account.APIKey)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt account %s api key: %w", account.ID, err)
+		}
 		if err := json.Unmarshal([]byte(modelsJSON), &account.Models); err != nil {
 			return nil, fmt.Errorf("decode account %s models: %w", account.ID, err)
 		}
@@ -68,7 +72,7 @@ func loadManagedAccounts(db *sql.DB) ([]*Account, error) {
 	return accounts, rows.Err()
 }
 
-func persistManagedAccount(db *sql.DB, account *Account) error {
+func persistManagedAccount(db *sql.DB, secrets *SecretCipher, account *Account) error {
 	if db == nil {
 		return nil
 	}
@@ -81,13 +85,17 @@ func persistManagedAccount(db *sql.DB, account *Account) error {
 	if createdAt.IsZero() {
 		createdAt = time.Now()
 	}
+	storedAPIKey, err := secrets.Encrypt("upstream:"+account.ID, account.APIKey)
+	if err != nil {
+		return fmt.Errorf("encrypt account api key: %w", err)
+	}
 	_, err = db.Exec(`INSERT INTO upstream_accounts
 		(id, name, api_key, base_url, weight, models_json, enabled, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, api_key=excluded.api_key,
 		base_url=excluded.base_url, weight=excluded.weight, models_json=excluded.models_json,
 		enabled=excluded.enabled, updated_at=excluded.updated_at`, account.ID, account.Name,
-		account.APIKey, account.BaseURL, account.Weight, string(modelsJSON), boolInt(!account.Disabled),
+		storedAPIKey, account.BaseURL, account.Weight, string(modelsJSON), boolInt(!account.Disabled),
 		createdAt.UTC().Format(time.RFC3339Nano), now)
 	return err
 }
@@ -324,7 +332,7 @@ func (s *Server) createManagedAccount(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := persistManagedAccount(s.config.DB, account); err != nil {
+	if err := persistManagedAccount(s.config.DB, s.config.SecretCipher, account); err != nil {
 		s.accountsMu.Unlock()
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "persist account failed"})
 		return
@@ -358,7 +366,7 @@ func (s *Server) updateManagedAccount(w http.ResponseWriter, r *http.Request, id
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
-		if err := persistManagedAccount(s.config.DB, account); err != nil {
+		if err := persistManagedAccount(s.config.DB, s.config.SecretCipher, account); err != nil {
 			s.accountsMu.Unlock()
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "persist account failed"})
 			return

@@ -41,7 +41,7 @@ Copy-Item .env.example .env
 docker compose up -d --build
 ```
 
-SQLite 数据保存在 `seekops-data` 命名卷的 `/data/seekops.db`，重建容器不会删除该卷。
+SQLite 数据和本地主密钥分别保存在 `seekops-data` 命名卷的 `/data/seekops.db`、`/data/seekops.key`，重建容器不会删除该卷。
 
 ## 配置
 
@@ -53,6 +53,8 @@ SQLite 数据保存在 `seekops-data` 命名卷的 `/data/seekops.db`，重建�
 - `ADMIN_API_KEY`：管理接口 Key，默认复用 `PLATFORM_API_KEY`
 - `REQUEST_TIMEOUT`：上游请求超时，默认 `10m`
 - `SQLITE_PATH`：SQLite 文件路径，默认 `data/seekops.db`；设置为 `:memory:` 可关闭持久化
+- `SECRETS_MASTER_KEY_FILE`：AES-256-GCM 本地主密钥文件，默认与 SQLite 同目录、文件名为 `seekops.key`；首次启动自动生成
+- `SECRETS_MASTER_KEY`：Base64 或 64 位十六进制编码的 32 字节外部主密钥；设置后优先于本地密钥文件，不能在控制台轮换
 - `PRICE_INPUT_HIT_CNY_PER_MILLION`、`PRICE_INPUT_MISS_CNY_PER_MILLION`、`PRICE_OUTPUT_CNY_PER_MILLION`：MVP 估算价格，默认分别为 `0.02`、`1`、`2`
 - `BALANCE_POLL_INTERVAL`：上游余额轮询间隔，默认 `5m`
 
@@ -70,6 +72,8 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `GET /admin/setup`：查询管理员 API Key 是否已完成本地初始化
 - `POST /admin/setup`：首次保存管理员 API Key，JSON 格式为 `{"api_key":"..."}`，只允许执行一次
 - `POST /admin/admin-key`：在已认证状态下轮换管理员 API Key，JSON 格式为 `{"api_key":"..."}`
+- `GET /admin/security`：查询 SQLite 凭据加密状态、主密钥 ID 和密钥文件位置
+- `POST /admin/security/rotate`：轮换本地主密钥并重新加密全部 SQLite 凭据；外部主密钥模式不支持
 - `GET /metrics`：Prometheus 文本指标
 - `GET /admin/stats`：管理统计，需要 `X-Admin-Key` 或管理员 Bearer Token
 - `GET /admin/client-config`：获取当前 OpenAI/Anthropic Base URL 和平台 API Key，需要管理员认证
@@ -92,7 +96,17 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 
 Chat、Responses 和 Anthropic Messages JSON 请求体在 MVP 中限制为 32 MiB；流式 Chat 请求会在转发前确保 `stream_options.include_usage=true`。Anthropic 非流式和 SSE 响应的 `input_tokens`、`output_tokens`、缓存读取/创建 Token 会写入同一用量账本。虚拟 Key、用量事件、统计恢复和余额快照会写入 SQLite。
 
-控制台创建或更新上游账号时会立即检测一次，后台还会按 `BALANCE_POLL_INTERVAL` 自动检测；账号列表也提供单账号手动检测。未完成检测的账号显示“待检测”，只有余额接口成功返回后才显示“健康”。控制台账号会立即加入代理池并写入 SQLite；环境变量账号继续作为只读基线。上游 API Key 和控制台创建的租户 Key 必须可在重启后恢复，因此本地数据库包含可用凭据，部署时应严格限制 `data/seekops.db` 的文件访问权限并纳入安全备份。历史版本创建且只保存哈希的租户 Key 会显示为不可恢复，可通过轮换生成可查看的新密钥。
+控制台创建或更新上游账号时会立即检测一次，后台还会按 `BALANCE_POLL_INTERVAL` 自动检测；账号列表也提供单账号手动检测。未完成检测的账号显示“待检测”，只有余额接口成功返回后才显示“健康”。控制台账号会立即加入代理池并写入 SQLite；环境变量账号继续作为只读基线。上游 API Key 和可恢复租户 Key 使用 AES-256-GCM 加密后写入 SQLite，认证索引仍使用摘要。历史版本中的明文凭据会在首次启用主密钥时自动迁移；只保存哈希的旧租户 Key 仍不可恢复，可通过轮换生成可查看的新密钥。
+
+## 备份与恢复
+
+默认部署必须把 `data/seekops.db` 和 `data/seekops.key` 作为一组备份。只备份数据库无法恢复上游和租户凭据；密钥文件缺失或不匹配时服务会拒绝启动，避免以空凭据或错误状态继续运行。
+
+1. 停止服务或先执行 SQLite 一致性备份。
+2. 同时复制 `seekops.db`、`seekops.db-wal`（如存在）、`seekops.db-shm`（如存在）和 `seekops.key`，并限制备份访问权限。
+3. 恢复时把数据库和对应的密钥文件放回配置路径，再启动服务并检查设置页的主密钥 ID。
+
+控制台“设置”页可以轮换本地文件型主密钥。轮换会先保留旧密钥、重写所有凭据，成功后再移除旧密钥；轮换完成后应立即创建一组新的数据库与密钥文件备份。使用 `SECRETS_MASTER_KEY` 时，主密钥生命周期由外部部署系统负责，切换值之前必须完成数据重加密，当前版本不会从控制台轮换该模式。
 
 管理控制台源码位于 `web/`，生产构建会写入 `internal/proxy/web/` 并嵌入 Go 二进制：
 

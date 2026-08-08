@@ -41,6 +41,14 @@ export interface AdminSetupStatus {
   initialized: boolean;
 }
 
+export interface SecurityStatus {
+  encryption_enabled: boolean;
+  key_id?: string;
+  key_storage: "local_file" | "external" | "disabled";
+  key_file?: string;
+  rotation_supported: boolean;
+}
+
 export interface BalanceInfo {
   currency: string;
   total_balance: string;
