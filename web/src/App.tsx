@@ -53,7 +53,7 @@ const initialStats: Stats = {
 };
 
 function BrandMark() {
-  return <div className="brand-mark" role="img" aria-label="SeekOps logo"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M25 8H11l-4 4 4 4h10l4 4-4 4H7" fill="none" stroke="currentColor" strokeWidth="2.75" strokeLinecap="square" strokeLinejoin="miter" /><circle cx="25" cy="8" r="1.75" fill="currentColor" /><circle cx="7" cy="24" r="1.75" fill="currentColor" /></svg></div>;
+  return <img className="brand-mark" src="/console/seekops-mark.svg" alt="SeekOps logo" />;
 }
 
 export function App() {

@@ -1,6 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <rect width="32" height="32" rx="5" fill="#f2f2ef"/>
-  <path d="M25 8H11l-4 4 4 4h10l4 4-4 4H7" fill="none" stroke="#090909" stroke-width="2.75" stroke-linecap="square" stroke-linejoin="miter"/>
-  <circle cx="25" cy="8" r="1.75" fill="#090909"/>
-  <circle cx="7" cy="24" r="1.75" fill="#090909"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">SeekOps whale shark seal</title>
+  <desc id="desc">A black and white hand-drawn seal containing a simple whale shark.</desc>
+  <rect width="64" height="64" fill="#fff"/>
+  <path d="M32 5.7c15.2-.1 26.6 11 26.7 26.2.1 15.1-11.2 26.4-26.5 26.5C17 58.5 5.4 47.2 5.5 32 5.6 16.9 16.8 5.8 32 5.7Z" fill="none" stroke="#000" stroke-linecap="round" stroke-width="3"/>
+  <path d="M16.8 34.5c4.2-7.4 11.4-10.9 20.4-10.1 5.7.5 10.4 3 14 6.7 1.5 1.5 1.2 3.9-.6 5.3-4 3-8.9 4.4-14.5 4.2-7.6-.2-14.2-2.2-19.3-6.1Z" fill="#fff" stroke="#000" stroke-linejoin="round" stroke-width="2.5"/>
+  <path d="m17.4 34.7-7.1-5 2.2 5.4-2.3 5.3 7.7-4.4M34.3 24.2l3-6.1 2.1 6.8M35.1 40.3l-3.3 6.2 7.2-5.9" fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"/>
+  <path d="M46.5 31.3c1.7.3 3 .9 4.1 1.8M46.8 35.5c1.6-.2 2.9-.7 4-1.5" fill="none" stroke="#000" stroke-linecap="round" stroke-width="1.6"/>
+  <circle cx="45.6" cy="29.5" r="1.3" fill="#000"/>
+  <circle cx="27.5" cy="29.2" r="1.35" fill="#000"/>
+  <circle cx="33.4" cy="27.4" r="1" fill="#000"/>
+  <circle cx="37.4" cy="32.6" r="1.2" fill="#000"/>
+  <circle cx="29.7" cy="35.2" r=".9" fill="#000"/>
 </svg>

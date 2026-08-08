@@ -25,7 +25,7 @@ button { cursor: pointer; }
 .shell { min-height: 100vh; display: flex; }
 .sidebar { width: 232px; flex: 0 0 232px; background: #17201e; color: #e7eeea; display: flex; flex-direction: column; padding: 24px 14px 18px; }
 .brand { display: flex; align-items: center; gap: 11px; padding: 0 11px; }
-.brand-mark { width: 32px; height: 32px; border-radius: 8px; background: #91d1b1; color: #112c21; display: grid; place-items: center; font-weight: 800; letter-spacing: 0; }
+.brand-mark { width: 32px; height: 32px; border-radius: 8px; display: block; flex: 0 0 auto; }
 .brand strong { display: block; font-size: 18px; letter-spacing: .01em; }
 .brand span { display: block; margin-top: 2px; color: #91a49a; font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
 .sidebar nav { margin-top: 44px; display: grid; gap: 5px; }
@@ -156,8 +156,7 @@ main { min-width: 0; flex: 1; }
 body { color: var(--ink); background: #f4f4f1; }
 .sidebar { background: #090909; color: #f2f2ef; box-shadow: none; }
 .brand { gap: 12px; }
-.brand-mark { width: 34px; height: 34px; border: 1px solid #d7d7d2; border-radius: 5px; background: #f2f2ef; color: #090909; }
-.brand-mark svg { width: 25px; height: 25px; display: block; }
+.brand-mark { width: 34px; height: 34px; border: 0; border-radius: 50%; background: #fff; }
 .brand strong { letter-spacing: .02em; }
 .brand span { color: #898984; }
 .sidebar nav button { color: #a2a29d; border-radius: 4px; }
