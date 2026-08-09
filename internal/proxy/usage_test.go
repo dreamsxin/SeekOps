@@ -17,8 +17,8 @@ func TestUsageSummaryFilteringAndCSVExport(t *testing.T) {
 	defer db.Close()
 	server := NewServer(Config{PlatformAPIKey: "platform", AdminAPIKey: "admin", DB: db})
 	events := []RequestStats{
-		{RequestID: "req-a", TenantID: "tenant-a", VirtualKeyID: "vk-a", AccountID: "acct-a", Model: "deepseek-chat", Path: "/chat/completions", Status: 200, DurationMS: 120, FirstByteMS: 30, Usage: Usage{PromptTokens: 10, CacheHitTokens: 4, CacheMissTokens: 6, CompletionTokens: 5, TotalTokens: 15, UsagePresent: true}, UsageStatus: "complete", EstimatedCostCNY: 0.01, CreatedAt: time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)},
-		{RequestID: "req-b", TenantID: "tenant-b", VirtualKeyID: "vk-b", AccountID: "acct-a", Attempts: 2, Model: "=spreadsheet", Path: "/responses", Status: 503, DurationMS: 250, FirstByteMS: 250, Usage: Usage{PromptTokens: 20, CompletionTokens: 0, TotalTokens: 20, UsagePresent: true}, UsageStatus: "complete", EstimatedCostCNY: 0.02, CreatedAt: time.Date(2026, 8, 1, 18, 0, 0, 0, time.UTC)},
+		{RequestID: "req-a", TenantID: "tenant-a", VirtualKeyID: "vk-a", AccountID: "acct-a", RoutingPolicy: routingPolicyAffinity, AffinityReused: true, Model: "deepseek-chat", Path: "/chat/completions", Status: 200, DurationMS: 120, FirstByteMS: 30, Usage: Usage{PromptTokens: 10, CacheHitTokens: 4, CacheMissTokens: 6, CompletionTokens: 5, TotalTokens: 15, UsagePresent: true}, UsageStatus: "complete", EstimatedCostCNY: 0.01, CreatedAt: time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)},
+		{RequestID: "req-b", TenantID: "tenant-b", VirtualKeyID: "vk-b", AccountID: "acct-a", Attempts: 2, RoutingPolicy: routingPolicyControl, Model: "=spreadsheet", Path: "/responses", Status: 503, DurationMS: 250, FirstByteMS: 250, Usage: Usage{PromptTokens: 20, CompletionTokens: 0, TotalTokens: 20, UsagePresent: true}, UsageStatus: "complete", EstimatedCostCNY: 0.02, CreatedAt: time.Date(2026, 8, 1, 18, 0, 0, 0, time.UTC)},
 		{RequestID: "req-c", TenantID: "tenant-a", VirtualKeyID: "vk-a", AccountID: "acct-b", Model: "deepseek-chat", Path: "/chat/completions", Status: 200, Usage: Usage{PromptTokens: 30, CompletionTokens: 10, TotalTokens: 40, UsagePresent: true}, UsageStatus: "complete", EstimatedCostCNY: 0.03, CreatedAt: time.Date(2026, 8, 2, 8, 0, 0, 0, time.UTC)},
 	}
 	for _, event := range events {
@@ -35,6 +35,9 @@ func TestUsageSummaryFilteringAndCSVExport(t *testing.T) {
 	}
 	if summary.Requests != 2 || summary.Successes != 1 || summary.Errors != 1 || summary.TotalTokens != 35 || len(summary.Daily) != 1 || len(summary.ByTenant) != 2 || len(summary.ByModel) != 2 {
 		t.Fatalf("summary=%+v", summary)
+	}
+	if len(summary.RoutingExperiment) != 2 || summary.RoutingExperiment[0].Policy != routingPolicyAffinity || summary.RoutingExperiment[0].AffinityReuses != 1 || summary.RoutingExperiment[0].CacheHitRatePercent != 40 {
+		t.Fatalf("routing experiment=%+v", summary.RoutingExperiment)
 	}
 	if got := summary.End.Format("2006-01-02"); got != "2026-08-02" {
 		t.Fatalf("exclusive summary end=%s", got)

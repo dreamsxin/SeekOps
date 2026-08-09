@@ -30,17 +30,20 @@ func main() {
 		log.Fatalf("open secrets master key: %v", err)
 	}
 	cfg := proxy.Config{
-		ListenAddr:     os.Getenv("LISTEN_ADDR"),
-		PublicBaseURL:  os.Getenv("PUBLIC_BASE_URL"),
-		PlatformAPIKey: envOr("PLATFORM_API_KEY", "proxy-demo-key"),
-		AdminAPIKey:    envOr("ADMIN_API_KEY", envOr("PLATFORM_API_KEY", "proxy-demo-key")),
-		RequestTimeout: durationOr("REQUEST_TIMEOUT", 10*time.Minute),
-		Accounts:       loadAccounts(),
-		DB:             db,
-		SecretCipher:   secrets,
-		PriceInputHit:  floatEnv("PRICE_INPUT_HIT_CNY_PER_MILLION", 0.02),
-		PriceInputMiss: floatEnv("PRICE_INPUT_MISS_CNY_PER_MILLION", 1),
-		PriceOutput:    floatEnv("PRICE_OUTPUT_CNY_PER_MILLION", 2),
+		ListenAddr:             os.Getenv("LISTEN_ADDR"),
+		PublicBaseURL:          os.Getenv("PUBLIC_BASE_URL"),
+		PlatformAPIKey:         envOr("PLATFORM_API_KEY", "proxy-demo-key"),
+		AdminAPIKey:            envOr("ADMIN_API_KEY", envOr("PLATFORM_API_KEY", "proxy-demo-key")),
+		RequestTimeout:         durationOr("REQUEST_TIMEOUT", 10*time.Minute),
+		SessionAffinityTTL:     durationOr("SESSION_AFFINITY_TTL", 24*time.Hour),
+		SessionAffinityMax:     intEnv("SESSION_AFFINITY_MAX_ENTRIES", 100000, 1, 1000000),
+		SessionAffinityPercent: intEnv("SESSION_AFFINITY_PERCENT", 90, 0, 100),
+		Accounts:               loadAccounts(),
+		DB:                     db,
+		SecretCipher:           secrets,
+		PriceInputHit:          floatEnv("PRICE_INPUT_HIT_CNY_PER_MILLION", 0.02),
+		PriceInputMiss:         floatEnv("PRICE_INPUT_MISS_CNY_PER_MILLION", 1),
+		PriceOutput:            floatEnv("PRICE_OUTPUT_CNY_PER_MILLION", 2),
 	}
 	server, err := proxy.NewServerChecked(cfg)
 	if err != nil {
@@ -127,6 +130,16 @@ func floatEnv(name string, fallback float64) float64 {
 			return parsed
 		}
 		log.Printf("invalid %s=%q; using %.8f", name, value, fallback)
+	}
+	return fallback
+}
+
+func intEnv(name string, fallback, minimum, maximum int) int {
+	if value := os.Getenv(name); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed >= minimum && parsed <= maximum {
+			return parsed
+		}
+		log.Printf("invalid %s=%q; using %d", name, value, fallback)
 	}
 	return fallback
 }

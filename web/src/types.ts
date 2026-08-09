@@ -14,6 +14,9 @@ export interface RequestEvent {
   virtual_key_id: string;
   account_id: string;
   attempts: number;
+  routing_policy?: string;
+  affinity_reused?: boolean;
+  affinity_fallback?: boolean;
   model?: string;
   path: string;
   status: number;
@@ -65,6 +68,20 @@ export interface UsageSummary {
   by_virtual_key: UsageBreakdown[];
   by_model: UsageBreakdown[];
   by_account: UsageBreakdown[];
+  routing_experiment: RoutingExperimentBucket[];
+}
+
+export interface RoutingExperimentBucket {
+  policy: "affinity" | "control" | "no_session" | "legacy" | string;
+  requests: number;
+  successes: number;
+  errors: number;
+  cache_hit_tokens: number;
+  cache_miss_tokens: number;
+  cache_hit_rate_percent: number;
+  average_duration_ms: number;
+  affinity_reuses: number;
+  fallback_requests: number;
 }
 
 export interface Stats {

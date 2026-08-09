@@ -89,6 +89,9 @@ func migrateSQLite(db *sql.DB) error {
 			virtual_key_id TEXT NOT NULL,
 			account_id TEXT NOT NULL,
 			attempts INTEGER NOT NULL DEFAULT 1,
+			routing_policy TEXT NOT NULL DEFAULT 'legacy',
+			affinity_reused INTEGER NOT NULL DEFAULT 0,
+			affinity_fallback INTEGER NOT NULL DEFAULT 0,
 			model TEXT NOT NULL DEFAULT '',
 			path TEXT NOT NULL,
 			status INTEGER NOT NULL,
@@ -184,6 +187,9 @@ func migrateSQLite(db *sql.DB) error {
 	if err := ensureUsagePriceColumns(db); err != nil {
 		return fmt.Errorf("migrate sqlite usage prices: %w", err)
 	}
+	if err := ensureUsageRoutingColumns(db); err != nil {
+		return fmt.Errorf("migrate sqlite usage routing: %w", err)
+	}
 	return nil
 }
 
@@ -267,6 +273,43 @@ func ensureUsagePriceColumns(db *sql.DB) error {
 	return nil
 }
 
+func ensureUsageRoutingColumns(db *sql.DB) error {
+	columns := map[string]bool{}
+	rows, err := db.Query(`PRAGMA table_info(usage_events)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !columns["routing_policy"] {
+		if _, err := db.Exec(`ALTER TABLE usage_events ADD COLUMN routing_policy TEXT NOT NULL DEFAULT 'legacy'`); err != nil {
+			return err
+		}
+	}
+	if !columns["affinity_reused"] {
+		if _, err := db.Exec(`ALTER TABLE usage_events ADD COLUMN affinity_reused INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if !columns["affinity_fallback"] {
+		if _, err := db.Exec(`ALTER TABLE usage_events ADD COLUMN affinity_fallback INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *KeyStore) loadSQLite(db *sql.DB) error {
 	rows, err := db.Query(`SELECT id, name, tenant_id, prefix, secret, secret_hash, enabled, created_at,
 		quota_rpm, quota_concurrent, quota_daily_tokens, quota_daily_cost_cny,
@@ -334,12 +377,16 @@ func persistRequest(db *sql.DB, event RequestStats) error {
 	if priceStatus == "" {
 		priceStatus = "legacy"
 	}
+	routingPolicy := event.RoutingPolicy
+	if routingPolicy == "" {
+		routingPolicy = "legacy"
+	}
 	_, err := db.Exec(`INSERT OR IGNORE INTO usage_events
-		(request_id, tenant_id, virtual_key_id, account_id, attempts, model, path, status, duration_ms, first_byte_ms,
+		(request_id, tenant_id, virtual_key_id, account_id, attempts, routing_policy, affinity_reused, affinity_fallback, model, path, status, duration_ms, first_byte_ms,
 		 prompt_tokens, cache_hit_tokens, cache_miss_tokens, completion_tokens, reasoning_tokens, total_tokens,
 		 usage_present, usage_status, price_rule_id, price_status, estimated_cost_cny, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		event.RequestID, event.TenantID, event.VirtualKeyID, event.AccountID, attempts, event.Model, event.Path, event.Status,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.RequestID, event.TenantID, event.VirtualKeyID, event.AccountID, attempts, routingPolicy, boolInt(event.AffinityReused), boolInt(event.AffinityFallback), event.Model, event.Path, event.Status,
 		event.DurationMS, event.FirstByteMS, event.Usage.PromptTokens, event.Usage.CacheHitTokens,
 		event.Usage.CacheMissTokens, event.Usage.CompletionTokens, event.Usage.ReasoningTokens, event.Usage.TotalTokens,
 		boolInt(event.Usage.UsagePresent), event.UsageStatus, event.PriceRuleID, priceStatus, event.EstimatedCostCNY,
@@ -360,7 +407,7 @@ func (r *Recorder) loadSQLite(db *sql.DB) {
 	row = db.QueryRow(`SELECT COUNT(*) FROM usage_events WHERE status >= 200 AND status < 400`)
 	_ = row.Scan(&r.stats.Successes)
 	r.stats.Errors = r.stats.Requests - r.stats.Successes
-	rows, err := db.Query(`SELECT request_id, tenant_id, virtual_key_id, account_id, attempts, model, path, status,
+	rows, err := db.Query(`SELECT request_id, tenant_id, virtual_key_id, account_id, attempts, routing_policy, affinity_reused, affinity_fallback, model, path, status,
 		duration_ms, first_byte_ms, prompt_tokens, cache_hit_tokens, cache_miss_tokens, completion_tokens,
 		reasoning_tokens, total_tokens, usage_present, usage_status, price_rule_id, price_status, estimated_cost_cny, created_at
 		FROM usage_events ORDER BY id DESC LIMIT 50`)
@@ -370,15 +417,17 @@ func (r *Recorder) loadSQLite(db *sql.DB) {
 	defer rows.Close()
 	for rows.Next() {
 		var event RequestStats
-		var present int
+		var present, affinityReused, affinityFallback int
 		var createdAt string
-		if err := rows.Scan(&event.RequestID, &event.TenantID, &event.VirtualKeyID, &event.AccountID, &event.Attempts, &event.Model, &event.Path,
+		if err := rows.Scan(&event.RequestID, &event.TenantID, &event.VirtualKeyID, &event.AccountID, &event.Attempts, &event.RoutingPolicy, &affinityReused, &affinityFallback, &event.Model, &event.Path,
 			&event.Status, &event.DurationMS, &event.FirstByteMS, &event.Usage.PromptTokens, &event.Usage.CacheHitTokens,
 			&event.Usage.CacheMissTokens, &event.Usage.CompletionTokens, &event.Usage.ReasoningTokens, &event.Usage.TotalTokens,
 			&present, &event.UsageStatus, &event.PriceRuleID, &event.PriceStatus, &event.EstimatedCostCNY, &createdAt); err != nil {
 			continue
 		}
 		event.Usage.UsagePresent = present != 0
+		event.AffinityReused = affinityReused != 0
+		event.AffinityFallback = affinityFallback != 0
 		if event.Attempts <= 0 {
 			event.Attempts = 1
 		}
@@ -452,7 +501,7 @@ type UsageFilter struct {
 
 func queryUsage(db *sql.DB, filter UsageFilter) ([]RequestStats, error) {
 	query := strings.Builder{}
-	query.WriteString(`SELECT request_id, tenant_id, virtual_key_id, account_id, attempts, model, path, status,
+	query.WriteString(`SELECT request_id, tenant_id, virtual_key_id, account_id, attempts, routing_policy, affinity_reused, affinity_fallback, model, path, status,
 		duration_ms, first_byte_ms, prompt_tokens, cache_hit_tokens, cache_miss_tokens, completion_tokens,
 		reasoning_tokens, total_tokens, usage_present, usage_status, price_rule_id, price_status, estimated_cost_cny, created_at
 		FROM usage_events`)
@@ -475,15 +524,17 @@ func queryUsage(db *sql.DB, filter UsageFilter) ([]RequestStats, error) {
 	result := make([]RequestStats, 0, limit)
 	for rows.Next() {
 		var event RequestStats
-		var present int
+		var present, affinityReused, affinityFallback int
 		var createdAt string
-		if err := rows.Scan(&event.RequestID, &event.TenantID, &event.VirtualKeyID, &event.AccountID, &event.Attempts, &event.Model, &event.Path,
+		if err := rows.Scan(&event.RequestID, &event.TenantID, &event.VirtualKeyID, &event.AccountID, &event.Attempts, &event.RoutingPolicy, &affinityReused, &affinityFallback, &event.Model, &event.Path,
 			&event.Status, &event.DurationMS, &event.FirstByteMS, &event.Usage.PromptTokens, &event.Usage.CacheHitTokens,
 			&event.Usage.CacheMissTokens, &event.Usage.CompletionTokens, &event.Usage.ReasoningTokens, &event.Usage.TotalTokens,
 			&present, &event.UsageStatus, &event.PriceRuleID, &event.PriceStatus, &event.EstimatedCostCNY, &createdAt); err != nil {
 			return nil, err
 		}
 		event.Usage.UsagePresent = present != 0
+		event.AffinityReused = affinityReused != 0
+		event.AffinityFallback = affinityFallback != 0
 		if event.Attempts <= 0 {
 			event.Attempts = 1
 		}

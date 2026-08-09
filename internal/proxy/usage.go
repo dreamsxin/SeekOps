@@ -11,23 +11,24 @@ import (
 )
 
 type UsageSummary struct {
-	Start            time.Time        `json:"start"`
-	End              time.Time        `json:"end"`
-	Requests         int64            `json:"requests"`
-	Successes        int64            `json:"successes"`
-	Errors           int64            `json:"errors"`
-	TotalTokens      int64            `json:"total_tokens"`
-	PromptTokens     int64            `json:"prompt_tokens"`
-	CompletionTokens int64            `json:"completion_tokens"`
-	CacheHitTokens   int64            `json:"cache_hit_tokens"`
-	CacheMissTokens  int64            `json:"cache_miss_tokens"`
-	EstimatedCostCNY float64          `json:"estimated_cost_cny"`
-	UnpricedRequests int64            `json:"unpriced_requests"`
-	Daily            []UsageBucket    `json:"daily"`
-	ByTenant         []UsageBreakdown `json:"by_tenant"`
-	ByVirtualKey     []UsageBreakdown `json:"by_virtual_key"`
-	ByModel          []UsageBreakdown `json:"by_model"`
-	ByAccount        []UsageBreakdown `json:"by_account"`
+	Start             time.Time                 `json:"start"`
+	End               time.Time                 `json:"end"`
+	Requests          int64                     `json:"requests"`
+	Successes         int64                     `json:"successes"`
+	Errors            int64                     `json:"errors"`
+	TotalTokens       int64                     `json:"total_tokens"`
+	PromptTokens      int64                     `json:"prompt_tokens"`
+	CompletionTokens  int64                     `json:"completion_tokens"`
+	CacheHitTokens    int64                     `json:"cache_hit_tokens"`
+	CacheMissTokens   int64                     `json:"cache_miss_tokens"`
+	EstimatedCostCNY  float64                   `json:"estimated_cost_cny"`
+	UnpricedRequests  int64                     `json:"unpriced_requests"`
+	Daily             []UsageBucket             `json:"daily"`
+	ByTenant          []UsageBreakdown          `json:"by_tenant"`
+	ByVirtualKey      []UsageBreakdown          `json:"by_virtual_key"`
+	ByModel           []UsageBreakdown          `json:"by_model"`
+	ByAccount         []UsageBreakdown          `json:"by_account"`
+	RoutingExperiment []RoutingExperimentBucket `json:"routing_experiment"`
 }
 
 type UsageBucket struct {
@@ -48,6 +49,19 @@ type UsageBreakdown struct {
 	TotalTokens      int64   `json:"total_tokens"`
 	EstimatedCostCNY float64 `json:"estimated_cost_cny"`
 	UnpricedRequests int64   `json:"unpriced_requests"`
+}
+
+type RoutingExperimentBucket struct {
+	Policy              string  `json:"policy"`
+	Requests            int64   `json:"requests"`
+	Successes           int64   `json:"successes"`
+	Errors              int64   `json:"errors"`
+	CacheHitTokens      int64   `json:"cache_hit_tokens"`
+	CacheMissTokens     int64   `json:"cache_miss_tokens"`
+	CacheHitRatePercent float64 `json:"cache_hit_rate_percent"`
+	AverageDurationMS   float64 `json:"average_duration_ms"`
+	AffinityReuses      int64   `json:"affinity_reuses"`
+	FallbackRequests    int64   `json:"fallback_requests"`
 }
 
 func parseUsageDate(value string) (time.Time, error) {
@@ -128,7 +142,7 @@ func usageWhere(filter UsageFilter) (string, []any) {
 }
 
 func usageSummary(db *sql.DB, filter UsageFilter) (UsageSummary, error) {
-	result := UsageSummary{Start: filter.StartAt.UTC(), End: filter.EndAt.UTC(), Daily: []UsageBucket{}, ByTenant: []UsageBreakdown{}, ByVirtualKey: []UsageBreakdown{}, ByModel: []UsageBreakdown{}, ByAccount: []UsageBreakdown{}}
+	result := UsageSummary{Start: filter.StartAt.UTC(), End: filter.EndAt.UTC(), Daily: []UsageBucket{}, ByTenant: []UsageBreakdown{}, ByVirtualKey: []UsageBreakdown{}, ByModel: []UsageBreakdown{}, ByAccount: []UsageBreakdown{}, RoutingExperiment: []RoutingExperimentBucket{}}
 	if db == nil {
 		return result, nil
 	}
@@ -153,7 +167,36 @@ func usageSummary(db *sql.DB, filter UsageFilter) (UsageSummary, error) {
 			return UsageSummary{}, err
 		}
 	}
+	if result.RoutingExperiment, err = queryRoutingExperiment(db, where, args); err != nil {
+		return UsageSummary{}, err
+	}
 	return result, nil
+}
+
+func queryRoutingExperiment(db *sql.DB, where string, args []any) ([]RoutingExperimentBucket, error) {
+	rows, err := db.Query(`SELECT routing_policy, COUNT(*),
+		COALESCE(SUM(CASE WHEN status >= 200 AND status < 400 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status < 200 OR status >= 400 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(cache_hit_tokens), 0), COALESCE(SUM(cache_miss_tokens), 0),
+		COALESCE(AVG(duration_ms), 0), COALESCE(SUM(affinity_reused), 0), COALESCE(SUM(affinity_fallback), 0)
+		FROM usage_events`+where+` GROUP BY routing_policy ORDER BY CASE routing_policy WHEN 'affinity' THEN 1 WHEN 'control' THEN 2 WHEN 'no_session' THEN 3 ELSE 4 END`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]RoutingExperimentBucket, 0, 4)
+	for rows.Next() {
+		var item RoutingExperimentBucket
+		if err := rows.Scan(&item.Policy, &item.Requests, &item.Successes, &item.Errors, &item.CacheHitTokens, &item.CacheMissTokens, &item.AverageDurationMS, &item.AffinityReuses, &item.FallbackRequests); err != nil {
+			return nil, err
+		}
+		denominator := item.CacheHitTokens + item.CacheMissTokens
+		if denominator > 0 {
+			item.CacheHitRatePercent = float64(item.CacheHitTokens) * 100 / float64(denominator)
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
 }
 
 func queryUsageBuckets(db *sql.DB, where string, args []any) ([]UsageBucket, error) {
@@ -205,11 +248,11 @@ func writeUsageCSV(w http.ResponseWriter, events []RequestStats) error {
 	w.Header().Set("Content-Disposition", `attachment; filename="seekops-usage.csv"`)
 	_, _ = w.Write([]byte{0xEF, 0xBB, 0xBF})
 	writer := csv.NewWriter(w)
-	if err := writer.Write([]string{"created_at", "request_id", "tenant_id", "virtual_key_id", "account_id", "attempts", "model", "path", "status", "duration_ms", "first_byte_ms", "prompt_tokens", "cache_hit_tokens", "cache_miss_tokens", "completion_tokens", "reasoning_tokens", "total_tokens", "usage_status", "price_rule_id", "price_status", "estimated_cost_cny"}); err != nil {
+	if err := writer.Write([]string{"created_at", "request_id", "tenant_id", "virtual_key_id", "account_id", "attempts", "routing_policy", "affinity_reused", "affinity_fallback", "model", "path", "status", "duration_ms", "first_byte_ms", "prompt_tokens", "cache_hit_tokens", "cache_miss_tokens", "completion_tokens", "reasoning_tokens", "total_tokens", "usage_status", "price_rule_id", "price_status", "estimated_cost_cny"}); err != nil {
 		return err
 	}
 	for _, event := range events {
-		values := []string{event.CreatedAt.UTC().Format(time.RFC3339), csvText(event.RequestID), csvText(event.TenantID), csvText(event.VirtualKeyID), csvText(event.AccountID), strconv.Itoa(event.Attempts), csvText(event.Model), csvText(event.Path), strconv.Itoa(event.Status), strconv.FormatInt(event.DurationMS, 10), strconv.FormatInt(event.FirstByteMS, 10), strconv.FormatInt(event.Usage.PromptTokens, 10), strconv.FormatInt(event.Usage.CacheHitTokens, 10), strconv.FormatInt(event.Usage.CacheMissTokens, 10), strconv.FormatInt(event.Usage.CompletionTokens, 10), strconv.FormatInt(event.Usage.ReasoningTokens, 10), strconv.FormatInt(event.Usage.TotalTokens, 10), csvText(event.UsageStatus), csvText(event.PriceRuleID), csvText(event.PriceStatus), strconv.FormatFloat(event.EstimatedCostCNY, 'f', 8, 64)}
+		values := []string{event.CreatedAt.UTC().Format(time.RFC3339), csvText(event.RequestID), csvText(event.TenantID), csvText(event.VirtualKeyID), csvText(event.AccountID), strconv.Itoa(event.Attempts), csvText(event.RoutingPolicy), strconv.FormatBool(event.AffinityReused), strconv.FormatBool(event.AffinityFallback), csvText(event.Model), csvText(event.Path), strconv.Itoa(event.Status), strconv.FormatInt(event.DurationMS, 10), strconv.FormatInt(event.FirstByteMS, 10), strconv.FormatInt(event.Usage.PromptTokens, 10), strconv.FormatInt(event.Usage.CacheHitTokens, 10), strconv.FormatInt(event.Usage.CacheMissTokens, 10), strconv.FormatInt(event.Usage.CompletionTokens, 10), strconv.FormatInt(event.Usage.ReasoningTokens, 10), strconv.FormatInt(event.Usage.TotalTokens, 10), csvText(event.UsageStatus), csvText(event.PriceRuleID), csvText(event.PriceStatus), strconv.FormatFloat(event.EstimatedCostCNY, 'f', 8, 64)}
 		if err := writer.Write(values); err != nil {
 			return err
 		}
@@ -244,7 +287,7 @@ func (s *Server) handleUsageSummary(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if s.config.DB == nil {
-			writeJSON(w, http.StatusOK, UsageSummary{Start: start, End: end, Daily: []UsageBucket{}, ByTenant: []UsageBreakdown{}, ByVirtualKey: []UsageBreakdown{}, ByModel: []UsageBreakdown{}, ByAccount: []UsageBreakdown{}})
+			writeJSON(w, http.StatusOK, UsageSummary{Start: start, End: end, Daily: []UsageBucket{}, ByTenant: []UsageBreakdown{}, ByVirtualKey: []UsageBreakdown{}, ByModel: []UsageBreakdown{}, ByAccount: []UsageBreakdown{}, RoutingExperiment: []RoutingExperimentBucket{}})
 			return
 		}
 		summary, err := usageSummary(s.config.DB, filter)

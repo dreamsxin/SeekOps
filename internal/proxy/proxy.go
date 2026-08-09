@@ -127,6 +127,9 @@ type RequestStats struct {
 	VirtualKeyID     string    `json:"virtual_key_id"`
 	AccountID        string    `json:"account_id"`
 	Attempts         int       `json:"attempts"`
+	RoutingPolicy    string    `json:"routing_policy"`
+	AffinityReused   bool      `json:"affinity_reused"`
+	AffinityFallback bool      `json:"affinity_fallback"`
 	Model            string    `json:"model,omitempty"`
 	Path             string    `json:"path"`
 	Status           int       `json:"status"`
@@ -568,18 +571,21 @@ func (r *Recorder) Snapshot() Stats {
 }
 
 type Config struct {
-	ListenAddr     string
-	PublicBaseURL  string
-	PlatformAPIKey string
-	AdminAPIKey    string
-	RequestTimeout time.Duration
-	Accounts       []*Account
-	VirtualKeys    *KeyStore
-	DB             *sql.DB
-	SecretCipher   *SecretCipher
-	PriceInputHit  float64
-	PriceInputMiss float64
-	PriceOutput    float64
+	ListenAddr             string
+	PublicBaseURL          string
+	PlatformAPIKey         string
+	AdminAPIKey            string
+	RequestTimeout         time.Duration
+	SessionAffinityTTL     time.Duration
+	SessionAffinityMax     int
+	SessionAffinityPercent int
+	Accounts               []*Account
+	VirtualKeys            *KeyStore
+	DB                     *sql.DB
+	SecretCipher           *SecretCipher
+	PriceInputHit          float64
+	PriceInputMiss         float64
+	PriceOutput            float64
 }
 
 type Server struct {
@@ -593,6 +599,7 @@ type Server struct {
 	transport  http.RoundTripper
 	server     *http.Server
 	sequence   atomic.Uint64
+	affinities *AffinityStore
 	adminMu    sync.RWMutex
 	adminKey   *adminKeyCredential
 	backupMu   sync.Mutex
@@ -607,21 +614,25 @@ const (
 )
 
 type requestMeta struct {
-	requestID string
-	principal *Principal
-	account   *Account
-	model     string
-	keys      *KeyStore
-	path      string
-	started   time.Time
-	recorder  *Recorder
-	prices    *PriceStore
-	alerts    *AlertStore
-	firstByte atomic.Int64
-	status    atomic.Int64
-	attempts  atomic.Int64
-	usage     usageCollector
-	recorded  atomic.Bool
+	requestID        string
+	principal        *Principal
+	account          *Account
+	model            string
+	keys             *KeyStore
+	path             string
+	started          time.Time
+	recorder         *Recorder
+	prices           *PriceStore
+	alerts           *AlertStore
+	firstByte        atomic.Int64
+	status           atomic.Int64
+	attempts         atomic.Int64
+	affinityReused   atomic.Bool
+	affinityFallback atomic.Bool
+	sessionKey       string
+	routingPolicy    string
+	usage            usageCollector
+	recorded         atomic.Bool
 }
 
 type failoverTransport struct {
@@ -657,6 +668,10 @@ func (t *failoverTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	next.active.Add(1)
 	meta.account = next
 	meta.attempts.Add(1)
+	if meta.routingPolicy == routingPolicyAffinity {
+		meta.affinityFallback.Store(true)
+		t.server.affinities.Bind(meta.sessionKey, next.ID, time.Now())
+	}
 	t.server.retargetRequest(retry, next, meta.path, meta.requestID)
 	return t.base.RoundTrip(retry)
 }
@@ -911,6 +926,15 @@ func NewServerChecked(cfg Config) (*Server, error) {
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 10 * time.Minute
 	}
+	if cfg.SessionAffinityTTL <= 0 {
+		cfg.SessionAffinityTTL = 24 * time.Hour
+	}
+	if cfg.SessionAffinityMax <= 0 {
+		cfg.SessionAffinityMax = 100000
+	}
+	if cfg.SessionAffinityPercent < 0 || cfg.SessionAffinityPercent > 100 {
+		cfg.SessionAffinityPercent = 90
+	}
 	if cfg.PriceInputHit == 0 {
 		cfg.PriceInputHit = 0.02
 	}
@@ -961,7 +985,7 @@ func NewServerChecked(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load admin key: %w", err)
 	}
-	s := &Server{config: cfg, keys: keys, prices: prices, alerts: alerts, audit: NewAuditStore(cfg.DB), recorder: recorder, transport: http.DefaultTransport, adminKey: adminKey, accounts: accounts}
+	s := &Server{config: cfg, keys: keys, prices: prices, alerts: alerts, audit: NewAuditStore(cfg.DB), recorder: recorder, transport: http.DefaultTransport, adminKey: adminKey, accounts: accounts, affinities: NewAffinityStore(cfg.SessionAffinityTTL, cfg.SessionAffinityMax)}
 	s.proxy = &httputil.ReverseProxy{Director: s.director, Transport: &failoverTransport{server: s, base: s.transport}, ModifyResponse: s.modifyResponse, ErrorHandler: s.errorHandler, FlushInterval: -1}
 	s.server = &http.Server{Addr: cfg.ListenAddr, Handler: s, ReadHeaderTimeout: 10 * time.Second}
 	return s, nil
@@ -1009,19 +1033,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.keys.Release(principal.ID)
-	model, status, err := s.prepareRequest(r)
+	prepared, status, err := s.prepareRequest(r)
 	if err != nil {
 		writeProxyError(w, r, status, "invalid_request_error", err.Error(), nil)
 		return
 	}
-	account := s.selectAccount(model, "")
+	sessionKey := scopedSessionKey(principal.ID, prepared.sessionSeed)
+	account, policy, reused, affinityFallback := s.routeAccount(prepared.model, sessionKey)
 	if account == nil {
 		writeProxyError(w, r, http.StatusServiceUnavailable, "proxy_error", "no healthy upstream account available", nil)
 		return
 	}
 	requestID := newID()
-	meta := &requestMeta{requestID: requestID, principal: principal, account: account, model: model, keys: s.keys, prices: s.prices, alerts: s.alerts, path: r.URL.Path, started: time.Now(), recorder: s.recorder}
+	meta := &requestMeta{requestID: requestID, principal: principal, account: account, model: prepared.model, keys: s.keys, prices: s.prices, alerts: s.alerts, path: r.URL.Path, started: time.Now(), recorder: s.recorder, sessionKey: sessionKey, routingPolicy: policy}
 	meta.attempts.Store(1)
+	meta.affinityReused.Store(reused)
+	meta.affinityFallback.Store(affinityFallback)
 	account.active.Add(1)
 	defer func() { meta.account.active.Add(-1) }()
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
@@ -1123,33 +1150,87 @@ func (s *Server) selectAccount(model, excludedID string) *Account {
 	return selected
 }
 
+func (s *Server) routeAccount(model, sessionKey string) (*Account, string, bool, bool) {
+	policy := routingPolicy(sessionKey, s.config.SessionAffinityPercent)
+	if policy != routingPolicyAffinity {
+		return s.selectAccount(model, ""), policy, false, false
+	}
+	now := time.Now()
+	if accountID, ok := s.affinities.Get(sessionKey, now); ok {
+		if account := s.eligibleAccount(accountID, model, "", now); account != nil {
+			return account, policy, true, false
+		}
+		account := s.selectAccount(model, "")
+		if account != nil {
+			s.affinities.Bind(sessionKey, account.ID, now)
+		}
+		return account, policy, false, true
+	}
+	account := s.selectAccount(model, "")
+	if account != nil {
+		s.affinities.Bind(sessionKey, account.ID, now)
+	}
+	return account, policy, false, false
+}
+
+func (s *Server) eligibleAccount(accountID, model, excludedID string, now time.Time) *Account {
+	for _, account := range s.accountsSnapshot() {
+		if account != nil && account.ID == accountID && account.ID != excludedID && !account.Disabled && account.APIKey != "" && account.Healthy(now) && account.SupportsModel(model) {
+			return account
+		}
+	}
+	return nil
+}
+
 func max(a, b int) int {
 	if a > b {
 		return a
 	}
 	return b
 }
-func (s *Server) prepareRequest(r *http.Request) (string, int, error) {
+
+type preparedRequest struct {
+	model       string
+	sessionSeed string
+}
+
+func (s *Server) prepareRequest(r *http.Request) (preparedRequest, int, error) {
+	result := preparedRequest{model: r.Header.Get("X-Proxy-Model")}
+	if sessionID := strings.TrimSpace(r.Header.Get("X-Proxy-Session-ID")); sessionID != "" {
+		if len(sessionID) > 512 {
+			return preparedRequest{}, http.StatusBadRequest, fmt.Errorf("X-Proxy-Session-ID exceeds 512 bytes")
+		}
+		result.sessionSeed = "header:" + sessionID
+	} else if sessionID := strings.TrimSpace(r.Header.Get("X-Conversation-ID")); sessionID != "" {
+		if len(sessionID) > 512 {
+			return preparedRequest{}, http.StatusBadRequest, fmt.Errorf("X-Conversation-ID exceeds 512 bytes")
+		}
+		result.sessionSeed = "header:" + sessionID
+	}
+	r.Header.Del("X-Proxy-Session-ID")
+	r.Header.Del("X-Conversation-ID")
 	isJSON := strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json")
 	isSupportedBody := strings.HasSuffix(r.URL.Path, "/chat/completions") || strings.HasSuffix(r.URL.Path, "/responses") || isAnthropicPath(r.URL.Path)
 	if r.Body == nil || !isJSON || !isSupportedBody {
-		return r.Header.Get("X-Proxy-Model"), 0, nil
+		return result, 0, nil
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 32*1024*1024+1))
 	if err != nil {
-		return "", http.StatusBadRequest, fmt.Errorf("read request body: %w", err)
+		return preparedRequest{}, http.StatusBadRequest, fmt.Errorf("read request body: %w", err)
 	}
 	if len(body) > 32*1024*1024 {
-		return "", http.StatusRequestEntityTooLarge, fmt.Errorf("request body exceeds the 32 MiB MVP limit")
+		return preparedRequest{}, http.StatusRequestEntityTooLarge, fmt.Errorf("request body exceeds the 32 MiB MVP limit")
 	}
 	r.Body.Close()
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", http.StatusBadRequest, fmt.Errorf("invalid JSON request body: %w", err)
+		return preparedRequest{}, http.StatusBadRequest, fmt.Errorf("invalid JSON request body: %w", err)
 	}
-	model := r.Header.Get("X-Proxy-Model")
-	if model == "" {
-		model = stringValue(payload["model"])
+	if result.model == "" {
+		result.model = stringValue(payload["model"])
+	}
+	if result.sessionSeed == "" {
+		result.sessionSeed = sessionSeedFromPayload(r.URL.Path, payload)
 	}
 	if strings.HasSuffix(r.URL.Path, "/chat/completions") {
 		if stream, ok := payload["stream"].(bool); ok && stream {
@@ -1161,12 +1242,52 @@ func (s *Server) prepareRequest(r *http.Request) (string, int, error) {
 			options["include_usage"] = true
 			body, err = json.Marshal(payload)
 			if err != nil {
-				return model, http.StatusBadRequest, fmt.Errorf("encode streaming request: %w", err)
+				return preparedRequest{}, http.StatusBadRequest, fmt.Errorf("encode streaming request: %w", err)
 			}
 		}
 	}
 	setReplayableBody(r, body)
-	return model, 0, nil
+	return result, 0, nil
+}
+
+func sessionSeedFromPayload(path string, payload map[string]any) string {
+	if conversation := stringValue(payload["conversation"]); conversation != "" {
+		return "conversation:" + conversation
+	}
+	if strings.HasSuffix(path, "/responses") {
+		return ""
+	}
+	anchors := map[string]any{"path": path}
+	if system, ok := payload["system"]; ok {
+		anchors["system"] = system
+	}
+	if tools, ok := payload["tools"]; ok {
+		anchors["tools"] = tools
+	}
+	messages, _ := payload["messages"].([]any)
+	stable := make([]any, 0, 4)
+	for _, raw := range messages {
+		message, _ := raw.(map[string]any)
+		role := stringValue(message["role"])
+		if role == "system" || role == "developer" {
+			stable = append(stable, raw)
+			continue
+		}
+		if role == "user" {
+			stable = append(stable, raw)
+			break
+		}
+	}
+	if len(stable) == 0 {
+		return ""
+	}
+	anchors["messages"] = stable
+	encoded, err := json.Marshal(anchors)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(encoded)
+	return "prefix:" + hex.EncodeToString(sum[:])
 }
 
 func setReplayableBody(r *http.Request, body []byte) {
@@ -1211,6 +1332,8 @@ func (s *Server) retargetRequest(r *http.Request, account *Account, originalPath
 	r.Header.Del("X-Proxy-API-Key")
 	r.Header.Del("X-Admin-Key")
 	r.Header.Del("X-Proxy-Model")
+	r.Header.Del("X-Proxy-Session-ID")
+	r.Header.Del("X-Conversation-ID")
 	r.Header.Set("X-Proxy-Request-ID", requestID)
 }
 func joinPath(base, path string) string {
@@ -1230,6 +1353,8 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	resp.Body = &trackingBody{body: resp.Body, meta: meta}
 	resp.Header.Set("X-Proxy-Request-ID", meta.requestID)
 	resp.Header.Set("X-Proxy-Attempts", strconv.FormatInt(meta.attempts.Load(), 10))
+	resp.Header.Set("X-Proxy-Routing-Policy", meta.routingPolicy)
+	resp.Header.Set("X-Proxy-Affinity-Reused", strconv.FormatBool(meta.affinityReused.Load()))
 	return nil
 }
 func (s *Server) errorHandler(w http.ResponseWriter, r *http.Request, err error) {
@@ -1238,6 +1363,7 @@ func (s *Server) errorHandler(w http.ResponseWriter, r *http.Request, err error)
 		meta.account.markTransportFailure()
 		meta.status.Store(502)
 		w.Header().Set("X-Proxy-Attempts", strconv.FormatInt(meta.attempts.Load(), 10))
+		w.Header().Set("X-Proxy-Routing-Policy", meta.routingPolicy)
 		recordMeta(meta)
 	}
 	log.Printf("proxy request failed: %v", err)
@@ -1294,7 +1420,7 @@ func recordMeta(meta *requestMeta) {
 		tenantID = meta.principal.TenantID
 		virtualKeyID = meta.principal.ID
 	}
-	event := RequestStats{RequestID: meta.requestID, TenantID: tenantID, VirtualKeyID: virtualKeyID, AccountID: meta.account.ID, Attempts: int(meta.attempts.Load()), Model: model, Path: meta.path, Status: status, DurationMS: time.Since(meta.started).Milliseconds(), FirstByteMS: first, Usage: usage, UsageStatus: usageStatus, PriceRuleID: priceRuleID, PriceStatus: priceStatus, EstimatedCostCNY: cost, CreatedAt: meta.started}
+	event := RequestStats{RequestID: meta.requestID, TenantID: tenantID, VirtualKeyID: virtualKeyID, AccountID: meta.account.ID, Attempts: int(meta.attempts.Load()), RoutingPolicy: meta.routingPolicy, AffinityReused: meta.affinityReused.Load(), AffinityFallback: meta.affinityFallback.Load(), Model: model, Path: meta.path, Status: status, DurationMS: time.Since(meta.started).Milliseconds(), FirstByteMS: first, Usage: usage, UsageStatus: usageStatus, PriceRuleID: priceRuleID, PriceStatus: priceStatus, EstimatedCostCNY: cost, CreatedAt: meta.started}
 	meta.recorder.Record(event)
 	now := time.Now()
 	if meta.keys != nil && meta.principal != nil {

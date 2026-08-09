@@ -208,9 +208,10 @@ func TestSQLiteMigratesUsageMetadata(t *testing.T) {
 	}
 	defer db.Close()
 	var attempts int
-	var priceRuleID, priceStatus string
-	if err := db.QueryRow(`SELECT attempts, price_rule_id, price_status FROM usage_events WHERE request_id = 'legacy'`).Scan(&attempts, &priceRuleID, &priceStatus); err != nil || attempts != 1 || priceRuleID != "" || priceStatus != "legacy" {
-		t.Fatalf("attempts=%d price_rule_id=%q price_status=%q err=%v", attempts, priceRuleID, priceStatus, err)
+	var affinityReused, affinityFallback int
+	var priceRuleID, priceStatus, routingPolicy string
+	if err := db.QueryRow(`SELECT attempts, price_rule_id, price_status, routing_policy, affinity_reused, affinity_fallback FROM usage_events WHERE request_id = 'legacy'`).Scan(&attempts, &priceRuleID, &priceStatus, &routingPolicy, &affinityReused, &affinityFallback); err != nil || attempts != 1 || priceRuleID != "" || priceStatus != "legacy" || routingPolicy != "legacy" || affinityReused != 0 || affinityFallback != 0 {
+		t.Fatalf("attempts=%d price_rule_id=%q price_status=%q routing_policy=%q reused=%d fallback=%d err=%v", attempts, priceRuleID, priceStatus, routingPolicy, affinityReused, affinityFallback, err)
 	}
 }
 

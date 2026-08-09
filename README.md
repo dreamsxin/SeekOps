@@ -66,6 +66,9 @@ SQLite 数据和本地主密钥分别保存在 `seekops-data` 命名卷的 `/dat
 - `PLATFORM_API_KEY`：平台虚拟 Key，默认仅用于本地开发的 `proxy-demo-key`
 - `ADMIN_API_KEY`：管理接口 Key，默认复用 `PLATFORM_API_KEY`
 - `REQUEST_TIMEOUT`：上游请求超时，默认 `10m`
+- `SESSION_AFFINITY_TTL`：会话亲和路由关系的内存 TTL，默认 `24h`
+- `SESSION_AFFINITY_MAX_ENTRIES`：最多保留的会话亲和关系，默认 `100000`
+- `SESSION_AFFINITY_PERCENT`：稳定会话进入亲和实验组的比例，默认 `90`；设为 `0` 可关闭亲和，设为 `100` 可全量启用
 - `SQLITE_PATH`：SQLite 文件路径，默认 `data/seekops.db`；设置为 `:memory:` 可关闭持久化
 - `SECRETS_MASTER_KEY_FILE`：AES-256-GCM 本地主密钥文件，默认与 SQLite 同目录、文件名为 `seekops.key`；首次启动自动生成
 - `SECRETS_MASTER_KEY`：Base64 或 64 位十六进制编码的 32 字节外部主密钥；设置后优先于本地密钥文件，不能在控制台轮换
@@ -95,7 +98,7 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `GET /admin/stats`：管理统计，需要 `X-Admin-Key` 或管理员 Bearer Token
 - `GET /admin/client-config`：获取当前 OpenAI/Anthropic Base URL 和平台 API Key，需要管理员认证
 - `GET /admin/usage`：查询持久化用量事件，支持 `tenant_id`、`virtual_key_id`、`account_id`、`model`、`limit` 参数
-- `GET /admin/usage/summary`：查询时间范围用量汇总、每日趋势和租户/密钥/模型/账号排行；支持 `start`、`end`（包含结束日期）、`tenant_id`、`virtual_key_id`、`account_id`、`model`
+- `GET /admin/usage/summary`：查询时间范围用量汇总、每日趋势、租户/密钥/模型/账号排行和会话亲和实验分组；支持 `start`、`end`（包含结束日期）、`tenant_id`、`virtual_key_id`、`account_id`、`model`
 - `GET /admin/usage/export`：按同样筛选条件导出 UTF-8 CSV，最多导出 10000 条记录
 - `GET /admin/prices`、`POST /admin/prices`、`DELETE /admin/prices/{id}`：查看、新增和删除模型价格版本；历史请求保存价格版本与费用结果，不会因后续改价而重算
 - `GET /admin/alerts`：查询账号检测、低余额、租户配额和近期错误率告警
@@ -119,6 +122,8 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `/anthropic/v1/messages`：Anthropic Messages 兼容代理，使用 `x-api-key` 传入平台租户 Key
 
 Chat、Responses 和 Anthropic Messages JSON 请求体在 MVP 中限制为 32 MiB；流式 Chat 请求会在转发前确保 `stream_options.include_usage=true`。Anthropic 非流式和 SSE 响应的 `input_tokens`、`output_tokens`、缓存读取/创建 Token 会写入同一用量账本。虚拟 Key、用量事件、统计恢复和余额快照会写入 SQLite。
+
+同一会话可在请求头中发送 `X-Proxy-Session-ID`（兼容 `X-Conversation-ID`），代理会在租户密钥范围内优先选择同一上游账号。Chat/Anthropic 未提供会话头时，会根据稳定的系统消息、工具定义和首个用户消息生成不可逆指纹；不会保存原始请求内容。亲和关系只存在于内存中，账号不健康或发生可重试故障时会切换到健康账号池并把亲和关系迁移到新账号。请求账本的“会话亲和实验”按亲和组、对照组和无会话组比较上游实际返回的 `prompt_cache_hit_tokens`、`prompt_cache_miss_tokens`、平均延迟、成功率和回退次数；同一上游账号不等于必然缓存命中。
 
 控制台创建或更新上游账号时会立即检测一次，后台还会按 `BALANCE_POLL_INTERVAL` 自动检测；账号列表也提供单账号手动检测。未完成检测的账号显示“待检测”，只有余额接口成功返回后才显示“健康”。检测失败、CNY 余额低于阈值、租户每日配额达到默认 80%/100% 或近期错误率超过阈值时，告警中心会生成一条可确认、静默和恢复的持久化告警；故障消失或用量回落后自动记录恢复时间。同一条件不会在每次轮询时重复生成记录。
 
