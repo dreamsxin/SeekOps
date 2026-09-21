@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -79,9 +80,13 @@ func migrateSQLite(db *sql.DB) error {
 			quota_concurrent INTEGER NOT NULL DEFAULT 0,
 			quota_daily_tokens INTEGER NOT NULL DEFAULT 0,
 			quota_daily_cost_cny REAL NOT NULL DEFAULT 0,
+			quota_monthly_cost_cny REAL NOT NULL DEFAULT 0,
+			allowed_models_json TEXT NOT NULL DEFAULT '[]',
 			usage_date TEXT NOT NULL DEFAULT '',
 			daily_tokens INTEGER NOT NULL DEFAULT 0,
-			daily_cost_cny REAL NOT NULL DEFAULT 0
+			daily_cost_cny REAL NOT NULL DEFAULT 0,
+			usage_month TEXT NOT NULL DEFAULT '',
+			monthly_cost_cny REAL NOT NULL DEFAULT 0
 		)`,
 		`CREATE TABLE IF NOT EXISTS usage_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -200,6 +205,34 @@ func migrateSQLite(db *sql.DB) error {
 	}
 	if err := ensureAccountConcurrencyColumn(db); err != nil {
 		return fmt.Errorf("migrate sqlite account concurrency: %w", err)
+	}
+	if err := ensureVirtualKeyPolicyColumns(db); err != nil {
+		return fmt.Errorf("migrate sqlite virtual key policy: %w", err)
+	}
+	return nil
+}
+
+func ensureVirtualKeyPolicyColumns(db *sql.DB) error {
+	columns, err := tableColumns(db, "virtual_keys")
+	if err != nil {
+		return err
+	}
+	additions := []struct {
+		name       string
+		definition string
+	}{
+		{"quota_monthly_cost_cny", "REAL NOT NULL DEFAULT 0"},
+		{"allowed_models_json", "TEXT NOT NULL DEFAULT '[]'"},
+		{"usage_month", "TEXT NOT NULL DEFAULT ''"},
+		{"monthly_cost_cny", "REAL NOT NULL DEFAULT 0"},
+	}
+	for _, column := range additions {
+		if columns[column.name] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE virtual_keys ADD COLUMN ` + column.name + ` ` + column.definition); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -365,8 +398,8 @@ func ensureUsageRoutingColumns(db *sql.DB) error {
 
 func (s *KeyStore) loadSQLite(db *sql.DB) error {
 	rows, err := db.Query(`SELECT id, name, tenant_id, prefix, secret, secret_hash, enabled, created_at,
-		quota_rpm, quota_concurrent, quota_daily_tokens, quota_daily_cost_cny,
-		usage_date, daily_tokens, daily_cost_cny FROM virtual_keys`)
+		quota_rpm, quota_concurrent, quota_daily_tokens, quota_daily_cost_cny, quota_monthly_cost_cny,
+		allowed_models_json, usage_date, daily_tokens, daily_cost_cny, usage_month, monthly_cost_cny FROM virtual_keys`)
 	if err != nil {
 		return fmt.Errorf("load virtual keys from sqlite: %w", err)
 	}
@@ -374,11 +407,15 @@ func (s *KeyStore) loadSQLite(db *sql.DB) error {
 	for rows.Next() {
 		var key virtualKey
 		var enabled int
-		var createdAt string
+		var createdAt, allowedModelsJSON string
 		if err := rows.Scan(&key.ID, &key.Name, &key.TenantID, &key.Prefix, &key.Secret, &key.Hash, &enabled, &createdAt,
 			&key.Quota.RequestsPerMinute, &key.Quota.ConcurrentRequests, &key.Quota.DailyTokens, &key.Quota.DailyCostCNY,
-			&key.usageDate, &key.dailyTokens, &key.dailyCostCNY); err != nil {
+			&key.Quota.MonthlyCostCNY, &allowedModelsJSON, &key.usageDate, &key.dailyTokens, &key.dailyCostCNY,
+			&key.usageMonth, &key.monthlyCostCNY); err != nil {
 			return fmt.Errorf("scan virtual key from sqlite: %w", err)
+		}
+		if err := json.Unmarshal([]byte(allowedModelsJSON), &key.AllowedModels); err != nil {
+			return fmt.Errorf("decode virtual key %s allowed models: %w", key.ID, err)
 		}
 		key.Secret, err = s.secrets.Decrypt("virtual:"+key.ID, key.Secret)
 		if err != nil {
@@ -397,20 +434,29 @@ func (s *KeyStore) persistKeyLocked(db *sql.DB, key *virtualKey) error {
 	if err != nil {
 		return fmt.Errorf("encrypt virtual key secret: %w", err)
 	}
+	allowedModelsJSON, err := json.Marshal(key.AllowedModels)
+	if err != nil {
+		return err
+	}
 	_, err = db.Exec(`INSERT INTO virtual_keys
 		(id, name, tenant_id, prefix, secret, secret_hash, enabled, created_at, quota_rpm, quota_concurrent,
-		 quota_daily_tokens, quota_daily_cost_cny, usage_date, daily_tokens, daily_cost_cny)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 quota_daily_tokens, quota_daily_cost_cny, quota_monthly_cost_cny, allowed_models_json,
+		 usage_date, daily_tokens, daily_cost_cny, usage_month, monthly_cost_cny)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, tenant_id=excluded.tenant_id,
 		prefix=excluded.prefix, secret=excluded.secret, secret_hash=excluded.secret_hash,
 		enabled=excluded.enabled, created_at=excluded.created_at,
 		quota_rpm=excluded.quota_rpm,
 		quota_concurrent=excluded.quota_concurrent, quota_daily_tokens=excluded.quota_daily_tokens,
-		quota_daily_cost_cny=excluded.quota_daily_cost_cny, usage_date=excluded.usage_date,
-		daily_tokens=excluded.daily_tokens, daily_cost_cny=excluded.daily_cost_cny`,
+		quota_daily_cost_cny=excluded.quota_daily_cost_cny,
+		quota_monthly_cost_cny=excluded.quota_monthly_cost_cny,
+		allowed_models_json=excluded.allowed_models_json, usage_date=excluded.usage_date,
+		daily_tokens=excluded.daily_tokens, daily_cost_cny=excluded.daily_cost_cny,
+		usage_month=excluded.usage_month, monthly_cost_cny=excluded.monthly_cost_cny`,
 		key.ID, key.Name, key.TenantID, key.Prefix, storedSecret, key.Hash, boolInt(key.Enabled), key.CreatedAt.UTC().Format(time.RFC3339Nano),
 		key.Quota.RequestsPerMinute, key.Quota.ConcurrentRequests, key.Quota.DailyTokens, key.Quota.DailyCostCNY,
-		key.usageDate, key.dailyTokens, key.dailyCostCNY)
+		key.Quota.MonthlyCostCNY, string(allowedModelsJSON),
+		key.usageDate, key.dailyTokens, key.dailyCostCNY, key.usageMonth, key.monthlyCostCNY)
 	return err
 }
 

@@ -38,21 +38,23 @@ func accountAuditMetadata(account *Account) map[string]any {
 		return map[string]any{}
 	}
 	return map[string]any{
-		"name":     account.Name,
-		"base_url": account.BaseURL,
-		"weight":   account.Weight,
-		"models":   append([]string(nil), account.Models...),
-		"enabled":  !account.Disabled,
+		"name":           account.Name,
+		"base_url":       account.BaseURL,
+		"weight":         account.Weight,
+		"max_concurrent": account.MaxConcurrent,
+		"models":         append([]string(nil), account.Models...),
+		"enabled":        !account.Disabled,
 	}
 }
 
 func virtualKeyAuditMetadata(view VirtualKeyView) map[string]any {
 	return map[string]any{
-		"name":      view.Name,
-		"tenant_id": view.TenantID,
-		"prefix":    view.Prefix,
-		"enabled":   view.Enabled,
-		"quota":     view.Quota,
+		"name":           view.Name,
+		"tenant_id":      view.TenantID,
+		"prefix":         view.Prefix,
+		"enabled":        view.Enabled,
+		"quota":          view.Quota,
+		"allowed_models": view.AllowedModels,
 	}
 }
 

@@ -212,9 +212,24 @@ type RequestStats struct {
 }
 
 type Principal struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	TenantID string `json:"tenant_id"`
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	TenantID      string   `json:"tenant_id"`
+	AllowedModels []string `json:"allowed_models,omitempty"`
+}
+
+// AllowsModel reports whether the tenant may call the requested model. An empty
+// allow-list means every model is permitted.
+func (p *Principal) AllowsModel(model string) bool {
+	if p == nil || len(p.AllowedModels) == 0 || model == "" {
+		return true
+	}
+	for _, allowed := range p.AllowedModels {
+		if allowed == model {
+			return true
+		}
+	}
+	return false
 }
 
 type QuotaPolicy struct {
@@ -222,14 +237,17 @@ type QuotaPolicy struct {
 	ConcurrentRequests int     `json:"concurrent_requests,omitempty"`
 	DailyTokens        int64   `json:"daily_tokens,omitempty"`
 	DailyCostCNY       float64 `json:"daily_cost_cny,omitempty"`
+	MonthlyCostCNY     float64 `json:"monthly_cost_cny,omitempty"`
 }
 
 type QuotaUsage struct {
 	Date               string  `json:"date"`
+	Month              string  `json:"month"`
 	RequestsThisMinute int     `json:"requests_this_minute"`
 	ActiveRequests     int     `json:"active_requests"`
 	DailyTokens        int64   `json:"daily_tokens"`
 	DailyCostCNY       float64 `json:"daily_cost_cny"`
+	MonthlyCostCNY     float64 `json:"monthly_cost_cny"`
 }
 
 type VirtualKeyView struct {
@@ -240,6 +258,7 @@ type VirtualKeyView struct {
 	Secret          string      `json:"secret"`
 	SecretAvailable bool        `json:"secret_available"`
 	Enabled         bool        `json:"enabled"`
+	AllowedModels   []string    `json:"allowed_models"`
 	CreatedAt       time.Time   `json:"created_at"`
 	Quota           QuotaPolicy `json:"quota"`
 	Usage           QuotaUsage  `json:"usage"`
@@ -254,6 +273,8 @@ type virtualKey struct {
 	usageDate      string
 	dailyTokens    int64
 	dailyCostCNY   float64
+	usageMonth     string
+	monthlyCostCNY float64
 }
 
 type KeyStore struct {
@@ -342,20 +363,24 @@ func (s *KeyStore) Authenticate(secret string) (*Principal, bool) {
 func (s *KeyStore) Create(name, tenant string) (VirtualKeyView, string, error) {
 	return s.CreateWithQuota(name, tenant, QuotaPolicy{})
 }
-func (s *KeyStore) CreateWithQuota(name, tenant string, quota QuotaPolicy) (VirtualKeyView, string, error) {
+
+// CreateWithQuota registers a tenant key. allowedModels is optional; an empty
+// list lets the tenant call every model.
+func (s *KeyStore) CreateWithQuota(name, tenant string, quota QuotaPolicy, allowedModels ...string) (VirtualKeyView, string, error) {
 	name = strings.TrimSpace(name)
 	tenant = strings.TrimSpace(tenant)
 	if name == "" || tenant == "" {
 		return VirtualKeyView{}, "", fmt.Errorf("name and tenant_id are required")
 	}
-	if quota.RequestsPerMinute < 0 || quota.ConcurrentRequests < 0 || quota.DailyTokens < 0 || quota.DailyCostCNY < 0 {
-		return VirtualKeyView{}, "", fmt.Errorf("quota values must not be negative")
+	if err := validateQuota(quota); err != nil {
+		return VirtualKeyView{}, "", err
 	}
 	secret := "sk-proxy-" + newID()
 	id := "vk-" + newID()[:16]
 	s.mu.Lock()
 	key := s.add(id, name, tenant, secret)
 	key.Quota = quota
+	key.AllowedModels = normalizeModels(allowedModels)
 	if s.db != nil {
 		if err := s.persistKeyLocked(s.db, key); err != nil {
 			delete(s.byHash, key.Hash)
@@ -433,6 +458,9 @@ func (s *KeyStore) Acquire(secret string, now time.Time) (*Principal, *QuotaReje
 	if key.Quota.DailyCostCNY > 0 && key.dailyCostCNY >= key.Quota.DailyCostCNY {
 		return key.principal(), &QuotaRejection{Reason: "daily_cost_cny", RetryAfter: 60}
 	}
+	if key.Quota.MonthlyCostCNY > 0 && key.monthlyCostCNY >= key.Quota.MonthlyCostCNY {
+		return key.principal(), &QuotaRejection{Reason: "monthly_cost_cny", RetryAfter: 3600}
+	}
 	key.minuteRequests++
 	key.active++
 	return key.principal(), nil
@@ -454,6 +482,7 @@ func (s *KeyStore) RecordUsage(id string, tokens int64, cost float64, now time.T
 	key.resetUsage(now)
 	key.dailyTokens += tokens
 	key.dailyCostCNY += cost
+	key.monthlyCostCNY += cost
 	if s.db != nil {
 		if err := s.persistKeyLocked(s.db, key); err != nil {
 			log.Printf("persist virtual key usage: %v", err)
@@ -461,7 +490,8 @@ func (s *KeyStore) RecordUsage(id string, tokens int64, cost float64, now time.T
 	}
 }
 func (key *virtualKey) principal() *Principal {
-	return &Principal{ID: key.ID, Name: key.Name, TenantID: key.TenantID}
+	return &Principal{ID: key.ID, Name: key.Name, TenantID: key.TenantID,
+		AllowedModels: append([]string(nil), key.AllowedModels...)}
 }
 func (key *virtualKey) resetUsage(now time.Time) {
 	date := now.Format("2006-01-02")
@@ -470,22 +500,40 @@ func (key *virtualKey) resetUsage(now time.Time) {
 		key.dailyTokens = 0
 		key.dailyCostCNY = 0
 	}
+	month := now.Format("2006-01")
+	if key.usageMonth != month {
+		key.usageMonth = month
+		key.monthlyCostCNY = 0
+	}
 }
 func (key *virtualKey) view() VirtualKeyView {
 	view := key.VirtualKeyView
 	view.SecretAvailable = view.Secret != ""
-	view.Usage = QuotaUsage{Date: key.usageDate, RequestsThisMinute: key.minuteRequests, ActiveRequests: key.active, DailyTokens: key.dailyTokens, DailyCostCNY: key.dailyCostCNY}
+	view.AllowedModels = append([]string{}, key.AllowedModels...)
+	view.Usage = QuotaUsage{Date: key.usageDate, Month: key.usageMonth, RequestsThisMinute: key.minuteRequests,
+		ActiveRequests: key.active, DailyTokens: key.dailyTokens, DailyCostCNY: key.dailyCostCNY,
+		MonthlyCostCNY: key.monthlyCostCNY}
 	return view
 }
 
-func (s *KeyStore) Update(id, name, tenant string, quota QuotaPolicy, enabled bool) (VirtualKeyView, error) {
+func validateQuota(quota QuotaPolicy) error {
+	if quota.RequestsPerMinute < 0 || quota.ConcurrentRequests < 0 || quota.DailyTokens < 0 ||
+		quota.DailyCostCNY < 0 || quota.MonthlyCostCNY < 0 {
+		return fmt.Errorf("quota values must not be negative")
+	}
+	return nil
+}
+
+// Update replaces the mutable fields of a tenant key. allowedModels is optional;
+// an empty list clears the restriction.
+func (s *KeyStore) Update(id, name, tenant string, quota QuotaPolicy, enabled bool, allowedModels ...string) (VirtualKeyView, error) {
 	name = strings.TrimSpace(name)
 	tenant = strings.TrimSpace(tenant)
 	if name == "" || tenant == "" {
 		return VirtualKeyView{}, fmt.Errorf("name and tenant_id are required")
 	}
-	if quota.RequestsPerMinute < 0 || quota.ConcurrentRequests < 0 || quota.DailyTokens < 0 || quota.DailyCostCNY < 0 {
-		return VirtualKeyView{}, fmt.Errorf("quota values must not be negative")
+	if err := validateQuota(quota); err != nil {
+		return VirtualKeyView{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -501,6 +549,7 @@ func (s *KeyStore) Update(id, name, tenant string, quota QuotaPolicy, enabled bo
 	key.TenantID = tenant
 	key.Quota = quota
 	key.Enabled = enabled
+	key.AllowedModels = normalizeModels(allowedModels)
 	if s.db != nil {
 		if err := s.persistKeyLocked(s.db, key); err != nil {
 			key.VirtualKeyView = previous
@@ -1143,6 +1192,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sessionKey := scopedSessionKey(principal.ID, prepared.sessionSeed)
+	if !principal.AllowsModel(prepared.model) {
+		writeProxyError(w, r, http.StatusForbidden, "permission_error",
+			fmt.Sprintf("model %q is not allowed for this tenant key", prepared.model),
+			map[string]any{"allowed_models": principal.AllowedModels})
+		return
+	}
 	account, policy, reused, affinityFallback := s.routeAccount(prepared.model, sessionKey)
 	if account == nil {
 		if s.poolSaturated(prepared.model) {
@@ -1735,15 +1790,16 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/admin/virtual-keys" && r.Method == http.MethodPost {
 		var input struct {
-			Name     string      `json:"name"`
-			TenantID string      `json:"tenant_id"`
-			Quota    QuotaPolicy `json:"quota"`
+			Name          string      `json:"name"`
+			TenantID      string      `json:"tenant_id"`
+			Quota         QuotaPolicy `json:"quota"`
+			AllowedModels []string    `json:"allowed_models"`
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&input); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
-		view, secret, err := s.keys.CreateWithQuota(input.Name, input.TenantID, input.Quota)
+		view, secret, err := s.keys.CreateWithQuota(input.Name, input.TenantID, input.Quota, input.AllowedModels...)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
@@ -1761,16 +1817,17 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var input struct {
-			Name     string      `json:"name"`
-			TenantID string      `json:"tenant_id"`
-			Quota    QuotaPolicy `json:"quota"`
-			Enabled  bool        `json:"enabled"`
+			Name          string      `json:"name"`
+			TenantID      string      `json:"tenant_id"`
+			Quota         QuotaPolicy `json:"quota"`
+			AllowedModels []string    `json:"allowed_models"`
+			Enabled       bool        `json:"enabled"`
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&input); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
-		view, err := s.keys.Update(id, input.Name, input.TenantID, input.Quota, input.Enabled)
+		view, err := s.keys.Update(id, input.Name, input.TenantID, input.Quota, input.Enabled, input.AllowedModels...)
 		if err != nil {
 			status := http.StatusBadRequest
 			if strings.Contains(err.Error(), "not found") {

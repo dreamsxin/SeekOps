@@ -445,6 +445,7 @@ func (s *AlertStore) EvaluateAccount(account AccountView, now time.Time) {
 func (s *AlertStore) EvaluateQuota(key VirtualKeyView, now time.Time) {
 	s.evaluateQuotaValue("quota_tokens:"+key.ID, key, "每日 Token", float64(key.Usage.DailyTokens), float64(key.Quota.DailyTokens), now)
 	s.evaluateQuotaValue("quota_cost:"+key.ID, key, "每日费用", key.Usage.DailyCostCNY, key.Quota.DailyCostCNY, now)
+	s.evaluateQuotaValue("quota_monthly_cost:"+key.ID, key, "每月预算", key.Usage.MonthlyCostCNY, key.Quota.MonthlyCostCNY, now)
 }
 
 func (s *AlertStore) evaluateQuotaValue(source string, key VirtualKeyView, label string, used, limit float64, now time.Time) {

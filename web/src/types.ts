@@ -202,14 +202,17 @@ export interface QuotaPolicy {
   concurrent_requests?: number;
   daily_tokens?: number;
   daily_cost_cny?: number;
+  monthly_cost_cny?: number;
 }
 
 export interface QuotaUsage {
   date: string;
+  month: string;
   requests_this_minute: number;
   active_requests: number;
   daily_tokens: number;
   daily_cost_cny: number;
+  monthly_cost_cny: number;
 }
 
 export interface VirtualKey {
@@ -220,6 +223,7 @@ export interface VirtualKey {
   secret: string;
   secret_available: boolean;
   enabled: boolean;
+  allowed_models: string[];
   created_at: string;
   quota: QuotaPolicy;
   usage: QuotaUsage;
@@ -230,6 +234,7 @@ export interface VirtualKeyInput {
   tenant_id: string;
   enabled: boolean;
   quota: QuotaPolicy;
+  allowed_models: string[];
 }
 
 export interface BalanceSnapshot extends BalanceInfo {

@@ -249,6 +249,107 @@ func TestManagedAccountPersistsConcurrencyLimit(t *testing.T) {
 	}
 }
 
+func TestVirtualKeyMonthlyBudgetBlocksRequests(t *testing.T) {
+	store := NewKeyStore("")
+	_, secret, err := store.CreateWithQuota("Budget", "tenant", QuotaPolicy{MonthlyCostCNY: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 21, 10, 0, 0, 0, time.UTC)
+	principal, rejection := store.Acquire(secret, now)
+	if principal == nil || rejection != nil {
+		t.Fatalf("first acquire principal=%+v rejection=%+v", principal, rejection)
+	}
+	store.Release(principal.ID)
+	store.RecordUsage(principal.ID, 100, 1.25, now)
+	if _, rejection = store.Acquire(secret, now); rejection == nil || rejection.Reason != "monthly_cost_cny" {
+		t.Fatalf("budget rejection=%+v", rejection)
+	}
+	view, ok := store.View(principal.ID, now)
+	if !ok || view.Usage.MonthlyCostCNY != 1.25 || view.Usage.Month != "2026-09" {
+		t.Fatalf("usage=%+v", view.Usage)
+	}
+	// The daily counter resets sooner than the month, so the block must persist.
+	nextDay := now.AddDate(0, 0, 1)
+	if _, rejection = store.Acquire(secret, nextDay); rejection == nil || rejection.Reason != "monthly_cost_cny" {
+		t.Fatalf("next day rejection=%+v", rejection)
+	}
+	nextMonth := now.AddDate(0, 1, 0)
+	if principal, rejection = store.Acquire(secret, nextMonth); principal == nil || rejection != nil {
+		t.Fatalf("next month principal=%+v rejection=%+v", principal, rejection)
+	}
+}
+
+func TestProxyRejectsModelOutsideTenantAllowList(t *testing.T) {
+	var upstreamCalls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls++
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"model":"deepseek-flash","usage":{"total_tokens":1}}`)
+	}))
+	defer upstream.Close()
+	keys := NewKeyStore("platform-secret")
+	_, secret, err := keys.CreateWithQuota("Flash only", "team-a", QuotaPolicy{}, "deepseek-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(Config{PlatformAPIKey: "platform-secret", VirtualKeys: keys,
+		Accounts: []*Account{{ID: "a", APIKey: "upstream-secret", BaseURL: upstream.URL}}})
+	call := func(model string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/chat/completions",
+			strings.NewReader(fmt.Sprintf(`{"model":%q,"messages":[]}`, model)))
+		request.Header.Set("Authorization", "Bearer "+secret)
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		s.ServeHTTP(recorder, request)
+		return recorder
+	}
+	if allowed := call("deepseek-flash"); allowed.Code != http.StatusOK {
+		t.Fatalf("allowed model status=%d body=%s", allowed.Code, allowed.Body.String())
+	}
+	denied := call("deepseek-v4-pro")
+	if denied.Code != http.StatusForbidden || !strings.Contains(denied.Body.String(), "deepseek-flash") {
+		t.Fatalf("denied model status=%d body=%s", denied.Code, denied.Body.String())
+	}
+	if upstreamCalls != 1 {
+		t.Fatalf("upstream calls=%d, the denied request must not reach the upstream", upstreamCalls)
+	}
+}
+
+func TestVirtualKeyPolicyPersistsAcrossRestart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "seekops.db")
+	db, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewKeyStoreWithDBAndCipher("platform-secret", db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, _, err := store.CreateWithQuota("Team A", "team-a", QuotaPolicy{MonthlyCostCNY: 50}, "deepseek-flash", "deepseek-v4-pro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.RecordUsage(view.ID, 10, 2.5, time.Now())
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	restored, err := NewKeyStoreWithDBAndCipher("platform-secret", reopened, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, ok := restored.View(view.ID, time.Now())
+	if !ok || stored.Quota.MonthlyCostCNY != 50 || len(stored.AllowedModels) != 2 || stored.Usage.MonthlyCostCNY != 2.5 {
+		t.Fatalf("restored key=%+v", stored)
+	}
+}
+
 func TestProxyCapturesStreamingUsage(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
