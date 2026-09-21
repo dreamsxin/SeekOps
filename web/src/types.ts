@@ -271,6 +271,11 @@ export interface AlertSettings {
   error_rate_min_requests: number;
   error_rate_window_minutes: number;
   silence_minutes: number;
+  webhook_url: string;
+  webhook_format: "feishu" | "wecom" | "generic";
+  webhook_min_severity: "warning" | "critical";
+  webhook_last_delivery_at?: string;
+  webhook_last_error?: string;
 }
 
 export interface AuditLog {

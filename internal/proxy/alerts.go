@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -19,6 +21,14 @@ const (
 	alertStatusAcknowledged = "acknowledged"
 	alertStatusSilenced     = "silenced"
 	alertStatusResolved     = "resolved"
+
+	webhookFormatFeishu  = "feishu"
+	webhookFormatWeCom   = "wecom"
+	webhookFormatGeneric = "generic"
+
+	alertEventRaised    = "raised"
+	alertEventEscalated = "escalated"
+	alertEventResolved  = "resolved"
 )
 
 type AlertSettings struct {
@@ -28,6 +38,12 @@ type AlertSettings struct {
 	ErrorRateMinRequests      int     `json:"error_rate_min_requests"`
 	ErrorRateWindowMinutes    int     `json:"error_rate_window_minutes"`
 	SilenceMinutes            int     `json:"silence_minutes"`
+	WebhookURL                string  `json:"webhook_url"`
+	WebhookFormat             string  `json:"webhook_format"`
+	WebhookMinSeverity        string  `json:"webhook_min_severity"`
+	// The delivery status is owned by the store and ignored on update.
+	WebhookLastDeliveryAt time.Time `json:"webhook_last_delivery_at,omitempty"`
+	WebhookLastError      string    `json:"webhook_last_error,omitempty"`
 }
 
 type Alert struct {
@@ -61,14 +77,28 @@ type AlertStore struct {
 	outcomes      []recentOutcome
 	outcomeStart  int
 	outcomeErrors int
+	notify        func(webhookNotification)
+	deliveredAt   time.Time
+	deliveryError string
+}
+
+// webhookNotification carries an immutable copy of the alert and of the settings
+// captured while the store lock was held, so delivery can run without the lock.
+type webhookNotification struct {
+	Alert    Alert
+	Event    string
+	Settings AlertSettings
 }
 
 func defaultAlertSettings() AlertSettings {
-	return AlertSettings{BalanceThresholdCNY: 10, QuotaWarningPercent: 80, ErrorRateThresholdPercent: 20, ErrorRateMinRequests: 10, ErrorRateWindowMinutes: 15, SilenceMinutes: 60}
+	return AlertSettings{BalanceThresholdCNY: 10, QuotaWarningPercent: 80, ErrorRateThresholdPercent: 20,
+		ErrorRateMinRequests: 10, ErrorRateWindowMinutes: 15, SilenceMinutes: 60,
+		WebhookFormat: webhookFormatFeishu, WebhookMinSeverity: "warning"}
 }
 
 func NewAlertStore(db *sql.DB) (*AlertStore, error) {
 	store := &AlertStore{db: db, settings: defaultAlertSettings(), byID: make(map[string]*Alert), bySource: make(map[string]*Alert)}
+	store.notify = store.deliverAsync
 	if db == nil {
 		return store, nil
 	}
@@ -80,15 +110,23 @@ func NewAlertStore(db *sql.DB) (*AlertStore, error) {
 
 func (s *AlertStore) load() error {
 	row := s.db.QueryRow(`SELECT balance_threshold_cny, quota_warning_percent, error_rate_threshold_percent,
-		error_rate_min_requests, error_rate_window_minutes, silence_minutes FROM alert_settings WHERE id = 1`)
+		error_rate_min_requests, error_rate_window_minutes, silence_minutes,
+		webhook_url, webhook_format, webhook_min_severity FROM alert_settings WHERE id = 1`)
 	if err := row.Scan(&s.settings.BalanceThresholdCNY, &s.settings.QuotaWarningPercent, &s.settings.ErrorRateThresholdPercent,
-		&s.settings.ErrorRateMinRequests, &s.settings.ErrorRateWindowMinutes, &s.settings.SilenceMinutes); err != nil {
+		&s.settings.ErrorRateMinRequests, &s.settings.ErrorRateWindowMinutes, &s.settings.SilenceMinutes,
+		&s.settings.WebhookURL, &s.settings.WebhookFormat, &s.settings.WebhookMinSeverity); err != nil {
 		if err != sql.ErrNoRows {
 			return fmt.Errorf("load alert settings: %w", err)
 		}
 		if err := s.persistSettingsLocked(); err != nil {
 			return fmt.Errorf("create alert settings: %w", err)
 		}
+	}
+	if s.settings.WebhookFormat == "" {
+		s.settings.WebhookFormat = webhookFormatFeishu
+	}
+	if s.settings.WebhookMinSeverity == "" {
+		s.settings.WebhookMinSeverity = "warning"
 	}
 	rows, err := s.db.Query(`SELECT id, source_key, type, scope_type, scope_id, severity, title, message, status,
 		first_seen_at, last_seen_at, acknowledged_at, silenced_until, resolved_at FROM alerts`)
@@ -153,7 +191,14 @@ func alertTime(value time.Time) string {
 func (s *AlertStore) Settings() AlertSettings {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.settings
+	return s.settingsViewLocked()
+}
+
+func (s *AlertStore) settingsViewLocked() AlertSettings {
+	settings := s.settings
+	settings.WebhookLastDeliveryAt = s.deliveredAt
+	settings.WebhookLastError = s.deliveryError
+	return settings
 }
 
 func (s *AlertStore) UpdateSettings(settings AlertSettings, now time.Time) (AlertSettings, error) {
@@ -175,6 +220,11 @@ func (s *AlertStore) UpdateSettings(settings AlertSettings, now time.Time) (Aler
 	if settings.SilenceMinutes < 1 || settings.SilenceMinutes > 10080 {
 		return AlertSettings{}, fmt.Errorf("silence_minutes must be between 1 and 10080")
 	}
+	normalized, err := normalizeWebhookSettings(settings)
+	if err != nil {
+		return AlertSettings{}, err
+	}
+	settings = normalized
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	previous := s.settings
@@ -184,7 +234,37 @@ func (s *AlertStore) UpdateSettings(settings AlertSettings, now time.Time) (Aler
 		return AlertSettings{}, err
 	}
 	s.evaluateErrorRateLocked(now)
-	return s.settings, nil
+	return s.settingsViewLocked(), nil
+}
+
+func normalizeWebhookSettings(settings AlertSettings) (AlertSettings, error) {
+	settings.WebhookURL = strings.TrimSpace(settings.WebhookURL)
+	if len(settings.WebhookURL) > 2000 {
+		return AlertSettings{}, fmt.Errorf("webhook_url must not exceed 2000 characters")
+	}
+	if settings.WebhookURL != "" && !strings.HasPrefix(settings.WebhookURL, "http://") && !strings.HasPrefix(settings.WebhookURL, "https://") {
+		return AlertSettings{}, fmt.Errorf("webhook_url must be an absolute http or https URL")
+	}
+	settings.WebhookFormat = strings.TrimSpace(settings.WebhookFormat)
+	if settings.WebhookFormat == "" {
+		settings.WebhookFormat = webhookFormatFeishu
+	}
+	switch settings.WebhookFormat {
+	case webhookFormatFeishu, webhookFormatWeCom, webhookFormatGeneric:
+	default:
+		return AlertSettings{}, fmt.Errorf("webhook_format must be feishu, wecom or generic")
+	}
+	settings.WebhookMinSeverity = strings.TrimSpace(settings.WebhookMinSeverity)
+	if settings.WebhookMinSeverity == "" {
+		settings.WebhookMinSeverity = "warning"
+	}
+	if settings.WebhookMinSeverity != "warning" && settings.WebhookMinSeverity != "critical" {
+		return AlertSettings{}, fmt.Errorf("webhook_min_severity must be warning or critical")
+	}
+	// The delivery status belongs to the store, never to the caller.
+	settings.WebhookLastDeliveryAt = time.Time{}
+	settings.WebhookLastError = ""
+	return settings, nil
 }
 
 func (s *AlertStore) persistSettingsLocked() error {
@@ -192,14 +272,18 @@ func (s *AlertStore) persistSettingsLocked() error {
 		return nil
 	}
 	_, err := s.db.Exec(`INSERT INTO alert_settings (id, balance_threshold_cny, quota_warning_percent,
-		error_rate_threshold_percent, error_rate_min_requests, error_rate_window_minutes, silence_minutes, updated_at)
-		VALUES (1, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET
+		error_rate_threshold_percent, error_rate_min_requests, error_rate_window_minutes, silence_minutes,
+		webhook_url, webhook_format, webhook_min_severity, updated_at)
+		VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET
 		balance_threshold_cny=excluded.balance_threshold_cny, quota_warning_percent=excluded.quota_warning_percent,
 		error_rate_threshold_percent=excluded.error_rate_threshold_percent, error_rate_min_requests=excluded.error_rate_min_requests,
 		error_rate_window_minutes=excluded.error_rate_window_minutes, silence_minutes=excluded.silence_minutes,
+		webhook_url=excluded.webhook_url, webhook_format=excluded.webhook_format,
+		webhook_min_severity=excluded.webhook_min_severity,
 		updated_at=excluded.updated_at`, s.settings.BalanceThresholdCNY, s.settings.QuotaWarningPercent,
 		s.settings.ErrorRateThresholdPercent, s.settings.ErrorRateMinRequests, s.settings.ErrorRateWindowMinutes,
-		s.settings.SilenceMinutes, time.Now().UTC().Format(time.RFC3339Nano))
+		s.settings.SilenceMinutes, s.settings.WebhookURL, s.settings.WebhookFormat, s.settings.WebhookMinSeverity,
+		time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
 
@@ -250,10 +334,13 @@ func (s *AlertStore) raiseLocked(sourceKey, alertType, scopeType, scopeID, sever
 		s.byID[item.ID] = item
 		s.bySource[sourceKey] = item
 		s.persistAlertBestEffortLocked(item)
+		s.notifyLocked(item, alertEventRaised)
 		return
 	}
 	previousLastSeen := item.LastSeenAt
-	shouldPersist := item.Status == alertStatusResolved || (item.Severity != "critical" && severity == "critical")
+	reopened := item.Status == alertStatusResolved
+	escalated := item.Severity != "critical" && severity == "critical"
+	shouldPersist := reopened || escalated
 	if item.Status == alertStatusResolved {
 		item.Status = alertStatusOpen
 		item.FirstSeenAt = now
@@ -276,6 +363,12 @@ func (s *AlertStore) raiseLocked(sourceKey, alertType, scopeType, scopeID, sever
 	if shouldPersist || now.Sub(previousLastSeen) >= time.Minute {
 		s.persistAlertBestEffortLocked(item)
 	}
+	switch {
+	case reopened:
+		s.notifyLocked(item, alertEventRaised)
+	case escalated:
+		s.notifyLocked(item, alertEventEscalated)
+	}
 }
 
 func (s *AlertStore) Resolve(sourceKey string, now time.Time) {
@@ -293,6 +386,110 @@ func (s *AlertStore) resolveLocked(sourceKey string, now time.Time) {
 	item.ResolvedAt = now.UTC()
 	item.SilencedUntil = time.Time{}
 	s.persistAlertBestEffortLocked(item)
+	s.notifyLocked(item, alertEventResolved)
+}
+
+// notifyLocked hands an alert transition to the webhook sender. It runs with the
+// store lock held, so it only captures state and never performs I/O itself.
+func (s *AlertStore) notifyLocked(item *Alert, event string) {
+	if s.notify == nil || strings.TrimSpace(s.settings.WebhookURL) == "" {
+		return
+	}
+	if s.settings.WebhookMinSeverity == "critical" && item.Severity != "critical" {
+		return
+	}
+	s.notify(webhookNotification{Alert: *item, Event: event, Settings: s.settings})
+}
+
+func (s *AlertStore) deliverAsync(notification webhookNotification) {
+	go func() {
+		err := postAlertWebhook(notification)
+		s.recordDelivery(err, time.Now())
+	}()
+}
+
+func (s *AlertStore) recordDelivery(err error, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deliveredAt = now.UTC()
+	s.deliveryError = ""
+	if err != nil {
+		s.deliveryError = err.Error()
+	}
+}
+
+// alertWebhookText renders the alert summary. Only fields produced by the alert
+// evaluators are included, never request or response content.
+func alertWebhookText(notification webhookNotification) string {
+	item := notification.Alert
+	state := map[string]string{alertEventRaised: "触发", alertEventEscalated: "升级", alertEventResolved: "恢复"}[notification.Event]
+	if state == "" {
+		state = notification.Event
+	}
+	scope := item.ScopeType
+	if item.ScopeID != "" {
+		scope += " " + item.ScopeID
+	}
+	text := fmt.Sprintf("[SeekOps][%s][%s] %s\n%s\n对象：%s\n时间：%s",
+		state, item.Severity, item.Title, item.Message, scope, item.LastSeenAt.Format(time.RFC3339))
+	if len(text) > 1000 {
+		text = text[:1000]
+	}
+	return text
+}
+
+func alertWebhookPayload(notification webhookNotification) any {
+	text := alertWebhookText(notification)
+	switch notification.Settings.WebhookFormat {
+	case webhookFormatWeCom:
+		return map[string]any{"msgtype": "text", "text": map[string]any{"content": text}}
+	case webhookFormatGeneric:
+		return map[string]any{"event": notification.Event, "text": text, "alert": notification.Alert}
+	default:
+		return map[string]any{"msg_type": "text", "content": map[string]any{"text": text}}
+	}
+}
+
+func postAlertWebhook(notification webhookNotification) error {
+	body, err := json.Marshal(alertWebhookPayload(notification))
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, notification.Settings.WebhookURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := (&http.Client{Timeout: 10 * time.Second}).Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("webhook returned HTTP %d", response.StatusCode)
+	}
+	return nil
+}
+
+// SendTestWebhook delivers a synthetic alert so an operator can verify the
+// configuration without waiting for a real incident.
+func (s *AlertStore) SendTestWebhook(now time.Time) error {
+	s.mu.Lock()
+	settings := s.settings
+	s.mu.Unlock()
+	if strings.TrimSpace(settings.WebhookURL) == "" {
+		return fmt.Errorf("webhook_url is not configured")
+	}
+	notification := webhookNotification{Event: alertEventRaised, Settings: settings, Alert: Alert{
+		ID: "alert-test", SourceKey: "webhook_test", Type: "test", ScopeType: "webhook", Severity: "warning",
+		Title: "告警外发连通性测试", Message: "这是一条测试消息，收到即表示 webhook 配置可用。",
+		Status: alertStatusOpen, FirstSeenAt: now.UTC(), LastSeenAt: now.UTC()}}
+	err := postAlertWebhook(notification)
+	s.recordDelivery(err, now)
+	return err
 }
 
 func (s *AlertStore) ResolveScope(scopeType, scopeID string, now time.Time) {
@@ -524,6 +721,23 @@ func (s *Server) refreshAlerts(now time.Time) {
 }
 
 func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/admin/alerts/settings/test" {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		now := time.Now()
+		if err := s.alerts.SendTestWebhook(now); err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"delivered": false, "error": err.Error()})
+			return
+		}
+		if s.audit != nil {
+			s.audit.Record("alert_webhook_tested", "alert_settings", "", "测试告警外发", nil, now)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"delivered": true})
+		return
+	}
 	if r.URL.Path == "/admin/alerts/settings" {
 		switch r.Method {
 		case http.MethodGet:
@@ -548,6 +762,9 @@ func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
 					"error_rate_min_requests":      settings.ErrorRateMinRequests,
 					"error_rate_window_minutes":    settings.ErrorRateWindowMinutes,
 					"silence_minutes":              settings.SilenceMinutes,
+					"webhook_configured":           settings.WebhookURL != "",
+					"webhook_format":               settings.WebhookFormat,
+					"webhook_min_severity":         settings.WebhookMinSeverity,
 				}, time.Now())
 			}
 			writeJSON(w, http.StatusOK, settings)

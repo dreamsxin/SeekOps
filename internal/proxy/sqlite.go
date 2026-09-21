@@ -151,6 +151,9 @@ func migrateSQLite(db *sql.DB) error {
 			error_rate_min_requests INTEGER NOT NULL DEFAULT 10,
 			error_rate_window_minutes INTEGER NOT NULL DEFAULT 15,
 			silence_minutes INTEGER NOT NULL DEFAULT 60,
+			webhook_url TEXT NOT NULL DEFAULT '',
+			webhook_format TEXT NOT NULL DEFAULT 'feishu',
+			webhook_min_severity TEXT NOT NULL DEFAULT 'warning',
 			updated_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS alerts (
@@ -208,6 +211,33 @@ func migrateSQLite(db *sql.DB) error {
 	}
 	if err := ensureVirtualKeyPolicyColumns(db); err != nil {
 		return fmt.Errorf("migrate sqlite virtual key policy: %w", err)
+	}
+	if err := ensureAlertWebhookColumns(db); err != nil {
+		return fmt.Errorf("migrate sqlite alert webhook: %w", err)
+	}
+	return nil
+}
+
+func ensureAlertWebhookColumns(db *sql.DB) error {
+	columns, err := tableColumns(db, "alert_settings")
+	if err != nil {
+		return err
+	}
+	additions := []struct {
+		name       string
+		definition string
+	}{
+		{"webhook_url", "TEXT NOT NULL DEFAULT ''"},
+		{"webhook_format", "TEXT NOT NULL DEFAULT 'feishu'"},
+		{"webhook_min_severity", "TEXT NOT NULL DEFAULT 'warning'"},
+	}
+	for _, column := range additions {
+		if columns[column.name] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE alert_settings ADD COLUMN ` + column.name + ` ` + column.definition); err != nil {
+			return err
+		}
 	}
 	return nil
 }

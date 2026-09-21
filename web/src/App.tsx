@@ -67,6 +67,9 @@ const initialAlertSettings: AlertSettings = {
   error_rate_min_requests: 10,
   error_rate_window_minutes: 15,
   silence_minutes: 60,
+  webhook_url: "",
+  webhook_format: "feishu",
+  webhook_min_severity: "warning",
 };
 
 function BrandMark() {
@@ -281,6 +284,10 @@ export function App() {
             const saved = await api.updateAlertSettings(next);
             setAlertSettings(saved);
             setAlerts(await api.alerts());
+          }} onTestWebhook={async () => {
+            const result = await api.testAlertWebhook();
+            setAlertSettings(await api.alertSettings());
+            return result;
           }} />}
           {view === "access" && <AccessConfig config={clientConfig} />}
           {view === "keys" && <Keys keys={keys} onCreate={() => { setCreatedSecret(""); setCreateOpen(true); }} onEdit={setKeyEditor} />}
@@ -520,9 +527,10 @@ function Metric({ icon: Icon, label, value, detail, tone }: { icon: typeof Activ
   return <div className="metric"><div className={`metric-icon ${tone}`}><Icon size={19} /></div><div><span>{label}</span><strong>{value}</strong><small>{detail}</small></div></div>;
 }
 
-function AlertsPage({ alerts, settings, onAcknowledge, onSilence, onResolve, onSaveSettings }: { alerts: Alert[]; settings: AlertSettings; onAcknowledge: (id: string) => Promise<void>; onSilence: (id: string) => Promise<void>; onResolve: (id: string) => Promise<void>; onSaveSettings: (settings: AlertSettings) => Promise<void> }) {
+function AlertsPage({ alerts, settings, onAcknowledge, onSilence, onResolve, onSaveSettings, onTestWebhook }: { alerts: Alert[]; settings: AlertSettings; onAcknowledge: (id: string) => Promise<void>; onSilence: (id: string) => Promise<void>; onResolve: (id: string) => Promise<void>; onSaveSettings: (settings: AlertSettings) => Promise<void>; onTestWebhook: () => Promise<{ delivered: boolean; error?: string }> }) {
   const [filter, setFilter] = useState<"active" | "all">("active");
   const [draft, setDraft] = useState(settings);
+  const [webhookResult, setWebhookResult] = useState("");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
@@ -557,7 +565,7 @@ function AlertsPage({ alerts, settings, onAcknowledge, onSilence, onResolve, onS
       <div className="table-wrap alert-table"><table><thead><tr><th>级别</th><th>告警</th><th>范围</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody>{visible.map((item) => <tr key={item.id}><td><span className={`severity-pill ${item.severity}`}>{item.severity === "critical" ? "严重" : "警告"}</span></td><td className="alert-copy"><strong>{item.title}</strong><small>{item.message}</small></td><td><span>{alertScopeLabel(item.scope_type)}</span><small className="mono">{item.scope_id}</small></td><td><span className={`alert-state ${item.status}`}>{alertStatusLabel(item.status)}</span>{item.status === "silenced" && <small>至 {formatTime(item.silenced_until)}</small>}{item.status === "resolved" && <small>{formatTime(item.resolved_at)}</small>}</td><td><span>{formatTime(item.first_seen_at)}</span><small>最近 {formatTime(item.last_seen_at)}</small></td><td><div className="alert-actions">{item.status !== "resolved" && <><button className="secondary compact" title="确认告警" disabled={Boolean(busy) || item.status === "acknowledged"} onClick={() => runAction(item.id, "acknowledge")}><CheckCheck size={14} />确认</button><button className="secondary compact" title={`静默 ${settings.silence_minutes} 分钟`} disabled={Boolean(busy) || item.status === "silenced"} onClick={() => runAction(item.id, "silence")}><BellOff size={14} />静默</button><button className="secondary compact" title="标记为已恢复" disabled={Boolean(busy)} onClick={() => runAction(item.id, "resolve")}><Check size={14} />恢复</button></>}</div></td></tr>)}</tbody></table>{!visible.length && <Empty label={filter === "active" ? "当前没有活动告警" : "尚无告警记录"} />}</div>
     </section>
     <section className="panel alert-settings-panel">
-      <PanelHead title="告警阈值" subtitle="账号余额、租户配额与近期错误率" />
+      <PanelHead title="告警阈值" subtitle="账号余额、租户配额、错误率与告警外发" />
       <form className="alert-settings-form" onSubmit={async (event) => { event.preventDefault(); setBusy("settings"); setError(""); setSaved(false); try { await onSaveSettings(draft); setSaved(true); } catch (err) { setError(err instanceof Error ? err.message : "保存告警设置失败"); } finally { setBusy(""); } }}>
         <label>余额下限（元）<input type="number" min="0" step="0.01" value={draft.balance_threshold_cny} onChange={(event) => updateNumber("balance_threshold_cny", event.target.value)} required /></label>
         <label>配额预警（%）<input type="number" min="1" max="99" step="1" value={draft.quota_warning_percent} onChange={(event) => updateNumber("quota_warning_percent", event.target.value)} required /></label>
@@ -565,7 +573,10 @@ function AlertsPage({ alerts, settings, onAcknowledge, onSilence, onResolve, onS
         <label>最少请求数<input type="number" min="1" max="10000" step="1" value={draft.error_rate_min_requests} onChange={(event) => updateNumber("error_rate_min_requests", event.target.value)} required /></label>
         <label>统计窗口（分钟）<input type="number" min="1" max="1440" step="1" value={draft.error_rate_window_minutes} onChange={(event) => updateNumber("error_rate_window_minutes", event.target.value)} required /></label>
         <label>默认静默（分钟）<input type="number" min="1" max="10080" step="1" value={draft.silence_minutes} onChange={(event) => updateNumber("silence_minutes", event.target.value)} required /></label>
-        <div className="alert-settings-footer">{saved && <span className="form-success">告警阈值已保存。</span>}<button className="primary" disabled={busy === "settings"}>{busy === "settings" ? "正在保存" : "保存阈值"}</button></div>
+        <label className="alert-settings-wide">告警外发地址<input type="url" value={draft.webhook_url} onChange={(event) => setDraft((current) => ({ ...current, webhook_url: event.target.value }))} placeholder="留空表示不外发，例如飞书或企业微信机器人地址" /></label>
+        <label>消息格式<select value={draft.webhook_format} onChange={(event) => setDraft((current) => ({ ...current, webhook_format: event.target.value as AlertSettings["webhook_format"] }))}><option value="feishu">飞书</option><option value="wecom">企业微信</option><option value="generic">通用 JSON</option></select></label>
+        <label>外发级别<select value={draft.webhook_min_severity} onChange={(event) => setDraft((current) => ({ ...current, webhook_min_severity: event.target.value as AlertSettings["webhook_min_severity"] }))}><option value="warning">警告及以上</option><option value="critical">仅严重</option></select></label>
+        <div className="alert-settings-footer">{saved && <span className="form-success">告警阈值已保存。</span>}{webhookResult && <span className={webhookResult.startsWith("已") ? "form-success" : "form-error"}>{webhookResult}</span>}{settings.webhook_last_error && <span className="form-error">最近一次外发失败：{settings.webhook_last_error}</span>}<button type="button" className="secondary" disabled={busy === "webhook" || !settings.webhook_url} title={settings.webhook_url ? "向已保存的地址发送一条测试消息" : "请先保存告警外发地址"} onClick={async () => { setBusy("webhook"); setWebhookResult(""); try { const result = await onTestWebhook(); setWebhookResult(result.delivered ? "已发送测试消息" : `测试失败：${result.error ?? "未知错误"}`); } catch (err) { setWebhookResult(err instanceof Error ? err.message : "测试失败"); } finally { setBusy(""); } }}>{busy === "webhook" ? "正在测试" : "测试外发"}</button><button className="primary" disabled={busy === "settings"}>{busy === "settings" ? "正在保存" : "保存阈值"}</button></div>
       </form>
     </section>
   </div>;

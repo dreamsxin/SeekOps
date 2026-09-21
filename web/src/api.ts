@@ -57,6 +57,7 @@ export const api = {
   alerts: () => request<Alert[]>("/admin/alerts"),
   alertSettings: () => request<AlertSettings>("/admin/alerts/settings"),
   updateAlertSettings: (body: AlertSettings) => request<AlertSettings>("/admin/alerts/settings", { method: "PUT", body: JSON.stringify(body) }),
+  testAlertWebhook: () => request<{ delivered: boolean; error?: string }>("/admin/alerts/settings/test", { method: "POST" }),
   acknowledgeAlert: (id: string) => request<Alert>(`/admin/alerts/${encodeURIComponent(id)}/acknowledge`, { method: "POST" }),
   silenceAlert: (id: string, minutes?: number) => request<Alert>(`/admin/alerts/${encodeURIComponent(id)}/silence`, { method: "POST", body: JSON.stringify({ minutes }) }),
   resolveAlert: (id: string) => request<Alert>(`/admin/alerts/${encodeURIComponent(id)}/resolve`, { method: "POST" }),

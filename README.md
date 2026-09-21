@@ -103,7 +103,8 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `GET /admin/usage/export`：按同样筛选条件导出 UTF-8 CSV，最多导出 10000 条记录
 - `GET /admin/prices`、`POST /admin/prices`、`DELETE /admin/prices/{id}`：查看、新增和删除模型价格版本；历史请求保存价格版本与费用结果，不会因后续改价而重算
 - `GET /admin/alerts`：查询账号检测、低余额、租户配额和近期错误率告警
-- `GET /admin/alerts/settings`、`PUT /admin/alerts/settings`：查看或调整余额、配额、错误率与默认静默阈值
+- `GET /admin/alerts/settings`、`PUT /admin/alerts/settings`：查看或调整余额、配额、错误率、默认静默阈值与告警外发配置
+- `POST /admin/alerts/settings/test`：向已保存的告警外发地址发送一条测试消息，返回投递结果
 - `POST /admin/alerts/{id}/acknowledge`、`POST /admin/alerts/{id}/silence`、`POST /admin/alerts/{id}/resolve`：确认、定时静默或手动恢复告警
 - `GET /admin/accounts`：列出环境变量账号和 SQLite 托管账号
 - `POST /admin/accounts`：创建 SQLite 托管的上游账号
@@ -129,6 +130,8 @@ Chat、Responses 和 Anthropic Messages JSON 请求体在 MVP 中限制为 32 Mi
 同一会话可在请求头中发送 `X-Proxy-Session-ID`（兼容 `X-Conversation-ID`），代理会在租户密钥范围内优先选择同一上游账号。Chat/Anthropic 未提供会话头时，会根据稳定的系统消息、工具定义和首个用户消息生成不可逆指纹；不会保存原始请求内容。亲和关系只存在于内存中，账号不健康或发生可重试故障时会切换到健康账号池并把亲和关系迁移到新账号。请求账本的“会话亲和实验”按亲和组、对照组和无会话组比较上游实际返回的 `prompt_cache_hit_tokens`、`prompt_cache_miss_tokens`、平均延迟、成功率和回退次数；同一上游账号不等于必然缓存命中。
 
 控制台创建或更新上游账号时会立即检测一次，后台还会按 `BALANCE_POLL_INTERVAL` 自动检测；账号列表也提供单账号手动检测。未完成检测的账号显示“待检测”，只有余额接口成功返回后才显示“健康”。检测失败、CNY 余额低于阈值、租户每日配额达到默认 80%/100% 或近期错误率超过阈值时，告警中心会生成一条可确认、静默和恢复的持久化告警；故障消失或用量回落后自动记录恢复时间。同一条件不会在每次轮询时重复生成记录。
+
+配置 `webhook_url` 后，告警在首次触发、升级为严重和自动恢复这三个时刻会外发到飞书、企业微信或通用 JSON 地址；重复评估同一条件不会重复发送，手动确认/静默/恢复也不发送。外发级别可设为“仅严重”。消息只包含告警标题、描述、级别、对象和时间，不含任何请求或响应内容。投递是异步的，不阻塞告警评估；最近一次投递时间与失败原因会显示在告警设置里，也可以用“测试外发”按钮直接验证配置。
 
 控制台账号会立即加入代理池并写入 SQLite；环境变量账号继续作为只读基线。请求账本支持最近 7 天默认汇总、自定义日期、租户/模型筛选、每日趋势、用量排行和 CSV 导出；每条记录会绑定当时命中的价格版本 ID 和计费档位（`pricing_tier` 为 `peak` 或 `off_peak`），便于与 DeepSeek 实际账单对账。上游 API Key 和可恢复租户 Key 使用 AES-256-GCM 加密后写入 SQLite，认证索引仍使用摘要。历史版本中的明文凭据会在首次启用主密钥时自动迁移；只保存哈希的旧租户 Key 仍不可恢复，可通过轮换生成可查看的新密钥。
 

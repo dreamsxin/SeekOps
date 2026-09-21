@@ -11,6 +11,138 @@ import (
 	"time"
 )
 
+func TestAlertWebhookNotifiesOnTransitions(t *testing.T) {
+	store, err := NewAlertStore(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []string
+	store.notify = func(notification webhookNotification) {
+		events = append(events, notification.Event+":"+notification.Alert.Severity)
+	}
+	now := time.Date(2026, 9, 21, 10, 0, 0, 0, time.UTC)
+	store.Raise("account_check:a", "account_check", "account", "a", "warning", "检测失败", "timeout", now)
+	if len(events) != 0 {
+		t.Fatalf("no webhook configured, events=%v", events)
+	}
+	settings := store.Settings()
+	settings.WebhookURL = "https://example.invalid/hook"
+	if _, err := store.UpdateSettings(settings, now); err != nil {
+		t.Fatal(err)
+	}
+
+	store.Raise("account_check:b", "account_check", "account", "b", "warning", "检测失败", "timeout", now)
+	store.Raise("account_check:b", "account_check", "account", "b", "warning", "检测失败", "still failing", now.Add(time.Minute))
+	store.Raise("account_check:b", "account_check", "account", "b", "critical", "检测失败", "invalid key", now.Add(2*time.Minute))
+	store.Resolve("account_check:b", now.Add(3*time.Minute))
+	store.Raise("account_check:b", "account_check", "account", "b", "warning", "检测失败", "failing again", now.Add(4*time.Minute))
+	want := []string{"raised:warning", "escalated:critical", "resolved:critical", "raised:warning"}
+	if strings.Join(events, ",") != strings.Join(want, ",") {
+		t.Fatalf("events=%v want=%v", events, want)
+	}
+
+	events = nil
+	settings = store.Settings()
+	settings.WebhookMinSeverity = "critical"
+	if _, err := store.UpdateSettings(settings, now); err != nil {
+		t.Fatal(err)
+	}
+	store.Raise("account_check:c", "account_check", "account", "c", "warning", "检测失败", "timeout", now)
+	if len(events) != 0 {
+		t.Fatalf("warning must be filtered by webhook_min_severity, events=%v", events)
+	}
+	store.Raise("account_check:c", "account_check", "account", "c", "critical", "检测失败", "invalid key", now.Add(time.Minute))
+	if len(events) != 1 || events[0] != "escalated:critical" {
+		t.Fatalf("events=%v", events)
+	}
+}
+
+func TestAlertWebhookPayloadFormats(t *testing.T) {
+	var contentType string
+	var payloads []map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contentType = r.Header.Get("Content-Type")
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode webhook payload: %v", err)
+		}
+		payloads = append(payloads, payload)
+	}))
+	defer upstream.Close()
+	alert := Alert{ID: "alert-1", Severity: "critical", Title: "余额不足", Message: "CNY 余额 1.00",
+		ScopeType: "account", ScopeID: "acct-a", LastSeenAt: time.Date(2026, 9, 21, 10, 0, 0, 0, time.UTC)}
+	for _, format := range []string{webhookFormatFeishu, webhookFormatWeCom, webhookFormatGeneric} {
+		notification := webhookNotification{Alert: alert, Event: alertEventRaised,
+			Settings: AlertSettings{WebhookURL: upstream.URL, WebhookFormat: format}}
+		if err := postAlertWebhook(notification); err != nil {
+			t.Fatalf("%s delivery: %v", format, err)
+		}
+	}
+	if contentType != "application/json" {
+		t.Fatalf("content type=%q", contentType)
+	}
+	if len(payloads) != 3 {
+		t.Fatalf("payloads=%+v", payloads)
+	}
+	feishu, _ := payloads[0]["content"].(map[string]any)
+	if payloads[0]["msg_type"] != "text" || !strings.Contains(feishu["text"].(string), "余额不足") {
+		t.Fatalf("feishu payload=%+v", payloads[0])
+	}
+	wecom, _ := payloads[1]["text"].(map[string]any)
+	if payloads[1]["msgtype"] != "text" || !strings.Contains(wecom["content"].(string), "acct-a") {
+		t.Fatalf("wecom payload=%+v", payloads[1])
+	}
+	generic, _ := payloads[2]["alert"].(map[string]any)
+	if payloads[2]["event"] != alertEventRaised || generic["id"] != "alert-1" {
+		t.Fatalf("generic payload=%+v", payloads[2])
+	}
+}
+
+func TestAlertWebhookTestEndpointReportsDelivery(t *testing.T) {
+	var received int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		received++
+		if received > 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer upstream.Close()
+	server := NewServer(Config{PlatformAPIKey: "client-key", AdminAPIKey: "admin-key"})
+	settings := server.alerts.Settings()
+	settings.WebhookURL = upstream.URL
+	settings.WebhookFormat = webhookFormatWeCom
+	if _, err := server.alerts.UpdateSettings(settings, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	call := func() map[string]any {
+		request := httptest.NewRequest(http.MethodPost, "/admin/alerts/settings/test", nil)
+		request.Header.Set("X-Admin-Key", "admin-key")
+		recorder := httptest.NewRecorder()
+		server.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+	if payload := call(); payload["delivered"] != true {
+		t.Fatalf("first delivery=%+v", payload)
+	}
+	if got := server.alerts.Settings(); got.WebhookLastError != "" || got.WebhookLastDeliveryAt.IsZero() {
+		t.Fatalf("settings after success=%+v", got)
+	}
+	failed := call()
+	if failed["delivered"] != false || !strings.Contains(failed["error"].(string), "500") {
+		t.Fatalf("second delivery=%+v", failed)
+	}
+	if got := server.alerts.Settings(); !strings.Contains(got.WebhookLastError, "500") {
+		t.Fatalf("settings after failure=%+v", got)
+	}
+}
+
 func TestAlertLifecycleAndPersistence(t *testing.T) {
 	db, err := OpenSQLite(":memory:")
 	if err != nil {
