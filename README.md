@@ -114,8 +114,8 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `DELETE /admin/accounts/{id}`：删除托管账号；环境变量账号为只读
 - `GET /admin/balance-history`：查询余额快照，支持 `account_id` 和 `limit` 参数
 - `GET /admin/virtual-keys`：列出租户虚拟 Key、可恢复密钥、配额和当前用量
-- `POST /admin/virtual-keys`：创建虚拟 Key，JSON 可包含 `quota.requests_per_minute`、`quota.concurrent_requests`、`quota.daily_tokens`、`quota.daily_cost_cny`、`quota.monthly_cost_cny` 和 `allowed_models`
-- `PUT /admin/virtual-keys/{id}`：更新名称、租户、启用状态、五类配额和可用模型白名单
+- `POST /admin/virtual-keys`：创建虚拟 Key，JSON 可包含 `quota.requests_per_minute`、`quota.tokens_per_minute`、`quota.concurrent_requests`、`quota.daily_tokens`、`quota.daily_cost_cny`、`quota.monthly_cost_cny` 和 `allowed_models`
+- `PUT /admin/virtual-keys/{id}`：更新名称、租户、启用状态、六类配额和可用模型白名单
 - `POST /admin/virtual-keys/{id}/rotate`：轮换租户密钥，旧密钥立即失效
 - `POST /admin/virtual-keys/{id}/revoke`：撤销虚拟 Key
 - `/chat/completions`、`/v1/chat/completions`：Chat Completions 代理
@@ -139,7 +139,7 @@ Chat、Responses 和 Anthropic Messages JSON 请求体在 MVP 中限制为 32 Mi
 
 租户隔离：转发 Chat Completions 时代理会写入 `user_id`（Anthropic 接口写入 `metadata.user_id`），取值为 `t-<租户>`，客户端自带的值会作为 `-u-<原值>` 后缀保留。DeepSeek 用它做 KVCache 隔离、内容安全隔离和按 `user_id` 的并发隔离，因此不同租户不会共享同一份上下文缓存命名空间。
 
-租户治理：除每分钟请求、并发、每日 Token 和每日费用外，还可以给密钥设置 `quota.monthly_cost_cny` 月度预算。月度用量按北京时间的自然月累计（见 `usage.month`），与 DeepSeek 的账单月一致，达到预算后请求被直接拒绝（`429`，`Retry-After: 3600`）；日配额跨天重置不会解除月度阻断，跨月自动清零。`allowed_models` 是租户可用模型白名单，留空表示不限制；请求的模型不在白名单内时返回 `403` 并附上允许的模型列表，请求不会打到上游。月度预算达到告警阈值时，告警中心会生成“每月预算”告警。
+租户治理：除每分钟请求、并发、每日 Token 和每日费用外，还可以给密钥设置 `quota.tokens_per_minute` 每分钟 Token 上限和 `quota.monthly_cost_cny` 月度预算。TPM 用于挡住长上下文租户——单个请求就能吃掉上百万 Token，此时 RPM 限制形同虚设；它按固定分钟窗口累计，且只能在请求结束拿到实际用量后才生效，所以是滞后限流：超限的那个请求会放过，之后的请求在本分钟内被拒（`429`，`Retry-After` 为距下一分钟的秒数）。月度用量按北京时间的自然月累计（见 `usage.month`），与 DeepSeek 的账单月一致，达到预算后请求被直接拒绝（`429`，`Retry-After: 3600`）；日配额跨天重置不会解除月度阻断，跨月自动清零。`allowed_models` 是租户可用模型白名单，留空表示不限制；请求的模型不在白名单内时返回 `403` 并附上允许的模型列表，请求不会打到上游。月度预算达到告警阈值时，告警中心会生成“每月预算”告警。
 
 Beta 能力（FIM 补全、对话前缀续写）走独立的 Beta Base URL，控制台“客户端接入”面板可直接复制。FIM 请求体没有 `user_id` 字段，因此不会注入租户标识，但模型白名单、配额和计费与其他端点一致。Files API（`/files`）暂未代理：文件上传后只存在于上传时使用的那个上游账号上，多账号池下 `file_id` 会随机失效，需要先设计文件到账号的绑定关系。
 

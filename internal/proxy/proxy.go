@@ -235,6 +235,7 @@ func (p *Principal) AllowsModel(model string) bool {
 
 type QuotaPolicy struct {
 	RequestsPerMinute  int     `json:"requests_per_minute,omitempty"`
+	TokensPerMinute    int64   `json:"tokens_per_minute,omitempty"`
 	ConcurrentRequests int     `json:"concurrent_requests,omitempty"`
 	DailyTokens        int64   `json:"daily_tokens,omitempty"`
 	DailyCostCNY       float64 `json:"daily_cost_cny,omitempty"`
@@ -245,6 +246,7 @@ type QuotaUsage struct {
 	Date               string  `json:"date"`
 	Month              string  `json:"month"`
 	RequestsThisMinute int     `json:"requests_this_minute"`
+	TokensThisMinute   int64   `json:"tokens_this_minute"`
 	ActiveRequests     int     `json:"active_requests"`
 	DailyTokens        int64   `json:"daily_tokens"`
 	DailyCostCNY       float64 `json:"daily_cost_cny"`
@@ -270,6 +272,7 @@ type virtualKey struct {
 	Hash           string
 	minute         int64
 	minuteRequests int
+	minuteTokens   int64
 	active         int
 	usageDate      string
 	dailyTokens    int64
@@ -399,12 +402,7 @@ func (s *KeyStore) List() []VirtualKeyView {
 	now := time.Now()
 	result := make([]VirtualKeyView, 0, len(s.byID))
 	for _, key := range s.byID {
-		key.resetUsage(now)
-		minute := now.Unix() / 60
-		if key.minute != minute {
-			key.minute = minute
-			key.minuteRequests = 0
-		}
+		key.rollUsageWindows(now)
 		result = append(result, key.view())
 	}
 	for i := 0; i < len(result); i++ {
@@ -424,7 +422,7 @@ func (s *KeyStore) View(id string, now time.Time) (VirtualKeyView, bool) {
 	if !ok {
 		return VirtualKeyView{}, false
 	}
-	key.resetUsage(now)
+	key.rollUsageWindows(now)
 	return key.view(), true
 }
 
@@ -441,14 +439,12 @@ func (s *KeyStore) Acquire(secret string, now time.Time) (*Principal, *QuotaReje
 	if !ok || !key.Enabled {
 		return nil, nil
 	}
-	key.resetUsage(now)
-	minute := now.Unix() / 60
-	if key.minute != minute {
-		key.minute = minute
-		key.minuteRequests = 0
-	}
+	key.rollUsageWindows(now)
 	if key.Quota.RequestsPerMinute > 0 && key.minuteRequests >= key.Quota.RequestsPerMinute {
 		return key.principal(), &QuotaRejection{Reason: "requests_per_minute", RetryAfter: int(60 - now.Unix()%60)}
+	}
+	if key.Quota.TokensPerMinute > 0 && key.minuteTokens >= key.Quota.TokensPerMinute {
+		return key.principal(), &QuotaRejection{Reason: "tokens_per_minute", RetryAfter: int(60 - now.Unix()%60)}
 	}
 	if key.Quota.ConcurrentRequests > 0 && key.active >= key.Quota.ConcurrentRequests {
 		return key.principal(), &QuotaRejection{Reason: "concurrent_requests", RetryAfter: 1}
@@ -480,7 +476,8 @@ func (s *KeyStore) RecordUsage(id string, tokens int64, cost float64, now time.T
 	if !ok {
 		return
 	}
-	key.resetUsage(now)
+	key.rollUsageWindows(now)
+	key.minuteTokens += tokens
 	key.dailyTokens += tokens
 	key.dailyCostCNY += cost
 	key.monthlyCostCNY += cost
@@ -494,7 +491,14 @@ func (key *virtualKey) principal() *Principal {
 	return &Principal{ID: key.ID, Name: key.Name, TenantID: key.TenantID,
 		AllowedModels: append([]string(nil), key.AllowedModels...)}
 }
-func (key *virtualKey) resetUsage(now time.Time) {
+// rollUsageWindows advances the per-minute, daily and monthly counters before any
+// quota decision or usage update.
+func (key *virtualKey) rollUsageWindows(now time.Time) {
+	if minute := now.Unix() / 60; key.minute != minute {
+		key.minute = minute
+		key.minuteRequests = 0
+		key.minuteTokens = 0
+	}
 	date := now.Format("2006-01-02")
 	if key.usageDate != date {
 		key.usageDate = date
@@ -514,14 +518,14 @@ func (key *virtualKey) view() VirtualKeyView {
 	view.SecretAvailable = view.Secret != ""
 	view.AllowedModels = append([]string{}, key.AllowedModels...)
 	view.Usage = QuotaUsage{Date: key.usageDate, Month: key.usageMonth, RequestsThisMinute: key.minuteRequests,
-		ActiveRequests: key.active, DailyTokens: key.dailyTokens, DailyCostCNY: key.dailyCostCNY,
-		MonthlyCostCNY: key.monthlyCostCNY}
+		TokensThisMinute: key.minuteTokens, ActiveRequests: key.active, DailyTokens: key.dailyTokens,
+		DailyCostCNY: key.dailyCostCNY, MonthlyCostCNY: key.monthlyCostCNY}
 	return view
 }
 
 func validateQuota(quota QuotaPolicy) error {
-	if quota.RequestsPerMinute < 0 || quota.ConcurrentRequests < 0 || quota.DailyTokens < 0 ||
-		quota.DailyCostCNY < 0 || quota.MonthlyCostCNY < 0 {
+	if quota.RequestsPerMinute < 0 || quota.TokensPerMinute < 0 || quota.ConcurrentRequests < 0 ||
+		quota.DailyTokens < 0 || quota.DailyCostCNY < 0 || quota.MonthlyCostCNY < 0 {
 		return fmt.Errorf("quota values must not be negative")
 	}
 	return nil

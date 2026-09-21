@@ -471,6 +471,36 @@ func TestVirtualKeyMonthlyBudgetFollowsBeijingMonth(t *testing.T) {
 	}
 }
 
+func TestVirtualKeyTokensPerMinuteThrottles(t *testing.T) {
+	store := NewKeyStore("")
+	_, secret, err := store.CreateWithQuota("TPM", "tenant", QuotaPolicy{TokensPerMinute: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 21, 10, 0, 30, 0, time.UTC)
+	principal, rejection := store.Acquire(secret, now)
+	if principal == nil || rejection != nil {
+		t.Fatalf("first acquire principal=%+v rejection=%+v", principal, rejection)
+	}
+	store.Release(principal.ID)
+	store.RecordUsage(principal.ID, 150, 0.1, now)
+	_, rejection = store.Acquire(secret, now)
+	if rejection == nil || rejection.Reason != "tokens_per_minute" || rejection.RetryAfter != 30 {
+		t.Fatalf("throttle rejection=%+v", rejection)
+	}
+	view, ok := store.View(principal.ID, now)
+	if !ok || view.Usage.TokensThisMinute != 150 || view.Usage.DailyTokens != 150 {
+		t.Fatalf("usage=%+v", view.Usage)
+	}
+	next := now.Add(time.Minute)
+	if principal, rejection = store.Acquire(secret, next); principal == nil || rejection != nil {
+		t.Fatalf("next minute principal=%+v rejection=%+v", principal, rejection)
+	}
+	if view, ok = store.View(principal.ID, next); !ok || view.Usage.TokensThisMinute != 0 || view.Usage.DailyTokens != 150 {
+		t.Fatalf("next minute usage=%+v", view.Usage)
+	}
+}
+
 func TestProxyCapturesStreamingUsage(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)

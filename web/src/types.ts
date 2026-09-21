@@ -200,6 +200,7 @@ export interface ClientConfig {
 
 export interface QuotaPolicy {
   requests_per_minute?: number;
+  tokens_per_minute?: number;
   concurrent_requests?: number;
   daily_tokens?: number;
   daily_cost_cny?: number;
@@ -210,6 +211,7 @@ export interface QuotaUsage {
   date: string;
   month: string;
   requests_this_minute: number;
+  tokens_this_minute: number;
   active_requests: number;
   daily_tokens: number;
   daily_cost_cny: number;
