@@ -350,6 +350,127 @@ func TestVirtualKeyPolicyPersistsAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestProxyForwardsBetaCompletions(t *testing.T) {
+	var path string
+	var auth string
+	var body []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path, auth = r.URL.Path, r.Header.Get("Authorization")
+		body, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"model":"deepseek-flash","choices":[{"text":"return a"}],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}`)
+	}))
+	defer upstream.Close()
+	s := NewServer(Config{PlatformAPIKey: "client-secret",
+		Accounts: []*Account{{ID: "a", APIKey: "upstream-secret", BaseURL: upstream.URL}}})
+	request := httptest.NewRequest(http.MethodPost, "/beta/completions",
+		strings.NewReader(`{"model":"deepseek-flash","prompt":"def fib(a):","suffix":"    return fib(a-1)","max_tokens":128}`))
+	request.Header.Set("Authorization", "Bearer client-secret")
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	s.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if path != "/beta/completions" || auth != "Bearer upstream-secret" {
+		t.Fatalf("upstream path=%q auth=%q", path, auth)
+	}
+	// FIM has no documented user_id field, so the tenant scope must not be injected.
+	if strings.Contains(string(body), "user_id") {
+		t.Fatalf("unexpected user_id in FIM body: %s", body)
+	}
+	stats := s.Recorder().Snapshot()
+	if stats.TotalTokens != 10 || len(stats.LastRequests) != 1 || stats.LastRequests[0].Model != "deepseek-flash" {
+		t.Fatalf("stats=%+v", stats)
+	}
+}
+
+func TestProxyForwardsAnthropicCountTokens(t *testing.T) {
+	var path, apiKey, authorization string
+	var body []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path, apiKey, authorization = r.URL.Path, r.Header.Get("X-Api-Key"), r.Header.Get("Authorization")
+		body, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"input_tokens":9}`)
+	}))
+	defer upstream.Close()
+	s := NewServer(Config{PlatformAPIKey: "client-secret",
+		Accounts: []*Account{{ID: "a", APIKey: "upstream-secret", BaseURL: upstream.URL}}})
+	request := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages/count_tokens",
+		strings.NewReader(`{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("X-Api-Key", "client-secret")
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	s.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if path != "/anthropic/v1/messages/count_tokens" || apiKey != "upstream-secret" || authorization != "" {
+		t.Fatalf("upstream path=%q x-api-key=%q authorization=%q", path, apiKey, authorization)
+	}
+	if strings.Contains(string(body), "metadata") {
+		t.Fatalf("count_tokens must not receive metadata: %s", body)
+	}
+}
+
+func TestMetricsExposeLabelledSeriesAndHistograms(t *testing.T) {
+	s := NewServer(Config{PlatformAPIKey: "client-secret",
+		Accounts: []*Account{{ID: "acct-a", APIKey: "upstream-secret", BaseURL: "http://example.com", MaxConcurrent: 7}}})
+	s.Recorder().Record(RequestStats{RequestID: "r1", TenantID: "team-a", AccountID: "acct-a", Model: `weird"model`,
+		Status: 200, DurationMS: 1500, FirstByteMS: 200, Usage: Usage{TotalTokens: 12, UsagePresent: true}, EstimatedCostCNY: 0.5})
+	s.Recorder().Record(RequestStats{RequestID: "r2", TenantID: "team-a", AccountID: "acct-a", Model: "deepseek-flash",
+		Status: 503, DurationMS: 300})
+	recorder := httptest.NewRecorder()
+	s.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := recorder.Body.String()
+	expected := []string{
+		`deepseek_proxy_requests_by_label_total{tenant="team-a",model="weird\"model",account="acct-a",outcome="success"} 1`,
+		`deepseek_proxy_requests_by_label_total{tenant="team-a",model="deepseek-flash",account="acct-a",outcome="error"} 1`,
+		`deepseek_proxy_tokens_by_label_total{tenant="team-a",model="weird\"model",account="acct-a",outcome="success"} 12`,
+		`deepseek_proxy_request_duration_seconds_bucket{le="0.5"} 1`,
+		`deepseek_proxy_request_duration_seconds_bucket{le="2"} 2`,
+		`deepseek_proxy_request_duration_seconds_count 2`,
+		`deepseek_proxy_first_byte_seconds_count 1`,
+		`deepseek_proxy_account_active_requests{account="acct-a"} 0`,
+		`deepseek_proxy_account_max_concurrent{account="acct-a"} 7`,
+		`deepseek_proxy_account_available{account="acct-a"} 1`,
+	}
+	for _, want := range expected {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics missing %q in:\n%s", want, body)
+		}
+	}
+}
+
+func TestVirtualKeyMonthlyBudgetFollowsBeijingMonth(t *testing.T) {
+	store := NewKeyStore("")
+	_, secret, err := store.CreateWithQuota("Budget", "tenant", QuotaPolicy{MonthlyCostCNY: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	september := time.Date(2026, 9, 30, 10, 0, 0, 0, time.UTC) // 18:00 Beijing, still September
+	principal, rejection := store.Acquire(secret, september)
+	if principal == nil || rejection != nil {
+		t.Fatalf("september principal=%+v rejection=%+v", principal, rejection)
+	}
+	store.Release(principal.ID)
+	store.RecordUsage(principal.ID, 10, 2, september)
+	if _, rejection = store.Acquire(secret, september); rejection == nil {
+		t.Fatal("september budget should be exhausted")
+	}
+	// 16:30 UTC on the last day of September is already October in Beijing, which is
+	// where the DeepSeek billing month rolls over.
+	october := time.Date(2026, 9, 30, 16, 30, 0, 0, time.UTC)
+	if principal, rejection = store.Acquire(secret, october); principal == nil || rejection != nil {
+		t.Fatalf("october principal=%+v rejection=%+v", principal, rejection)
+	}
+	view, ok := store.View(principal.ID, october)
+	if !ok || view.Usage.Month != "2026-10" || view.Usage.MonthlyCostCNY != 0 {
+		t.Fatalf("usage=%+v", view.Usage)
+	}
+}
+
 func TestProxyCapturesStreamingUsage(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)

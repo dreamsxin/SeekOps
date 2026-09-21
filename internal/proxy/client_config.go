@@ -8,6 +8,7 @@ import (
 type ClientConfigView struct {
 	BaseURL          string `json:"base_url"`
 	AnthropicBaseURL string `json:"anthropic_base_url"`
+	BetaBaseURL      string `json:"beta_base_url"`
 	APIKey           string `json:"api_key"`
 	APIKeyPrefix     string `json:"api_key_prefix"`
 }
@@ -21,16 +22,19 @@ func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {
 	apiKey := s.config.PlatformAPIKey
 	writeJSON(w, http.StatusOK, ClientConfigView{
 		BaseURL:          s.clientBaseURL(r),
-		AnthropicBaseURL: s.clientAnthropicBaseURL(r),
+		AnthropicBaseURL: s.clientSiblingBaseURL(r, "/anthropic"),
+		BetaBaseURL:      s.clientSiblingBaseURL(r, "/beta"),
 		APIKey:           apiKey,
 		APIKeyPrefix:     secretPrefix(apiKey),
 	})
 }
 
-func (s *Server) clientAnthropicBaseURL(r *http.Request) string {
+// clientSiblingBaseURL replaces the /v1 suffix of the OpenAI base URL with another
+// surface, for example /anthropic or the /beta base URL the FIM API requires.
+func (s *Server) clientSiblingBaseURL(r *http.Request, suffix string) string {
 	baseURL := strings.TrimRight(s.clientBaseURL(r), "/")
 	baseURL = strings.TrimSuffix(baseURL, "/v1")
-	return baseURL + "/anthropic"
+	return baseURL + suffix
 }
 
 func (s *Server) clientBaseURL(r *http.Request) string {

@@ -95,7 +95,7 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `GET /admin/audit-logs`：查询持久化管理操作，支持 `action`、`resource_type`、`resource_id` 和 `limit` 参数；记录不包含明文密钥
 - `GET /admin/backups/check`：检查 SQLite 结构、主密钥文件及已存凭据能否使用当前密钥解密
 - `GET /admin/backups/download`：下载一致性 SQLite、备份清单和本地主密钥组成的 ZIP；外部主密钥模式仅写入恢复要求
-- `GET /metrics`：Prometheus 文本指标
+- `GET /metrics`：Prometheus 文本指标。除全局累计值外，还导出按 `tenant`、`model`、`account`、`outcome` 打标的请求数、Token 和费用，请求总耗时与首字节耗时直方图，以及每个账号的活跃并发、并发上限和可用状态。`model` 来自客户端请求体，因此标签组合上限为 2000 组，超出部分只计入全局累计值并计数到 `deepseek_proxy_metric_series_dropped_total`
 - `GET /admin/stats`：管理统计，需要 `X-Admin-Key` 或管理员 Bearer Token
 - `GET /admin/client-config`：获取当前 OpenAI/Anthropic Base URL 和平台 API Key，需要管理员认证
 - `GET /admin/usage`：查询持久化用量事件，支持 `tenant_id`、`virtual_key_id`、`account_id`、`model`、`limit` 参数
@@ -121,6 +121,8 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `/responses`、`/v1/responses`：Responses 代理
 - `/models`、`/v1/models`：模型列表代理
 - `/anthropic/v1/messages`：Anthropic Messages 兼容代理，使用 `x-api-key` 传入平台租户 Key
+- `/anthropic/v1/messages/count_tokens`：Anthropic Token 计数代理
+- `/beta/completions`、`/beta/chat/completions`：DeepSeek Beta 能力代理，分别对应 FIM 补全和对话前缀续写；客户端需要把 base_url 设为控制台展示的 Beta Base URL
 
 Chat、Responses 和 Anthropic Messages JSON 请求体在 MVP 中限制为 32 MiB；流式 Chat 请求在客户端未显式设置时会补上 `stream_options.include_usage=true`，客户端显式传入的值会被保留（DeepSeek 在 `[DONE]` 前的最后一块始终返回 usage）。Anthropic 非流式和 SSE 响应的 `input_tokens`、`output_tokens`、缓存读取/创建 Token 会写入同一用量账本。请求未开始推理时上游返回的保活空行与 SSE 注释不计入首字节耗时。虚拟 Key、用量事件、统计恢复和余额快照会写入 SQLite。
 
@@ -134,7 +136,9 @@ Chat、Responses 和 Anthropic Messages JSON 请求体在 MVP 中限制为 32 Mi
 
 租户隔离：转发 Chat Completions 时代理会写入 `user_id`（Anthropic 接口写入 `metadata.user_id`），取值为 `t-<租户>`，客户端自带的值会作为 `-u-<原值>` 后缀保留。DeepSeek 用它做 KVCache 隔离、内容安全隔离和按 `user_id` 的并发隔离，因此不同租户不会共享同一份上下文缓存命名空间。
 
-租户治理：除每分钟请求、并发、每日 Token 和每日费用外，还可以给密钥设置 `quota.monthly_cost_cny` 月度预算。月度用量按服务器本地时区的月份累计（见 `usage.month`），达到预算后请求被直接拒绝（`429`，`Retry-After: 3600`）；日配额跨天重置不会解除月度阻断，跨月自动清零。`allowed_models` 是租户可用模型白名单，留空表示不限制；请求的模型不在白名单内时返回 `403` 并附上允许的模型列表，请求不会打到上游。月度预算达到告警阈值时，告警中心会生成“每月预算”告警。
+租户治理：除每分钟请求、并发、每日 Token 和每日费用外，还可以给密钥设置 `quota.monthly_cost_cny` 月度预算。月度用量按北京时间的自然月累计（见 `usage.month`），与 DeepSeek 的账单月一致，达到预算后请求被直接拒绝（`429`，`Retry-After: 3600`）；日配额跨天重置不会解除月度阻断，跨月自动清零。`allowed_models` 是租户可用模型白名单，留空表示不限制；请求的模型不在白名单内时返回 `403` 并附上允许的模型列表，请求不会打到上游。月度预算达到告警阈值时，告警中心会生成“每月预算”告警。
+
+Beta 能力（FIM 补全、对话前缀续写）走独立的 Beta Base URL，控制台“客户端接入”面板可直接复制。FIM 请求体没有 `user_id` 字段，因此不会注入租户标识，但模型白名单、配额和计费与其他端点一致。Files API（`/files`）暂未代理：文件上传后只存在于上传时使用的那个上游账号上，多账号池下 `file_id` 会随机失效，需要先设计文件到账号的绑定关系。
 
 代理请求在尚未返回数据时，遇到网络错误、402、429 或 500/502/503/504 会最多切换到另一个健康账号重试一次；401、422 不重试，流式响应开始后也不会重试。请求账本会保存最终上游账号和尝试次数。
 

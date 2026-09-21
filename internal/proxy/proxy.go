@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -500,7 +501,9 @@ func (key *virtualKey) resetUsage(now time.Time) {
 		key.dailyTokens = 0
 		key.dailyCostCNY = 0
 	}
-	month := now.Format("2006-01")
+	// The monthly budget follows the Beijing calendar month DeepSeek bills on, so
+	// the reset lines up with the invoice regardless of the host time zone.
+	month := now.In(beijing).Format("2006-01")
 	if key.usageMonth != month {
 		key.usageMonth = month
 		key.monthlyCostCNY = 0
@@ -636,15 +639,78 @@ type Stats struct {
 }
 
 type Recorder struct {
-	mu     sync.Mutex
-	stats  Stats
-	latest []RequestStats
-	db     *sql.DB
+	mu        sync.Mutex
+	stats     Stats
+	latest    []RequestStats
+	db        *sql.DB
+	metrics   map[metricKey]*metricCounters
+	dropped   int64
+	duration  latencyHistogram
+	firstByte latencyHistogram
 }
 
-func NewRecorder() *Recorder { return &Recorder{latest: make([]RequestStats, 0, 50)} }
+// maxMetricSeries caps the label combinations kept in memory. The model label comes
+// from the client request body, so an unbounded map would be a memory amplifier.
+const maxMetricSeries = 2000
+
+type metricKey struct {
+	tenant  string
+	model   string
+	account string
+	outcome string
+}
+
+type metricCounters struct {
+	requests int64
+	tokens   int64
+	costCNY  float64
+}
+
+var latencyBuckets = []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600}
+
+type latencyHistogram struct {
+	counts []int64
+	count  int64
+	sum    float64
+}
+
+func (h *latencyHistogram) observe(seconds float64) {
+	if h.counts == nil {
+		h.counts = make([]int64, len(latencyBuckets))
+	}
+	h.count++
+	h.sum += seconds
+	for index, bound := range latencyBuckets {
+		if seconds <= bound {
+			h.counts[index]++
+			return
+		}
+	}
+}
+
+// MetricsSample is one labelled counter set of the Prometheus exposition.
+type MetricsSample struct {
+	Tenant   string
+	Model    string
+	Account  string
+	Outcome  string
+	Requests int64
+	Tokens   int64
+	CostCNY  float64
+}
+
+type MetricsSnapshot struct {
+	Samples       []MetricsSample
+	Duration      latencyHistogram
+	FirstByte     latencyHistogram
+	DroppedSeries int64
+}
+
+func NewRecorder() *Recorder {
+	return &Recorder{latest: make([]RequestStats, 0, 50), metrics: map[metricKey]*metricCounters{}}
+}
 func NewRecorderWithDB(db *sql.DB) *Recorder {
-	recorder := &Recorder{latest: make([]RequestStats, 0, 50), db: db}
+	recorder := &Recorder{latest: make([]RequestStats, 0, 50), db: db, metrics: map[metricKey]*metricCounters{}}
 	recorder.loadSQLite(db)
 	return recorder
 }
@@ -672,6 +738,7 @@ func (r *Recorder) Record(event RequestStats) {
 	if len(r.latest) > 50 {
 		r.latest = r.latest[:50]
 	}
+	r.observeMetricsLocked(event)
 	r.mu.Unlock()
 	if r.db != nil {
 		if err := persistRequest(r.db, event); err != nil {
@@ -685,6 +752,83 @@ func (r *Recorder) Snapshot() Stats {
 	snapshot := r.stats
 	snapshot.LastRequests = append([]RequestStats(nil), r.latest...)
 	return snapshot
+}
+
+func (r *Recorder) observeMetricsLocked(event RequestStats) {
+	outcome := "success"
+	if event.Status < 200 || event.Status >= 400 {
+		outcome = "error"
+	}
+	key := metricKey{tenant: metricLabel(event.TenantID), model: metricLabel(event.Model),
+		account: metricLabel(event.AccountID), outcome: outcome}
+	counters, ok := r.metrics[key]
+	if !ok {
+		if len(r.metrics) >= maxMetricSeries {
+			r.dropped++
+		} else {
+			counters = &metricCounters{}
+			r.metrics[key] = counters
+		}
+	}
+	if counters != nil {
+		counters.requests++
+		counters.tokens += event.Usage.TotalTokens
+		counters.costCNY += event.EstimatedCostCNY
+	}
+	if event.DurationMS > 0 {
+		r.duration.observe(float64(event.DurationMS) / 1000)
+	}
+	if event.FirstByteMS > 0 {
+		r.firstByte.observe(float64(event.FirstByteMS) / 1000)
+	}
+}
+
+func (r *Recorder) MetricsSnapshot() MetricsSnapshot {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	snapshot := MetricsSnapshot{Samples: make([]MetricsSample, 0, len(r.metrics)),
+		Duration: r.duration.clone(), FirstByte: r.firstByte.clone(), DroppedSeries: r.dropped}
+	for key, counters := range r.metrics {
+		snapshot.Samples = append(snapshot.Samples, MetricsSample{Tenant: key.tenant, Model: key.model,
+			Account: key.account, Outcome: key.outcome, Requests: counters.requests,
+			Tokens: counters.tokens, CostCNY: counters.costCNY})
+	}
+	sort.Slice(snapshot.Samples, func(i, j int) bool {
+		left, right := snapshot.Samples[i], snapshot.Samples[j]
+		if left.Tenant != right.Tenant {
+			return left.Tenant < right.Tenant
+		}
+		if left.Model != right.Model {
+			return left.Model < right.Model
+		}
+		if left.Account != right.Account {
+			return left.Account < right.Account
+		}
+		return left.Outcome < right.Outcome
+	})
+	return snapshot
+}
+
+func (h latencyHistogram) clone() latencyHistogram {
+	h.counts = append([]int64(nil), h.counts...)
+	return h
+}
+
+func metricLabel(value string) string {
+	if value == "" {
+		return "unknown"
+	}
+	return escapeMetricLabel(value)
+}
+
+// escapeMetricLabel protects the exposition format from client-supplied label
+// values such as the requested model name.
+func escapeMetricLabel(value string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+	if len(value) > 120 {
+		value = value[:120]
+	}
+	return replacer.Replace(value)
 }
 
 type Config struct {
@@ -1256,16 +1400,25 @@ func (s *Server) console(w http.ResponseWriter, r *http.Request) {
 
 func isProxyPath(path string) bool {
 	if isAnthropicPath(path) {
-		return true
+		return path == "/anthropic/v1/messages" || path == "/anthropic/v1/messages/count_tokens"
 	}
 	for _, suffix := range []string{"/chat/completions", "/responses", "/models"} {
 		if path == suffix || path == "/v1"+suffix {
 			return true
 		}
 	}
-	return false
+	// FIM completion and chat prefix completion are DeepSeek beta features served
+	// under a /beta base URL.
+	return path == "/beta/completions" || path == "/beta/chat/completions"
 }
-func isAnthropicPath(path string) bool { return path == "/anthropic/v1/messages" }
+
+// isAnthropicPath reports whether the request uses the Anthropic-compatible
+// surface, which authenticates with x-api-key and returns Anthropic error shapes.
+func isAnthropicPath(path string) bool { return strings.HasPrefix(path, "/anthropic/") }
+
+// isAnthropicMessagesPath matches the Anthropic endpoint that accepts metadata and
+// reports usage; count_tokens shares the surface but not those fields.
+func isAnthropicMessagesPath(path string) bool { return path == "/anthropic/v1/messages" }
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) (*Principal, bool) {
 	token := r.Header.Get("Authorization")
 	if strings.HasPrefix(token, "Bearer ") {
@@ -1406,7 +1559,7 @@ func (s *Server) prepareRequest(r *http.Request, principal *Principal) (prepared
 	r.Header.Del("X-Proxy-Session-ID")
 	r.Header.Del("X-Conversation-ID")
 	isJSON := strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json")
-	isSupportedBody := strings.HasSuffix(r.URL.Path, "/chat/completions") || strings.HasSuffix(r.URL.Path, "/responses") || isAnthropicPath(r.URL.Path)
+	isSupportedBody := strings.HasSuffix(r.URL.Path, "/completions") || strings.HasSuffix(r.URL.Path, "/responses") || isAnthropicPath(r.URL.Path)
 	if r.Body == nil || !isJSON || !isSupportedBody {
 		return result, 0, nil
 	}
@@ -1464,6 +1617,9 @@ func (s *Server) prepareRequest(r *http.Request, principal *Principal) (prepared
 // being trusted on its own.
 func applyTenantUserID(payload map[string]any, path string, principal *Principal) bool {
 	if isAnthropicPath(path) {
+		if !isAnthropicMessagesPath(path) {
+			return false
+		}
 		metadata, _ := payload["metadata"].(map[string]any)
 		scoped := tenantUserID(principal, stringValue(metadata["user_id"]))
 		if metadata == nil {
@@ -1584,6 +1740,9 @@ func (s *Server) retargetRequest(r *http.Request, account *Account, originalPath
 	}
 	if isAnthropicPath(path) && strings.HasSuffix(strings.TrimRight(target.Path, "/"), "/anthropic") {
 		path = strings.TrimPrefix(path, "/anthropic")
+	}
+	if strings.HasPrefix(path, "/beta/") && strings.HasSuffix(strings.TrimRight(target.Path, "/"), "/beta") {
+		path = strings.TrimPrefix(path, "/beta")
 	}
 	r.URL.Scheme, r.URL.Host = target.Scheme, target.Host
 	r.URL.Path = joinPath(target.Path, path)
@@ -1961,12 +2120,46 @@ func (s *Server) pollAccountBalance(ctx context.Context, account *Account) {
 
 func (s *Server) writeMetrics(w http.ResponseWriter) {
 	snapshot := s.recorder.Snapshot()
+	metrics := s.recorder.MetricsSnapshot()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	fmt.Fprintf(w, "deepseek_proxy_requests_total %d\n", snapshot.Requests)
 	fmt.Fprintf(w, "deepseek_proxy_successes_total %d\n", snapshot.Successes)
 	fmt.Fprintf(w, "deepseek_proxy_errors_total %d\n", snapshot.Errors)
 	fmt.Fprintf(w, "deepseek_proxy_tokens_total %d\n", snapshot.TotalTokens)
 	fmt.Fprintf(w, "deepseek_proxy_estimated_cost_cny_total %.8f\n", snapshot.EstimatedCostCNY)
+	for _, sample := range metrics.Samples {
+		labels := fmt.Sprintf(`{tenant="%s",model="%s",account="%s",outcome="%s"}`,
+			sample.Tenant, sample.Model, sample.Account, sample.Outcome)
+		fmt.Fprintf(w, "deepseek_proxy_requests_by_label_total%s %d\n", labels, sample.Requests)
+		fmt.Fprintf(w, "deepseek_proxy_tokens_by_label_total%s %d\n", labels, sample.Tokens)
+		fmt.Fprintf(w, "deepseek_proxy_cost_cny_by_label_total%s %.8f\n", labels, sample.CostCNY)
+	}
+	fmt.Fprintf(w, "deepseek_proxy_metric_series_dropped_total %d\n", metrics.DroppedSeries)
+	writeHistogram(w, "deepseek_proxy_request_duration_seconds", metrics.Duration)
+	writeHistogram(w, "deepseek_proxy_first_byte_seconds", metrics.FirstByte)
+	for _, account := range s.accountsSnapshot() {
+		if account == nil {
+			continue
+		}
+		labels := fmt.Sprintf(`{account="%s"}`, escapeMetricLabel(account.ID))
+		fmt.Fprintf(w, "deepseek_proxy_account_active_requests%s %d\n", labels, account.Active())
+		fmt.Fprintf(w, "deepseek_proxy_account_max_concurrent%s %d\n", labels, account.MaxConcurrent)
+		fmt.Fprintf(w, "deepseek_proxy_account_available%s %d\n", labels,
+			boolInt(!account.Disabled && account.APIKey != "" && account.Healthy(time.Now())))
+	}
+}
+
+func writeHistogram(w io.Writer, name string, histogram latencyHistogram) {
+	cumulative := int64(0)
+	for index, bound := range latencyBuckets {
+		if index < len(histogram.counts) {
+			cumulative += histogram.counts[index]
+		}
+		fmt.Fprintf(w, "%s_bucket{le=\"%g\"} %d\n", name, bound, cumulative)
+	}
+	fmt.Fprintf(w, "%s_bucket{le=\"+Inf\"} %d\n", name, histogram.count)
+	fmt.Fprintf(w, "%s_sum %.6f\n", name, histogram.sum)
+	fmt.Fprintf(w, "%s_count %d\n", name, histogram.count)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

@@ -193,6 +193,7 @@ export interface AccountTestResult {
 export interface ClientConfig {
   base_url: string;
   anthropic_base_url: string;
+  beta_base_url: string;
   api_key: string;
   api_key_prefix: string;
 }
