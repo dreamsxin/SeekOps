@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -29,15 +28,16 @@ import (
 var ConsoleAssets embed.FS
 
 type Account struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	APIKey    string    `json:"-"`
-	BaseURL   string    `json:"base_url"`
-	Weight    int       `json:"weight"`
-	Models    []string  `json:"models,omitempty"`
-	Disabled  bool      `json:"-"`
-	Managed   bool      `json:"-"`
-	CreatedAt time.Time `json:"-"`
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	APIKey        string    `json:"-"`
+	BaseURL       string    `json:"base_url"`
+	Weight        int       `json:"weight"`
+	MaxConcurrent int       `json:"max_concurrent"`
+	Models        []string  `json:"models,omitempty"`
+	Disabled      bool      `json:"-"`
+	Managed       bool      `json:"-"`
+	CreatedAt     time.Time `json:"-"`
 
 	active  atomic.Int64
 	fails   atomic.Int64
@@ -75,6 +75,31 @@ func (a *Account) balanceSnapshot() (bool, []BalanceInfo, time.Time, string) {
 }
 
 func (a *Account) Active() int64 { return a.active.Load() }
+
+// atCapacity reports whether the account already runs its maximum number of
+// concurrent upstream requests. DeepSeek counts concurrency per account, so
+// admitting more only earns an HTTP 429 from the upstream.
+func (a *Account) atCapacity() bool {
+	return a.MaxConcurrent > 0 && a.active.Load() >= int64(a.MaxConcurrent)
+}
+
+// tryAcquire reserves a concurrency slot, or reports false when the account is
+// already at its limit.
+func (a *Account) tryAcquire() bool {
+	limit := int64(a.MaxConcurrent)
+	for {
+		current := a.active.Load()
+		if limit > 0 && current >= limit {
+			return false
+		}
+		if a.active.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+func (a *Account) release() { a.active.Add(-1) }
+
 func (a *Account) Healthy(now time.Time) bool {
 	return a.blocked.Load() <= now.Unix()
 }
@@ -96,7 +121,7 @@ func (a *Account) markStatus(status int) {
 	case status == http.StatusPaymentRequired:
 		a.blocked.Store(time.Now().Add(30 * time.Minute).Unix())
 	case status == http.StatusTooManyRequests:
-		a.blocked.Store(time.Now().Add(5 * time.Second).Unix())
+		a.markRateLimited(0)
 	case status >= 500:
 		a.fails.Add(1)
 		a.blocked.Store(time.Now().Add(3 * time.Second).Unix())
@@ -109,6 +134,48 @@ func (a *Account) markStatus(status int) {
 func (a *Account) markTransportFailure() {
 	a.fails.Add(1)
 	a.blocked.Store(time.Now().Add(3 * time.Second).Unix())
+}
+
+// markResponse records the upstream outcome, honouring the Retry-After hint that
+// accompanies a rate-limit response.
+func (a *Account) markResponse(resp *http.Response) {
+	if resp == nil {
+		a.markTransportFailure()
+		return
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		a.markRateLimited(retryAfterDuration(resp.Header.Get("Retry-After")))
+		return
+	}
+	a.markStatus(resp.StatusCode)
+}
+
+// markRateLimited cools the account down for the hinted delay, capped so a long
+// hint cannot sideline the account for the whole window.
+func (a *Account) markRateLimited(retryAfter time.Duration) {
+	if retryAfter <= 0 {
+		retryAfter = time.Second
+	}
+	if retryAfter > 30*time.Second {
+		retryAfter = 30 * time.Second
+	}
+	a.blocked.Store(time.Now().Add(retryAfter).Unix())
+}
+
+func retryAfterDuration(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		if delta := time.Until(at); delta > 0 {
+			return delta
+		}
+	}
+	return 0
 }
 
 type Usage struct {
@@ -139,6 +206,7 @@ type RequestStats struct {
 	UsageStatus      string    `json:"usage_status"`
 	PriceRuleID      string    `json:"price_rule_id,omitempty"`
 	PriceStatus      string    `json:"price_status"`
+	PricingTier      string    `json:"pricing_tier,omitempty"`
 	EstimatedCostCNY float64   `json:"estimated_cost_cny"`
 	CreatedAt        time.Time `json:"created_at"`
 }
@@ -586,6 +654,9 @@ type Config struct {
 	PriceInputHit          float64
 	PriceInputMiss         float64
 	PriceOutput            float64
+	PricePeakInputHit      float64
+	PricePeakInputMiss     float64
+	PricePeakOutput        float64
 }
 
 type Server struct {
@@ -659,13 +730,12 @@ func (t *failoverTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	previous := meta.account
 	if resp != nil {
-		previous.markStatus(resp.StatusCode)
+		previous.markResponse(resp)
 		_ = resp.Body.Close()
 	} else {
 		previous.markTransportFailure()
 	}
-	previous.active.Add(-1)
-	next.active.Add(1)
+	previous.release()
 	meta.account = next
 	meta.attempts.Add(1)
 	if meta.routingPolicy == routingPolicyAffinity {
@@ -684,7 +754,7 @@ func retryableUpstreamResult(resp *http.Response, err error) bool {
 		return false
 	}
 	switch resp.StatusCode {
-	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	case http.StatusPaymentRequired, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	default:
 		return false
@@ -747,81 +817,98 @@ func (u *usageCollector) snapshot() (Usage, string) {
 	return u.usage, u.model
 }
 
+// maxUsageLineBytes caps the buffered fragment of a single unterminated line so a
+// huge non-streaming body cannot grow the tracking buffer without bound.
+const maxUsageLineBytes = 4 * 1024 * 1024
+
 type trackingBody struct {
-	body io.ReadCloser
-	meta *requestMeta
-	buf  []byte
+	body    io.ReadCloser
+	meta    *requestMeta
+	pending []byte
 }
 
 func (b *trackingBody) Read(p []byte) (int, error) {
-	if b.meta.firstByte.Load() == 0 {
-		b.meta.firstByte.CompareAndSwap(0, time.Since(b.meta.started).Milliseconds())
-	}
 	n, err := b.body.Read(p)
 	if n > 0 {
-		b.buf = append(b.buf, p[:n]...)
-		b.parse()
+		b.consume(p[:n])
 	}
 	return n, err
 }
 func (b *trackingBody) Close() error {
 	err := b.body.Close()
-	b.parse()
+	if len(b.pending) > 0 {
+		b.scanLine(b.pending)
+		b.pending = nil
+	}
 	recordMeta(b.meta)
 	return err
 }
-func (b *trackingBody) parse() {
-	if len(b.buf) == 0 {
+
+// consume scans only the lines completed by this chunk; the unterminated tail is
+// carried over so a long SSE response is parsed once instead of re-scanned on
+// every read.
+func (b *trackingBody) consume(chunk []byte) {
+	b.pending = append(b.pending, chunk...)
+	b.markFirstByte()
+	for {
+		index := bytes.IndexByte(b.pending, '\n')
+		if index < 0 {
+			break
+		}
+		line := b.pending[:index]
+		b.pending = b.pending[index+1:]
+		b.scanLine(line)
+	}
+	if len(b.pending) > maxUsageLineBytes {
+		b.pending = nil
+	}
+}
+
+// markFirstByte ignores the keep-alive traffic DeepSeek emits while a request is
+// still queued: blank lines for non-streaming requests and SSE comments
+// (": keep-alive") for streaming ones.
+func (b *trackingBody) markFirstByte() {
+	if b.meta.firstByte.Load() != 0 {
 		return
 	}
-	if len(b.buf) > 2*1024*1024 {
-		b.buf = b.buf[len(b.buf)-2*1024*1024:]
+	rest := b.pending
+	for len(rest) > 0 {
+		line := rest
+		if index := bytes.IndexByte(rest, '\n'); index >= 0 {
+			line, rest = rest[:index], rest[index+1:]
+		} else {
+			rest = nil
+		}
+		if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 && trimmed[0] != ':' {
+			b.meta.firstByte.CompareAndSwap(0, time.Since(b.meta.started).Milliseconds())
+			return
+		}
 	}
-	scanUsage(bytesReader(b.buf), b.meta)
 }
 
-type byteReader struct {
-	data   []byte
-	offset int
-}
-
-func bytesReader(data []byte) *byteReader { return &byteReader{data: data} }
-func (r *byteReader) Read(p []byte) (int, error) {
-	if r.offset >= len(r.data) {
-		return 0, io.EOF
+func (b *trackingBody) scanLine(line []byte) {
+	trimmed := bytes.TrimSpace(line)
+	if after, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
+		trimmed = bytes.TrimSpace(after)
 	}
-	n := copy(p, r.data[r.offset:])
-	r.offset += n
-	return n, nil
-}
-
-func scanUsage(reader io.Reader, meta *requestMeta) {
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 1024), 2*1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "data:") {
-			line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return
+	}
+	var payload map[string]any
+	if json.Unmarshal(trimmed, &payload) != nil {
+		return
+	}
+	if value, ok := payload["usage"].(map[string]any); ok {
+		b.meta.usage.merge(parseCompatibleUsage(value), stringValue(payload["model"]))
+	}
+	if response, ok := payload["response"].(map[string]any); ok {
+		if value, ok := response["usage"].(map[string]any); ok {
+			b.meta.usage.merge(parseResponsesUsage(value), stringValue(response["model"]))
 		}
-		if line == "" || line == "[DONE]" || !strings.HasPrefix(line, "{") {
-			continue
-		}
-		var payload map[string]any
-		if json.Unmarshal([]byte(line), &payload) != nil {
-			continue
-		}
-		if value, ok := payload["usage"].(map[string]any); ok {
-			meta.usage.merge(parseCompatibleUsage(value), stringValue(payload["model"]))
-		}
-		if response, ok := payload["response"].(map[string]any); ok {
-			if value, ok := response["usage"].(map[string]any); ok {
-				meta.usage.merge(parseResponsesUsage(value), stringValue(response["model"]))
-			}
-		}
-		if message, ok := payload["message"].(map[string]any); ok {
-			if value, ok := message["usage"].(map[string]any); ok {
-				meta.usage.merge(parseAnthropicUsage(value), stringValue(message["model"]))
-			}
+	}
+	if message, ok := payload["message"].(map[string]any); ok {
+		if value, ok := message["usage"].(map[string]any); ok {
+			b.meta.usage.merge(parseAnthropicUsage(value), stringValue(message["model"]))
 		}
 	}
 }
@@ -845,6 +932,9 @@ func parseCompatibleUsage(v map[string]any) Usage {
 func parseUsage(v map[string]any) Usage {
 	prompt := intValue(v["prompt_tokens"])
 	hit := intValue(v["prompt_cache_hit_tokens"])
+	if hit == 0 {
+		hit = intValue(nested(v, "prompt_tokens_details", "cached_tokens"))
+	}
 	miss := intValue(v["prompt_cache_miss_tokens"])
 	if miss == 0 && prompt > hit {
 		miss = prompt - hit
@@ -942,7 +1032,18 @@ func NewServerChecked(cfg Config) (*Server, error) {
 		cfg.PriceInputMiss = 1
 	}
 	if cfg.PriceOutput == 0 {
-		cfg.PriceOutput = 2
+		cfg.PriceOutput = 4
+	}
+	// DeepSeek bills off-peak requests at half the peak rate, so the peak seed
+	// defaults to twice the off-peak rate unless it is configured explicitly.
+	if cfg.PricePeakInputHit == 0 {
+		cfg.PricePeakInputHit = 2 * cfg.PriceInputHit
+	}
+	if cfg.PricePeakInputMiss == 0 {
+		cfg.PricePeakInputMiss = 2 * cfg.PriceInputMiss
+	}
+	if cfg.PricePeakOutput == 0 {
+		cfg.PricePeakOutput = 2 * cfg.PriceOutput
 	}
 	if err := ValidateStoredSecrets(cfg.DB, cfg.SecretCipher); err != nil {
 		return nil, err
@@ -955,7 +1056,10 @@ func NewServerChecked(cfg Config) (*Server, error) {
 			return nil, fmt.Errorf("load virtual keys: %w", err)
 		}
 	}
-	prices, err := NewPriceStore(cfg.DB, cfg.PriceInputHit, cfg.PriceInputMiss, cfg.PriceOutput)
+	prices, err := NewPriceStore(cfg.DB, PriceDefaults{
+		CacheHit: cfg.PriceInputHit, CacheMiss: cfg.PriceInputMiss, Output: cfg.PriceOutput,
+		PeakCacheHit: cfg.PricePeakInputHit, PeakCacheMiss: cfg.PricePeakInputMiss, PeakOutput: cfg.PricePeakOutput,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("load price rules: %w", err)
 	}
@@ -1033,7 +1137,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.keys.Release(principal.ID)
-	prepared, status, err := s.prepareRequest(r)
+	prepared, status, err := s.prepareRequest(r, principal)
 	if err != nil {
 		writeProxyError(w, r, status, "invalid_request_error", err.Error(), nil)
 		return
@@ -1041,6 +1145,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sessionKey := scopedSessionKey(principal.ID, prepared.sessionSeed)
 	account, policy, reused, affinityFallback := s.routeAccount(prepared.model, sessionKey)
 	if account == nil {
+		if s.poolSaturated(prepared.model) {
+			w.Header().Set("Retry-After", "1")
+			writeProxyError(w, r, http.StatusTooManyRequests, "quota_error", "upstream concurrency limit reached", nil)
+			return
+		}
 		writeProxyError(w, r, http.StatusServiceUnavailable, "proxy_error", "no healthy upstream account available", nil)
 		return
 	}
@@ -1049,8 +1158,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	meta.attempts.Store(1)
 	meta.affinityReused.Store(reused)
 	meta.affinityFallback.Store(affinityFallback)
-	account.active.Add(1)
-	defer func() { meta.account.active.Add(-1) }()
+	// The concurrency slot was reserved while routing.
+	defer func() { meta.account.release() }()
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
 	defer cancel()
 	ctx = context.WithValue(ctx, requestMetaKey, meta)
@@ -1127,7 +1236,22 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) (*Principal, 
 	}
 	return principal, true
 }
+// selectAccount picks the least loaded eligible account and reserves a
+// concurrency slot on it. The caller must release the slot when the request ends.
 func (s *Server) selectAccount(model, excludedID string) *Account {
+	for attempt := 0; attempt < 3; attempt++ {
+		account := s.pickAccount(model, excludedID)
+		if account == nil {
+			return nil
+		}
+		if account.tryAcquire() {
+			return account
+		}
+	}
+	return nil
+}
+
+func (s *Server) pickAccount(model, excludedID string) *Account {
 	now := time.Now()
 	accounts := s.accountsSnapshot()
 	var selected *Account
@@ -1135,7 +1259,7 @@ func (s *Server) selectAccount(model, excludedID string) *Account {
 	start := int(s.sequence.Add(1) % uint64(max(1, len(accounts))))
 	for offset := 0; offset < len(accounts); offset++ {
 		a := accounts[(start+offset)%len(accounts)]
-		if a == nil || a.ID == excludedID || a.Disabled || a.APIKey == "" || !a.Healthy(now) || !a.SupportsModel(model) {
+		if a == nil || a.ID == excludedID || a.Disabled || a.APIKey == "" || !a.Healthy(now) || !a.SupportsModel(model) || a.atCapacity() {
 			continue
 		}
 		weight := a.Weight
@@ -1150,6 +1274,23 @@ func (s *Server) selectAccount(model, excludedID string) *Account {
 	return selected
 }
 
+// poolSaturated reports whether every otherwise usable account is at its
+// concurrency limit, which maps to HTTP 429 rather than 503.
+func (s *Server) poolSaturated(model string) bool {
+	now := time.Now()
+	saturated := false
+	for _, account := range s.accountsSnapshot() {
+		if account == nil || account.Disabled || account.APIKey == "" || !account.Healthy(now) || !account.SupportsModel(model) {
+			continue
+		}
+		if !account.atCapacity() {
+			return false
+		}
+		saturated = true
+	}
+	return saturated
+}
+
 func (s *Server) routeAccount(model, sessionKey string) (*Account, string, bool, bool) {
 	policy := routingPolicy(sessionKey, s.config.SessionAffinityPercent)
 	if policy != routingPolicyAffinity {
@@ -1157,7 +1298,7 @@ func (s *Server) routeAccount(model, sessionKey string) (*Account, string, bool,
 	}
 	now := time.Now()
 	if accountID, ok := s.affinities.Get(sessionKey, now); ok {
-		if account := s.eligibleAccount(accountID, model, "", now); account != nil {
+		if account := s.eligibleAccount(accountID, model, "", now); account != nil && account.tryAcquire() {
 			return account, policy, true, false
 		}
 		account := s.selectAccount(model, "")
@@ -1194,7 +1335,7 @@ type preparedRequest struct {
 	sessionSeed string
 }
 
-func (s *Server) prepareRequest(r *http.Request) (preparedRequest, int, error) {
+func (s *Server) prepareRequest(r *http.Request, principal *Principal) (preparedRequest, int, error) {
 	result := preparedRequest{model: r.Header.Get("X-Proxy-Model")}
 	if sessionID := strings.TrimSpace(r.Header.Get("X-Proxy-Session-ID")); sessionID != "" {
 		if len(sessionID) > 512 {
@@ -1232,22 +1373,93 @@ func (s *Server) prepareRequest(r *http.Request) (preparedRequest, int, error) {
 	if result.sessionSeed == "" {
 		result.sessionSeed = sessionSeedFromPayload(r.URL.Path, payload)
 	}
+	mutated := false
 	if strings.HasSuffix(r.URL.Path, "/chat/completions") {
 		if stream, ok := payload["stream"].(bool); ok && stream {
 			options, _ := payload["stream_options"].(map[string]any)
-			if options == nil {
-				options = map[string]any{}
-				payload["stream_options"] = options
+			// DeepSeek always reports usage on the last chunk, so an explicit client
+			// choice is preserved; the default only adds the flag for upstreams that
+			// require it.
+			if _, explicit := options["include_usage"]; !explicit {
+				if options == nil {
+					options = map[string]any{}
+					payload["stream_options"] = options
+				}
+				options["include_usage"] = true
+				mutated = true
 			}
-			options["include_usage"] = true
-			body, err = json.Marshal(payload)
-			if err != nil {
-				return preparedRequest{}, http.StatusBadRequest, fmt.Errorf("encode streaming request: %w", err)
-			}
+		}
+	}
+	if applyTenantUserID(payload, r.URL.Path, principal) {
+		mutated = true
+	}
+	if mutated {
+		body, err = json.Marshal(payload)
+		if err != nil {
+			return preparedRequest{}, http.StatusBadRequest, fmt.Errorf("encode upstream request: %w", err)
 		}
 	}
 	setReplayableBody(r, body)
 	return result, 0, nil
+}
+
+// applyTenantUserID scopes the DeepSeek user_id to the calling tenant so KVCache,
+// content-safety handling and per-user_id concurrency stay isolated between
+// tenants of the pool. A client-supplied value is kept as a suffix instead of
+// being trusted on its own.
+func applyTenantUserID(payload map[string]any, path string, principal *Principal) bool {
+	if isAnthropicPath(path) {
+		metadata, _ := payload["metadata"].(map[string]any)
+		scoped := tenantUserID(principal, stringValue(metadata["user_id"]))
+		if metadata == nil {
+			metadata = map[string]any{}
+			payload["metadata"] = metadata
+		}
+		metadata["user_id"] = scoped
+		return true
+	}
+	if !strings.HasSuffix(path, "/chat/completions") {
+		return false
+	}
+	payload["user_id"] = tenantUserID(principal, stringValue(payload["user_id"]))
+	return true
+}
+
+// tenantUserID builds an identifier that matches the documented [a-zA-Z0-9\-_]+
+// pattern and stays within the 512 character limit.
+func tenantUserID(principal *Principal, clientValue string) string {
+	scope := ""
+	if principal != nil {
+		scope = principal.TenantID
+		if scope == "" {
+			scope = principal.ID
+		}
+	}
+	id := "t-" + sanitizeUserID(scope)
+	if clientValue != "" {
+		id += "-u-" + sanitizeUserID(clientValue)
+	}
+	if len(id) > 512 {
+		id = id[:512]
+	}
+	return id
+}
+
+func sanitizeUserID(value string) string {
+	var builder strings.Builder
+	for _, symbol := range value {
+		switch {
+		case symbol >= 'a' && symbol <= 'z', symbol >= 'A' && symbol <= 'Z',
+			symbol >= '0' && symbol <= '9', symbol == '-', symbol == '_':
+			builder.WriteRune(symbol)
+		default:
+			builder.WriteByte('_')
+		}
+	}
+	if builder.Len() == 0 {
+		return "anonymous"
+	}
+	return builder.String()
 }
 
 func sessionSeedFromPayload(path string, payload map[string]any) string {
@@ -1349,7 +1561,7 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 		return nil
 	}
 	meta.status.Store(int64(resp.StatusCode))
-	meta.account.markStatus(resp.StatusCode)
+	meta.account.markResponse(resp)
 	resp.Body = &trackingBody{body: resp.Body, meta: meta}
 	resp.Header.Set("X-Proxy-Request-ID", meta.requestID)
 	resp.Header.Set("X-Proxy-Attempts", strconv.FormatInt(meta.attempts.Load(), 10))
@@ -1400,13 +1612,16 @@ func recordMeta(meta *requestMeta) {
 	cost := float64(0)
 	priceRuleID := ""
 	priceStatus := "usage_missing"
+	pricingTier := ""
 	if usage.UsagePresent && meta.prices != nil {
 		if rule, ok := meta.prices.Resolve(model, meta.started); ok {
+			hitRate, missRate, outputRate, tier := rule.RatesAt(meta.started)
 			priceRuleID = rule.ID
 			priceStatus = "estimated"
-			cost = (float64(usage.CacheHitTokens)/1e6)*rule.CacheHitCNYPerMillion +
-				(float64(usage.CacheMissTokens)/1e6)*rule.CacheMissCNYPerMillion +
-				(float64(usage.CompletionTokens)/1e6)*rule.OutputCNYPerMillion
+			pricingTier = tier
+			cost = (float64(usage.CacheHitTokens)/1e6)*hitRate +
+				(float64(usage.CacheMissTokens)/1e6)*missRate +
+				(float64(usage.CompletionTokens)/1e6)*outputRate
 		} else {
 			priceStatus = "missing"
 		}
@@ -1420,7 +1635,7 @@ func recordMeta(meta *requestMeta) {
 		tenantID = meta.principal.TenantID
 		virtualKeyID = meta.principal.ID
 	}
-	event := RequestStats{RequestID: meta.requestID, TenantID: tenantID, VirtualKeyID: virtualKeyID, AccountID: meta.account.ID, Attempts: int(meta.attempts.Load()), RoutingPolicy: meta.routingPolicy, AffinityReused: meta.affinityReused.Load(), AffinityFallback: meta.affinityFallback.Load(), Model: model, Path: meta.path, Status: status, DurationMS: time.Since(meta.started).Milliseconds(), FirstByteMS: first, Usage: usage, UsageStatus: usageStatus, PriceRuleID: priceRuleID, PriceStatus: priceStatus, EstimatedCostCNY: cost, CreatedAt: meta.started}
+	event := RequestStats{RequestID: meta.requestID, TenantID: tenantID, VirtualKeyID: virtualKeyID, AccountID: meta.account.ID, Attempts: int(meta.attempts.Load()), RoutingPolicy: meta.routingPolicy, AffinityReused: meta.affinityReused.Load(), AffinityFallback: meta.affinityFallback.Load(), Model: model, Path: meta.path, Status: status, DurationMS: time.Since(meta.started).Milliseconds(), FirstByteMS: first, Usage: usage, UsageStatus: usageStatus, PriceRuleID: priceRuleID, PriceStatus: priceStatus, PricingTier: pricingTier, EstimatedCostCNY: cost, CreatedAt: meta.started}
 	meta.recorder.Record(event)
 	now := time.Now()
 	if meta.keys != nil && meta.principal != nil {

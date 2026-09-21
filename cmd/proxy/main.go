@@ -43,7 +43,10 @@ func main() {
 		SecretCipher:           secrets,
 		PriceInputHit:          floatEnv("PRICE_INPUT_HIT_CNY_PER_MILLION", 0.02),
 		PriceInputMiss:         floatEnv("PRICE_INPUT_MISS_CNY_PER_MILLION", 1),
-		PriceOutput:            floatEnv("PRICE_OUTPUT_CNY_PER_MILLION", 2),
+		PriceOutput:            floatEnv("PRICE_OUTPUT_CNY_PER_MILLION", 4),
+		PricePeakInputHit:      floatEnv("PRICE_PEAK_INPUT_HIT_CNY_PER_MILLION", 0.04),
+		PricePeakInputMiss:     floatEnv("PRICE_PEAK_INPUT_MISS_CNY_PER_MILLION", 2),
+		PricePeakOutput:        floatEnv("PRICE_PEAK_OUTPUT_CNY_PER_MILLION", 8),
 	}
 	server, err := proxy.NewServerChecked(cfg)
 	if err != nil {
@@ -59,12 +62,13 @@ func main() {
 func loadAccounts() []*proxy.Account {
 	if raw := os.Getenv("UPSTREAM_ACCOUNTS_JSON"); raw != "" {
 		type accountInput struct {
-			ID      string   `json:"id"`
-			Name    string   `json:"name"`
-			APIKey  string   `json:"api_key"`
-			BaseURL string   `json:"base_url"`
-			Weight  int      `json:"weight"`
-			Models  []string `json:"models"`
+			ID            string   `json:"id"`
+			Name          string   `json:"name"`
+			APIKey        string   `json:"api_key"`
+			BaseURL       string   `json:"base_url"`
+			Weight        int      `json:"weight"`
+			MaxConcurrent int      `json:"max_concurrent"`
+			Models        []string `json:"models"`
 		}
 		var inputs []accountInput
 		if err := json.Unmarshal([]byte(raw), &inputs); err != nil {
@@ -72,7 +76,8 @@ func loadAccounts() []*proxy.Account {
 		}
 		accounts := make([]*proxy.Account, 0, len(inputs))
 		for i, input := range inputs {
-			account := &proxy.Account{ID: input.ID, Name: input.Name, APIKey: input.APIKey, BaseURL: input.BaseURL, Weight: input.Weight, Models: input.Models}
+			account := &proxy.Account{ID: input.ID, Name: input.Name, APIKey: input.APIKey, BaseURL: input.BaseURL,
+				Weight: input.Weight, MaxConcurrent: input.MaxConcurrent, Models: input.Models}
 			normalizeAccount(account, i)
 			accounts = append(accounts, account)
 		}

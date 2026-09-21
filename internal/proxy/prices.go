@@ -12,14 +12,70 @@ import (
 	"time"
 )
 
+const (
+	pricingTierPeak    = "peak"
+	pricingTierOffPeak = "off_peak"
+)
+
+// beijing is the fixed UTC+8 offset DeepSeek uses to define its peak window.
+// Mainland China has observed no DST since 1991, so a fixed zone avoids relying
+// on the host tzdata.
+var beijing = time.FixedZone("UTC+8", 8*60*60)
+
+// isPeakPricing reports whether an instant falls inside the DeepSeek peak
+// window: Monday to Friday 09:00-12:00 and 14:00-18:00 Beijing time. Everything
+// else is off-peak and billed at half the peak rate.
+func isPeakPricing(at time.Time) bool {
+	local := at.In(beijing)
+	if local.Weekday() == time.Saturday || local.Weekday() == time.Sunday {
+		return false
+	}
+	minutes := local.Hour()*60 + local.Minute()
+	return (minutes >= 9*60 && minutes < 12*60) || (minutes >= 14*60 && minutes < 18*60)
+}
+
+// PriceRule carries the off-peak rates in its base fields; the peak rates are
+// optional so rules written before peak pricing existed keep their cost.
 type PriceRule struct {
-	ID                     string    `json:"id"`
-	Model                  string    `json:"model"`
-	CacheHitCNYPerMillion  float64   `json:"cache_hit_cny_per_million"`
-	CacheMissCNYPerMillion float64   `json:"cache_miss_cny_per_million"`
-	OutputCNYPerMillion    float64   `json:"output_cny_per_million"`
-	EffectiveAt            time.Time `json:"effective_at"`
-	CreatedAt              time.Time `json:"created_at"`
+	ID                         string    `json:"id"`
+	Model                      string    `json:"model"`
+	CacheHitCNYPerMillion      float64   `json:"cache_hit_cny_per_million"`
+	CacheMissCNYPerMillion     float64   `json:"cache_miss_cny_per_million"`
+	OutputCNYPerMillion        float64   `json:"output_cny_per_million"`
+	PeakCacheHitCNYPerMillion  *float64  `json:"peak_cache_hit_cny_per_million,omitempty"`
+	PeakCacheMissCNYPerMillion *float64  `json:"peak_cache_miss_cny_per_million,omitempty"`
+	PeakOutputCNYPerMillion    *float64  `json:"peak_output_cny_per_million,omitempty"`
+	EffectiveAt                time.Time `json:"effective_at"`
+	CreatedAt                  time.Time `json:"created_at"`
+}
+
+// RatesAt resolves the rates that apply at the given instant and reports which
+// tier was used, so a ledger entry can be reconciled against the invoice.
+func (r PriceRule) RatesAt(at time.Time) (hit, miss, output float64, tier string) {
+	hit, miss, output = r.CacheHitCNYPerMillion, r.CacheMissCNYPerMillion, r.OutputCNYPerMillion
+	if !isPeakPricing(at) {
+		return hit, miss, output, pricingTierOffPeak
+	}
+	if r.PeakCacheHitCNYPerMillion != nil {
+		hit = *r.PeakCacheHitCNYPerMillion
+	}
+	if r.PeakCacheMissCNYPerMillion != nil {
+		miss = *r.PeakCacheMissCNYPerMillion
+	}
+	if r.PeakOutputCNYPerMillion != nil {
+		output = *r.PeakOutputCNYPerMillion
+	}
+	return hit, miss, output, pricingTierPeak
+}
+
+// PriceDefaults seeds the first price rule when no rule exists yet.
+type PriceDefaults struct {
+	CacheHit      float64
+	CacheMiss     float64
+	Output        float64
+	PeakCacheHit  float64
+	PeakCacheMiss float64
+	PeakOutput    float64
 }
 
 type PriceStore struct {
@@ -28,21 +84,26 @@ type PriceStore struct {
 	db    *sql.DB
 }
 
-func NewPriceStore(db *sql.DB, hit, miss, output float64) (*PriceStore, error) {
+func NewPriceStore(db *sql.DB, defaults PriceDefaults) (*PriceStore, error) {
 	store := &PriceStore{db: db, rules: []PriceRule{}}
 	if db != nil {
 		rows, err := db.Query(`SELECT id, model, cache_hit_cny_per_million, cache_miss_cny_per_million,
-			output_cny_per_million, effective_at, created_at FROM price_rules ORDER BY effective_at DESC, created_at DESC`)
+			output_cny_per_million, peak_cache_hit_cny_per_million, peak_cache_miss_cny_per_million,
+			peak_output_cny_per_million, effective_at, created_at FROM price_rules ORDER BY effective_at DESC, created_at DESC`)
 		if err != nil {
 			return nil, fmt.Errorf("load price rules: %w", err)
 		}
 		for rows.Next() {
 			var rule PriceRule
 			var effectiveAt, createdAt string
+			var peakHit, peakMiss, peakOutput sql.NullFloat64
 			if err := rows.Scan(&rule.ID, &rule.Model, &rule.CacheHitCNYPerMillion, &rule.CacheMissCNYPerMillion,
-				&rule.OutputCNYPerMillion, &effectiveAt, &createdAt); err != nil {
+				&rule.OutputCNYPerMillion, &peakHit, &peakMiss, &peakOutput, &effectiveAt, &createdAt); err != nil {
 				return nil, fmt.Errorf("scan price rule: %w", err)
 			}
+			rule.PeakCacheHitCNYPerMillion = nullableFloat(peakHit)
+			rule.PeakCacheMissCNYPerMillion = nullableFloat(peakMiss)
+			rule.PeakOutputCNYPerMillion = nullableFloat(peakOutput)
 			rule.EffectiveAt, _ = time.Parse(time.RFC3339Nano, effectiveAt)
 			rule.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
 			store.rules = append(store.rules, rule)
@@ -57,9 +118,12 @@ func NewPriceStore(db *sql.DB, hit, miss, output float64) (*PriceStore, error) {
 	}
 	if len(store.rules) == 0 {
 		seed := PriceRule{
-			ID: "price-default", Model: "*", CacheHitCNYPerMillion: hit,
-			CacheMissCNYPerMillion: miss, OutputCNYPerMillion: output,
-			EffectiveAt: time.Unix(0, 0).UTC(), CreatedAt: time.Now().UTC(),
+			ID: "price-default", Model: "*", CacheHitCNYPerMillion: defaults.CacheHit,
+			CacheMissCNYPerMillion: defaults.CacheMiss, OutputCNYPerMillion: defaults.Output,
+			PeakCacheHitCNYPerMillion:  positiveFloat(defaults.PeakCacheHit),
+			PeakCacheMissCNYPerMillion: positiveFloat(defaults.PeakCacheMiss),
+			PeakOutputCNYPerMillion:    positiveFloat(defaults.PeakOutput),
+			EffectiveAt:                time.Unix(0, 0).UTC(), CreatedAt: time.Now().UTC(),
 		}
 		if db != nil {
 			if err := persistPriceRule(db, seed); err != nil {
@@ -71,6 +135,22 @@ func NewPriceStore(db *sql.DB, hit, miss, output float64) (*PriceStore, error) {
 	store.sortLocked()
 	return store, nil
 }
+
+func nullableFloat(value sql.NullFloat64) *float64 {
+	if !value.Valid {
+		return nil
+	}
+	rate := value.Float64
+	return &rate
+}
+
+func positiveFloat(value float64) *float64 {
+	if value <= 0 {
+		return nil
+	}
+	return &value
+}
+
 
 func (s *PriceStore) List() []PriceRule {
 	s.mu.RLock()
@@ -105,6 +185,11 @@ func (s *PriceStore) Create(rule PriceRule) (PriceRule, error) {
 	}
 	if rule.CacheHitCNYPerMillion < 0 || rule.CacheMissCNYPerMillion < 0 || rule.OutputCNYPerMillion < 0 {
 		return PriceRule{}, fmt.Errorf("price values must not be negative")
+	}
+	for _, peak := range []*float64{rule.PeakCacheHitCNYPerMillion, rule.PeakCacheMissCNYPerMillion, rule.PeakOutputCNYPerMillion} {
+		if peak != nil && *peak < 0 {
+			return PriceRule{}, fmt.Errorf("peak price values must not be negative")
+		}
 	}
 	if rule.EffectiveAt.IsZero() {
 		rule.EffectiveAt = time.Now().UTC()
@@ -154,11 +239,22 @@ func (s *PriceStore) sortLocked() {
 
 func persistPriceRule(db *sql.DB, rule PriceRule) error {
 	_, err := db.Exec(`INSERT INTO price_rules
-		(id, model, cache_hit_cny_per_million, cache_miss_cny_per_million, output_cny_per_million, effective_at, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, rule.ID, rule.Model, rule.CacheHitCNYPerMillion,
+		(id, model, cache_hit_cny_per_million, cache_miss_cny_per_million, output_cny_per_million,
+		 peak_cache_hit_cny_per_million, peak_cache_miss_cny_per_million, peak_output_cny_per_million,
+		 effective_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, rule.ID, rule.Model, rule.CacheHitCNYPerMillion,
 		rule.CacheMissCNYPerMillion, rule.OutputCNYPerMillion,
+		floatOrNull(rule.PeakCacheHitCNYPerMillion), floatOrNull(rule.PeakCacheMissCNYPerMillion),
+		floatOrNull(rule.PeakOutputCNYPerMillion),
 		rule.EffectiveAt.UTC().Format(time.RFC3339Nano), rule.CreatedAt.UTC().Format(time.RFC3339Nano))
 	return err
+}
+
+func floatOrNull(value *float64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
 }
 
 func (s *Server) handlePrices(w http.ResponseWriter, r *http.Request) {
@@ -181,7 +277,10 @@ func (s *Server) handlePrices(w http.ResponseWriter, r *http.Request) {
 				s.audit.Record("price_rule_created", "price_rule", rule.ID, "创建模型价格规则", map[string]any{
 					"model": rule.Model, "cache_hit_cny_per_million": rule.CacheHitCNYPerMillion,
 					"cache_miss_cny_per_million": rule.CacheMissCNYPerMillion, "output_cny_per_million": rule.OutputCNYPerMillion,
-					"effective_at": rule.EffectiveAt,
+					"peak_cache_hit_cny_per_million":  floatOrNull(rule.PeakCacheHitCNYPerMillion),
+					"peak_cache_miss_cny_per_million": floatOrNull(rule.PeakCacheMissCNYPerMillion),
+					"peak_output_cny_per_million":     floatOrNull(rule.PeakOutputCNYPerMillion),
+					"effective_at":                    rule.EffectiveAt,
 				}, time.Now())
 			}
 			writeJSON(w, http.StatusCreated, rule)

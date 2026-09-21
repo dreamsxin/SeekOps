@@ -54,6 +54,7 @@ func migrateSQLite(db *sql.DB) error {
 			api_key TEXT NOT NULL,
 			base_url TEXT NOT NULL,
 			weight INTEGER NOT NULL DEFAULT 1,
+			max_concurrent INTEGER NOT NULL DEFAULT 0,
 			models_json TEXT NOT NULL DEFAULT '[]',
 			enabled INTEGER NOT NULL DEFAULT 1,
 			created_at TEXT NOT NULL,
@@ -107,6 +108,7 @@ func migrateSQLite(db *sql.DB) error {
 			usage_status TEXT NOT NULL,
 			price_rule_id TEXT NOT NULL DEFAULT '',
 			price_status TEXT NOT NULL DEFAULT 'legacy',
+			pricing_tier TEXT NOT NULL DEFAULT '',
 			estimated_cost_cny REAL NOT NULL,
 			created_at TEXT NOT NULL
 		)`,
@@ -118,6 +120,9 @@ func migrateSQLite(db *sql.DB) error {
 			cache_hit_cny_per_million REAL NOT NULL,
 			cache_miss_cny_per_million REAL NOT NULL,
 			output_cny_per_million REAL NOT NULL,
+			peak_cache_hit_cny_per_million REAL,
+			peak_cache_miss_cny_per_million REAL,
+			peak_output_cny_per_million REAL,
 			effective_at TEXT NOT NULL,
 			created_at TEXT NOT NULL
 		)`,
@@ -190,6 +195,63 @@ func migrateSQLite(db *sql.DB) error {
 	if err := ensureUsageRoutingColumns(db); err != nil {
 		return fmt.Errorf("migrate sqlite usage routing: %w", err)
 	}
+	if err := ensurePriceRulePeakColumns(db); err != nil {
+		return fmt.Errorf("migrate sqlite price rule peak rates: %w", err)
+	}
+	if err := ensureAccountConcurrencyColumn(db); err != nil {
+		return fmt.Errorf("migrate sqlite account concurrency: %w", err)
+	}
+	return nil
+}
+
+// tableColumns reports the existing columns of a table so additive migrations
+// stay idempotent. The table name is always an internal constant.
+func tableColumns(db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return nil, err
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return columns, nil
+}
+
+func ensureAccountConcurrencyColumn(db *sql.DB) error {
+	columns, err := tableColumns(db, "upstream_accounts")
+	if err != nil {
+		return err
+	}
+	if columns["max_concurrent"] {
+		return nil
+	}
+	_, err = db.Exec(`ALTER TABLE upstream_accounts ADD COLUMN max_concurrent INTEGER NOT NULL DEFAULT 0`)
+	return err
+}
+
+func ensurePriceRulePeakColumns(db *sql.DB) error {	columns, err := tableColumns(db, "price_rules")
+	if err != nil {
+		return err
+	}
+	for _, column := range []string{"peak_cache_hit_cny_per_million", "peak_cache_miss_cny_per_million", "peak_output_cny_per_million"} {
+		if columns[column] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE price_rules ADD COLUMN ` + column + ` REAL`); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -242,22 +304,8 @@ func ensureUsageAttemptsColumn(db *sql.DB) error {
 }
 
 func ensureUsagePriceColumns(db *sql.DB) error {
-	columns := map[string]bool{}
-	rows, err := db.Query(`PRAGMA table_info(usage_events)`)
+	columns, err := tableColumns(db, "usage_events")
 	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid, notNull, primaryKey int
-		var name, columnType string
-		var defaultValue any
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
-			return err
-		}
-		columns[name] = true
-	}
-	if err := rows.Err(); err != nil {
 		return err
 	}
 	if !columns["price_rule_id"] {
@@ -267,6 +315,11 @@ func ensureUsagePriceColumns(db *sql.DB) error {
 	}
 	if !columns["price_status"] {
 		if _, err := db.Exec(`ALTER TABLE usage_events ADD COLUMN price_status TEXT NOT NULL DEFAULT 'legacy'`); err != nil {
+			return err
+		}
+	}
+	if !columns["pricing_tier"] {
+		if _, err := db.Exec(`ALTER TABLE usage_events ADD COLUMN pricing_tier TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
 	}
@@ -384,12 +437,12 @@ func persistRequest(db *sql.DB, event RequestStats) error {
 	_, err := db.Exec(`INSERT OR IGNORE INTO usage_events
 		(request_id, tenant_id, virtual_key_id, account_id, attempts, routing_policy, affinity_reused, affinity_fallback, model, path, status, duration_ms, first_byte_ms,
 		 prompt_tokens, cache_hit_tokens, cache_miss_tokens, completion_tokens, reasoning_tokens, total_tokens,
-		 usage_present, usage_status, price_rule_id, price_status, estimated_cost_cny, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 usage_present, usage_status, price_rule_id, price_status, pricing_tier, estimated_cost_cny, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		event.RequestID, event.TenantID, event.VirtualKeyID, event.AccountID, attempts, routingPolicy, boolInt(event.AffinityReused), boolInt(event.AffinityFallback), event.Model, event.Path, event.Status,
 		event.DurationMS, event.FirstByteMS, event.Usage.PromptTokens, event.Usage.CacheHitTokens,
 		event.Usage.CacheMissTokens, event.Usage.CompletionTokens, event.Usage.ReasoningTokens, event.Usage.TotalTokens,
-		boolInt(event.Usage.UsagePresent), event.UsageStatus, event.PriceRuleID, priceStatus, event.EstimatedCostCNY,
+		boolInt(event.Usage.UsagePresent), event.UsageStatus, event.PriceRuleID, priceStatus, event.PricingTier, event.EstimatedCostCNY,
 		event.CreatedAt.UTC().Format(time.RFC3339Nano))
 	return err
 }
@@ -409,7 +462,7 @@ func (r *Recorder) loadSQLite(db *sql.DB) {
 	r.stats.Errors = r.stats.Requests - r.stats.Successes
 	rows, err := db.Query(`SELECT request_id, tenant_id, virtual_key_id, account_id, attempts, routing_policy, affinity_reused, affinity_fallback, model, path, status,
 		duration_ms, first_byte_ms, prompt_tokens, cache_hit_tokens, cache_miss_tokens, completion_tokens,
-		reasoning_tokens, total_tokens, usage_present, usage_status, price_rule_id, price_status, estimated_cost_cny, created_at
+		reasoning_tokens, total_tokens, usage_present, usage_status, price_rule_id, price_status, pricing_tier, estimated_cost_cny, created_at
 		FROM usage_events ORDER BY id DESC LIMIT 50`)
 	if err != nil {
 		return
@@ -422,7 +475,7 @@ func (r *Recorder) loadSQLite(db *sql.DB) {
 		if err := rows.Scan(&event.RequestID, &event.TenantID, &event.VirtualKeyID, &event.AccountID, &event.Attempts, &event.RoutingPolicy, &affinityReused, &affinityFallback, &event.Model, &event.Path,
 			&event.Status, &event.DurationMS, &event.FirstByteMS, &event.Usage.PromptTokens, &event.Usage.CacheHitTokens,
 			&event.Usage.CacheMissTokens, &event.Usage.CompletionTokens, &event.Usage.ReasoningTokens, &event.Usage.TotalTokens,
-			&present, &event.UsageStatus, &event.PriceRuleID, &event.PriceStatus, &event.EstimatedCostCNY, &createdAt); err != nil {
+			&present, &event.UsageStatus, &event.PriceRuleID, &event.PriceStatus, &event.PricingTier, &event.EstimatedCostCNY, &createdAt); err != nil {
 			continue
 		}
 		event.Usage.UsagePresent = present != 0
@@ -503,7 +556,7 @@ func queryUsage(db *sql.DB, filter UsageFilter) ([]RequestStats, error) {
 	query := strings.Builder{}
 	query.WriteString(`SELECT request_id, tenant_id, virtual_key_id, account_id, attempts, routing_policy, affinity_reused, affinity_fallback, model, path, status,
 		duration_ms, first_byte_ms, prompt_tokens, cache_hit_tokens, cache_miss_tokens, completion_tokens,
-		reasoning_tokens, total_tokens, usage_present, usage_status, price_rule_id, price_status, estimated_cost_cny, created_at
+		reasoning_tokens, total_tokens, usage_present, usage_status, price_rule_id, price_status, pricing_tier, estimated_cost_cny, created_at
 		FROM usage_events`)
 	where, args := usageWhere(filter)
 	query.WriteString(where)
@@ -529,7 +582,7 @@ func queryUsage(db *sql.DB, filter UsageFilter) ([]RequestStats, error) {
 		if err := rows.Scan(&event.RequestID, &event.TenantID, &event.VirtualKeyID, &event.AccountID, &event.Attempts, &event.RoutingPolicy, &affinityReused, &affinityFallback, &event.Model, &event.Path,
 			&event.Status, &event.DurationMS, &event.FirstByteMS, &event.Usage.PromptTokens, &event.Usage.CacheHitTokens,
 			&event.Usage.CacheMissTokens, &event.Usage.CompletionTokens, &event.Usage.ReasoningTokens, &event.Usage.TotalTokens,
-			&present, &event.UsageStatus, &event.PriceRuleID, &event.PriceStatus, &event.EstimatedCostCNY, &createdAt); err != nil {
+			&present, &event.UsageStatus, &event.PriceRuleID, &event.PriceStatus, &event.PricingTier, &event.EstimatedCostCNY, &createdAt); err != nil {
 			return nil, err
 		}
 		event.Usage.UsagePresent = present != 0

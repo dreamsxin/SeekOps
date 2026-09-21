@@ -19,6 +19,7 @@ type AccountView struct {
 	APIKeyPrefix     string        `json:"api_key_prefix"`
 	BaseURL          string        `json:"base_url"`
 	Weight           int           `json:"weight"`
+	MaxConcurrent    int           `json:"max_concurrent"`
 	Models           []string      `json:"models"`
 	Enabled          bool          `json:"enabled"`
 	Managed          bool          `json:"managed"`
@@ -46,20 +47,21 @@ type AccountTestResult struct {
 }
 
 type accountInput struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	APIKey  string   `json:"api_key"`
-	BaseURL string   `json:"base_url"`
-	Weight  int      `json:"weight"`
-	Models  []string `json:"models"`
-	Enabled *bool    `json:"enabled"`
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	APIKey        string   `json:"api_key"`
+	BaseURL       string   `json:"base_url"`
+	Weight        int      `json:"weight"`
+	MaxConcurrent *int     `json:"max_concurrent"`
+	Models        []string `json:"models"`
+	Enabled       *bool    `json:"enabled"`
 }
 
 func loadManagedAccounts(db *sql.DB, secrets *SecretCipher) ([]*Account, error) {
 	if db == nil {
 		return nil, nil
 	}
-	rows, err := db.Query(`SELECT id, name, api_key, base_url, weight, models_json, enabled, created_at
+	rows, err := db.Query(`SELECT id, name, api_key, base_url, weight, max_concurrent, models_json, enabled, created_at
 		FROM upstream_accounts ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
@@ -70,7 +72,7 @@ func loadManagedAccounts(db *sql.DB, secrets *SecretCipher) ([]*Account, error) 
 		var account Account
 		var modelsJSON, createdAt string
 		var enabled int
-		if err := rows.Scan(&account.ID, &account.Name, &account.APIKey, &account.BaseURL, &account.Weight, &modelsJSON, &enabled, &createdAt); err != nil {
+		if err := rows.Scan(&account.ID, &account.Name, &account.APIKey, &account.BaseURL, &account.Weight, &account.MaxConcurrent, &modelsJSON, &enabled, &createdAt); err != nil {
 			return nil, err
 		}
 		account.APIKey, err = secrets.Decrypt("upstream:"+account.ID, account.APIKey)
@@ -106,12 +108,12 @@ func persistManagedAccount(db *sql.DB, secrets *SecretCipher, account *Account) 
 		return fmt.Errorf("encrypt account api key: %w", err)
 	}
 	_, err = db.Exec(`INSERT INTO upstream_accounts
-		(id, name, api_key, base_url, weight, models_json, enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, name, api_key, base_url, weight, max_concurrent, models_json, enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, api_key=excluded.api_key,
-		base_url=excluded.base_url, weight=excluded.weight, models_json=excluded.models_json,
-		enabled=excluded.enabled, updated_at=excluded.updated_at`, account.ID, account.Name,
-		storedAPIKey, account.BaseURL, account.Weight, string(modelsJSON), boolInt(!account.Disabled),
+		base_url=excluded.base_url, weight=excluded.weight, max_concurrent=excluded.max_concurrent,
+		models_json=excluded.models_json, enabled=excluded.enabled, updated_at=excluded.updated_at`, account.ID, account.Name,
+		storedAPIKey, account.BaseURL, account.Weight, account.MaxConcurrent, string(modelsJSON), boolInt(!account.Disabled),
 		createdAt.UTC().Format(time.RFC3339Nano), now)
 	return err
 }
@@ -188,7 +190,7 @@ func accountView(account *Account) AccountView {
 		healthy = true
 	}
 	return AccountView{ID: account.ID, Name: account.Name, APIKeyPrefix: prefix, BaseURL: account.BaseURL,
-		Weight: account.Weight, Models: append([]string{}, account.Models...), Enabled: !account.Disabled,
+		Weight: account.Weight, MaxConcurrent: account.MaxConcurrent, Models: append([]string{}, account.Models...), Enabled: !account.Disabled,
 		Managed: account.Managed, Active: account.Active(), Healthy: healthy, CheckStatus: checkStatus,
 		Failures: account.fails.Load(), BalanceAvailable: available, Balances: balances,
 		BalanceUpdatedAt: updatedAt, BalanceError: balanceError}
@@ -231,6 +233,18 @@ func normalizeAccountInput(input accountInput, existing *Account) (*Account, err
 	if weight > 1000 {
 		return nil, fmt.Errorf("weight must not exceed 1000")
 	}
+	maxConcurrent := 0
+	if input.MaxConcurrent != nil {
+		maxConcurrent = *input.MaxConcurrent
+	} else if existing != nil {
+		maxConcurrent = existing.MaxConcurrent
+	}
+	if maxConcurrent < 0 {
+		return nil, fmt.Errorf("max_concurrent must not be negative; use 0 for no limit")
+	}
+	if maxConcurrent > 100000 {
+		return nil, fmt.Errorf("max_concurrent must not exceed 100000")
+	}
 	enabled := true
 	if input.Enabled != nil {
 		enabled = *input.Enabled
@@ -242,7 +256,7 @@ func normalizeAccountInput(input accountInput, existing *Account) (*Account, err
 	if existing != nil {
 		createdAt = existing.CreatedAt
 	}
-	return &Account{ID: id, Name: name, APIKey: apiKey, BaseURL: baseURL, Weight: weight,
+	return &Account{ID: id, Name: name, APIKey: apiKey, BaseURL: baseURL, Weight: weight, MaxConcurrent: maxConcurrent,
 		Models: models, Disabled: !enabled, Managed: true, CreatedAt: createdAt}, nil
 }
 
@@ -475,7 +489,7 @@ func (s *Server) testAccountAPI(w http.ResponseWriter, r *http.Request, id strin
 		if len(account.Models) > 0 {
 			input.Model = account.Models[0]
 		} else {
-			input.Model = "deepseek-chat"
+			input.Model = "deepseek-flash"
 		}
 	}
 

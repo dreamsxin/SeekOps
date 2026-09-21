@@ -104,6 +104,9 @@ export interface PriceRule {
   cache_hit_cny_per_million: number;
   cache_miss_cny_per_million: number;
   output_cny_per_million: number;
+  peak_cache_hit_cny_per_million?: number;
+  peak_cache_miss_cny_per_million?: number;
+  peak_output_cny_per_million?: number;
   effective_at: string;
   created_at: string;
 }
@@ -113,6 +116,9 @@ export interface PriceRuleInput {
   cache_hit_cny_per_million: number;
   cache_miss_cny_per_million: number;
   output_cny_per_million: number;
+  peak_cache_hit_cny_per_million?: number;
+  peak_cache_miss_cny_per_million?: number;
+  peak_output_cny_per_million?: number;
   effective_at: string;
 }
 
@@ -141,6 +147,7 @@ export interface Account {
   api_key_prefix: string;
   base_url: string;
   weight: number;
+  max_concurrent: number;
   models: string[];
   enabled: boolean;
   managed: boolean;
@@ -160,6 +167,7 @@ export interface AccountInput {
   api_key?: string;
   base_url: string;
   weight: number;
+  max_concurrent: number;
   models: string[];
   enabled: boolean;
 }

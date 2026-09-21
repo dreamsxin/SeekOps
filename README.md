@@ -62,7 +62,7 @@ SQLite 数据和本地主密钥分别保存在 `seekops-data` 命名卷的 `/dat
 - `LISTEN_ADDR`：监听地址，默认 `:8080`
 - `PUBLIC_BASE_URL`：控制台展示给客户端的 OpenAI 兼容 Base URL，例如 `https://proxy.example.com/v1`；未设置时根据请求地址推导
 - `UPSTREAM_API_KEY`：单个 DeepSeek 上游 Key
-- `UPSTREAM_ACCOUNTS_JSON`：多个上游账号配置，JSON 数组字段为 `id`、`name`、`api_key`、`base_url`、`weight`、`models`
+- `UPSTREAM_ACCOUNTS_JSON`：多个上游账号配置，JSON 数组字段为 `id`、`name`、`api_key`、`base_url`、`weight`、`max_concurrent`、`models`
 - `PLATFORM_API_KEY`：平台虚拟 Key，默认仅用于本地开发的 `proxy-demo-key`
 - `ADMIN_API_KEY`：管理接口 Key，默认复用 `PLATFORM_API_KEY`
 - `REQUEST_TIMEOUT`：上游请求超时，默认 `10m`
@@ -72,13 +72,14 @@ SQLite 数据和本地主密钥分别保存在 `seekops-data` 命名卷的 `/dat
 - `SQLITE_PATH`：SQLite 文件路径，默认 `data/seekops.db`；设置为 `:memory:` 可关闭持久化
 - `SECRETS_MASTER_KEY_FILE`：AES-256-GCM 本地主密钥文件，默认与 SQLite 同目录、文件名为 `seekops.key`；首次启动自动生成
 - `SECRETS_MASTER_KEY`：Base64 或 64 位十六进制编码的 32 字节外部主密钥；设置后优先于本地密钥文件，不能在控制台轮换
-- `PRICE_INPUT_HIT_CNY_PER_MILLION`、`PRICE_INPUT_MISS_CNY_PER_MILLION`、`PRICE_OUTPUT_CNY_PER_MILLION`：首次运行时生成全模型默认价格版本，默认分别为 `0.02`、`1`、`2`；之后可在设置页按模型新增带生效时间的价格版本
+- `PRICE_INPUT_HIT_CNY_PER_MILLION`、`PRICE_INPUT_MISS_CNY_PER_MILLION`、`PRICE_OUTPUT_CNY_PER_MILLION`：首次运行时生成的全模型默认价格版本中的**空闲时段**单价，默认分别为 `0.02`、`1`、`4`（对齐 `deepseek-flash`）
+- `PRICE_PEAK_INPUT_HIT_CNY_PER_MILLION`、`PRICE_PEAK_INPUT_MISS_CNY_PER_MILLION`、`PRICE_PEAK_OUTPUT_CNY_PER_MILLION`：同一条默认价格版本中的**高峰时段**单价，默认分别为 `0.04`、`2`、`8`。高峰时段为北京时间周一至周五 9:00-12:00、14:00-18:00，其余时间按空闲价计费；`deepseek-v4-pro` 价格不同，请在设置页按模型新增价格版本。这些变量只在首次播种时生效，之后请在设置页按模型新增带生效时间的价格版本
 - `BALANCE_POLL_INTERVAL`：上游余额轮询间隔，默认 `5m`
 
 示例：
 
 ```powershell
-$env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-a","weight":2},{"id":"acct-b","name":"备用账号","api_key":"sk-b","weight":1}]'
+$env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-a","weight":2,"max_concurrent":2500},{"id":"acct-b","name":"备用账号","api_key":"sk-b","weight":1}]'
 ```
 
 ## 接口
@@ -121,15 +122,19 @@ $env:UPSTREAM_ACCOUNTS_JSON = '[{"id":"acct-a","name":"主账号","api_key":"sk-
 - `/models`、`/v1/models`：模型列表代理
 - `/anthropic/v1/messages`：Anthropic Messages 兼容代理，使用 `x-api-key` 传入平台租户 Key
 
-Chat、Responses 和 Anthropic Messages JSON 请求体在 MVP 中限制为 32 MiB；流式 Chat 请求会在转发前确保 `stream_options.include_usage=true`。Anthropic 非流式和 SSE 响应的 `input_tokens`、`output_tokens`、缓存读取/创建 Token 会写入同一用量账本。虚拟 Key、用量事件、统计恢复和余额快照会写入 SQLite。
+Chat、Responses 和 Anthropic Messages JSON 请求体在 MVP 中限制为 32 MiB；流式 Chat 请求在客户端未显式设置时会补上 `stream_options.include_usage=true`，客户端显式传入的值会被保留（DeepSeek 在 `[DONE]` 前的最后一块始终返回 usage）。Anthropic 非流式和 SSE 响应的 `input_tokens`、`output_tokens`、缓存读取/创建 Token 会写入同一用量账本。请求未开始推理时上游返回的保活空行与 SSE 注释不计入首字节耗时。虚拟 Key、用量事件、统计恢复和余额快照会写入 SQLite。
 
 同一会话可在请求头中发送 `X-Proxy-Session-ID`（兼容 `X-Conversation-ID`），代理会在租户密钥范围内优先选择同一上游账号。Chat/Anthropic 未提供会话头时，会根据稳定的系统消息、工具定义和首个用户消息生成不可逆指纹；不会保存原始请求内容。亲和关系只存在于内存中，账号不健康或发生可重试故障时会切换到健康账号池并把亲和关系迁移到新账号。请求账本的“会话亲和实验”按亲和组、对照组和无会话组比较上游实际返回的 `prompt_cache_hit_tokens`、`prompt_cache_miss_tokens`、平均延迟、成功率和回退次数；同一上游账号不等于必然缓存命中。
 
 控制台创建或更新上游账号时会立即检测一次，后台还会按 `BALANCE_POLL_INTERVAL` 自动检测；账号列表也提供单账号手动检测。未完成检测的账号显示“待检测”，只有余额接口成功返回后才显示“健康”。检测失败、CNY 余额低于阈值、租户每日配额达到默认 80%/100% 或近期错误率超过阈值时，告警中心会生成一条可确认、静默和恢复的持久化告警；故障消失或用量回落后自动记录恢复时间。同一条件不会在每次轮询时重复生成记录。
 
-控制台账号会立即加入代理池并写入 SQLite；环境变量账号继续作为只读基线。请求账本支持最近 7 天默认汇总、自定义日期、租户/模型筛选、每日趋势、用量排行和 CSV 导出。上游 API Key 和可恢复租户 Key 使用 AES-256-GCM 加密后写入 SQLite，认证索引仍使用摘要。历史版本中的明文凭据会在首次启用主密钥时自动迁移；只保存哈希的旧租户 Key 仍不可恢复，可通过轮换生成可查看的新密钥。
+控制台账号会立即加入代理池并写入 SQLite；环境变量账号继续作为只读基线。请求账本支持最近 7 天默认汇总、自定义日期、租户/模型筛选、每日趋势、用量排行和 CSV 导出；每条记录会绑定当时命中的价格版本 ID 和计费档位（`pricing_tier` 为 `peak` 或 `off_peak`），便于与 DeepSeek 实际账单对账。上游 API Key 和可恢复租户 Key 使用 AES-256-GCM 加密后写入 SQLite，认证索引仍使用摘要。历史版本中的明文凭据会在首次启用主密钥时自动迁移；只保存哈希的旧租户 Key 仍不可恢复，可通过轮换生成可查看的新密钥。
 
-账号列表的“测试 API”会直接向该账号的 `/models` 或 `/chat/completions` 发起请求，分别验证 Key、Base URL 和指定模型是否可用。模型列表测试成功后，SQLite 托管账号可以把返回的全部模型 ID 一键同步为该账号的支持模型；环境变量账号保持只读。代理请求在尚未返回数据时，遇到网络错误、429 或 500/502/503/504 会最多切换到另一个健康账号重试一次；401、402、422 不重试，流式响应开始后也不会重试。请求账本会保存最终上游账号和尝试次数。
+账号列表的“测试 API”会直接向该账号的 `/models` 或 `/chat/completions` 发起请求，分别验证 Key、Base URL 和指定模型是否可用。模型列表测试成功后，SQLite 托管账号可以把返回的全部模型 ID 一键同步为该账号的支持模型；环境变量账号保持只读。每个上游账号可以设置 `max_concurrent`（控制台字段“并发上限”，`0` 表示不限制）。DeepSeek 的并发限制以账号为粒度（`deepseek-flash` 2500、`deepseek-v4-pro` 500），代理在选号时就预占并发槽位：账号达到上限后不再被选中，整池都满时直接返回 `429` 并带上 `Retry-After: 1`，而不是把请求打到上游换回一个 429。会话亲和账号被占满时会退回到其他健康账号。上游返回 `429` 时，代理会按响应中的 `Retry-After` 冷却该账号（最长 30 秒），没有该头时冷却 1 秒。
+
+租户隔离：转发 Chat Completions 时代理会写入 `user_id`（Anthropic 接口写入 `metadata.user_id`），取值为 `t-<租户>`，客户端自带的值会作为 `-u-<原值>` 后缀保留。DeepSeek 用它做 KVCache 隔离、内容安全隔离和按 `user_id` 的并发隔离，因此不同租户不会共享同一份上下文缓存命名空间。
+
+代理请求在尚未返回数据时，遇到网络错误、402、429 或 500/502/503/504 会最多切换到另一个健康账号重试一次；401、422 不重试，流式响应开始后也不会重试。请求账本会保存最终上游账号和尝试次数。
 
 ## 备份与恢复
 

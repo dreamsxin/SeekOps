@@ -37,6 +37,218 @@ func TestProxyCapturesNonStreamingUsage(t *testing.T) {
 	}
 }
 
+func TestProxyPreservesExplicitStreamUsageOptOut(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"include_usage":true`) {
+			t.Fatalf("explicit include_usage=false was overwritten: %s", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, "data: {\"model\":\"deepseek-flash\",\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7,\"total_tokens\":12}}\n\ndata: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+	s := NewServer(Config{PlatformAPIKey: "client-secret", Accounts: []*Account{{ID: "a", APIKey: "upstream-secret", BaseURL: upstream.URL}}})
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions",
+		strings.NewReader(`{"model":"deepseek-flash","stream":true,"stream_options":{"include_usage":false},"messages":[]}`))
+	req.Header.Set("Authorization", "Bearer client-secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := s.Recorder().Snapshot(); got.TotalTokens != 12 {
+		t.Fatalf("usage from the last chunk was not recorded: %+v", got)
+	}
+}
+
+func TestProxyIgnoresKeepAliveForFirstByte(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, ": keep-alive\n\n")
+		flusher.Flush()
+		time.Sleep(80 * time.Millisecond)
+		fmt.Fprint(w, "data: {\"model\":\"deepseek-flash\",\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+	s := NewServer(Config{PlatformAPIKey: "client-secret", Accounts: []*Account{{ID: "a", APIKey: "upstream-secret", BaseURL: upstream.URL}}})
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions",
+		strings.NewReader(`{"model":"deepseek-flash","stream":true,"messages":[]}`))
+	req.Header.Set("Authorization", "Bearer client-secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	stats := s.Recorder().Snapshot()
+	if len(stats.LastRequests) != 1 || stats.LastRequests[0].FirstByteMS < 50 {
+		t.Fatalf("keep-alive comment was counted as the first byte: %+v", stats.LastRequests)
+	}
+}
+
+func TestParseUsageFallsBackToPromptTokensDetails(t *testing.T) {
+	usage := parseUsage(map[string]any{
+		"prompt_tokens":         float64(100),
+		"prompt_tokens_details": map[string]any{"cached_tokens": float64(60)},
+		"completion_tokens":     float64(5),
+	})
+	if usage.CacheHitTokens != 60 || usage.CacheMissTokens != 40 {
+		t.Fatalf("usage = %+v", usage)
+	}
+}
+
+func TestProxyScopesUserIDToTenant(t *testing.T) {
+	var openAIBody, anthropicBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.HasSuffix(r.URL.Path, "/v1/messages") {
+			anthropicBody = body
+		} else {
+			openAIBody = body
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"model":"deepseek-flash","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+	keys := NewKeyStore("platform-secret")
+	_, secret, err := keys.CreateWithQuota("Team A app", "team-a", QuotaPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(Config{PlatformAPIKey: "platform-secret", VirtualKeys: keys,
+		Accounts: []*Account{{ID: "a", APIKey: "upstream-secret", BaseURL: upstream.URL}}})
+
+	chat := httptest.NewRequest(http.MethodPost, "/chat/completions",
+		strings.NewReader(`{"model":"deepseek-flash","user_id":"caller/9","messages":[]}`))
+	chat.Header.Set("Authorization", "Bearer "+secret)
+	chat.Header.Set("Content-Type", "application/json")
+	chatRecorder := httptest.NewRecorder()
+	s.ServeHTTP(chatRecorder, chat)
+	if chatRecorder.Code != http.StatusOK {
+		t.Fatalf("chat status=%d body=%s", chatRecorder.Code, chatRecorder.Body.String())
+	}
+	var chatPayload map[string]any
+	if err := json.Unmarshal(openAIBody, &chatPayload); err != nil {
+		t.Fatal(err)
+	}
+	if chatPayload["user_id"] != "t-team-a-u-caller_9" {
+		t.Fatalf("chat user_id=%v body=%s", chatPayload["user_id"], openAIBody)
+	}
+
+	messages := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages",
+		strings.NewReader(`{"model":"deepseek-flash","max_tokens":16,"messages":[]}`))
+	messages.Header.Set("X-Api-Key", secret)
+	messages.Header.Set("Content-Type", "application/json")
+	messagesRecorder := httptest.NewRecorder()
+	s.ServeHTTP(messagesRecorder, messages)
+	if messagesRecorder.Code != http.StatusOK {
+		t.Fatalf("messages status=%d body=%s", messagesRecorder.Code, messagesRecorder.Body.String())
+	}
+	var messagesPayload map[string]any
+	if err := json.Unmarshal(anthropicBody, &messagesPayload); err != nil {
+		t.Fatal(err)
+	}
+	metadata, _ := messagesPayload["metadata"].(map[string]any)
+	if metadata["user_id"] != "t-team-a" {
+		t.Fatalf("anthropic metadata=%v body=%s", metadata, anthropicBody)
+	}
+}
+
+func TestProxyRejectsWhenAccountConcurrencyLimitReached(t *testing.T) {
+	arrived := make(chan struct{}, 1)
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		arrived <- struct{}{}
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"model":"deepseek-flash","usage":{"total_tokens":1}}`)
+	}))
+	defer upstream.Close()
+	s := NewServer(Config{PlatformAPIKey: "client-secret",
+		Accounts: []*Account{{ID: "a", APIKey: "upstream-secret", BaseURL: upstream.URL, MaxConcurrent: 1}}})
+	call := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/chat/completions",
+			strings.NewReader(`{"model":"deepseek-flash","messages":[]}`))
+		request.Header.Set("Authorization", "Bearer client-secret")
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		s.ServeHTTP(recorder, request)
+		return recorder
+	}
+	first := make(chan int, 1)
+	go func() { first <- call().Code }()
+	<-arrived
+	rejected := call()
+	if rejected.Code != http.StatusTooManyRequests || rejected.Header().Get("Retry-After") != "1" {
+		t.Fatalf("second request status=%d retry-after=%q body=%s", rejected.Code, rejected.Header().Get("Retry-After"), rejected.Body.String())
+	}
+	close(release)
+	if code := <-first; code != http.StatusOK {
+		t.Fatalf("first request status=%d", code)
+	}
+}
+
+func TestAccountHonoursUpstreamRetryAfter(t *testing.T) {
+	account := &Account{}
+	account.markResponse(&http.Response{StatusCode: http.StatusTooManyRequests,
+		Header: http.Header{"Retry-After": []string{"10"}}})
+	if account.Healthy(time.Now().Add(8 * time.Second)) {
+		t.Fatal("account should still be cooling down after 8s")
+	}
+	if !account.Healthy(time.Now().Add(12 * time.Second)) {
+		t.Fatal("account should recover after the hinted delay")
+	}
+	capped := &Account{}
+	capped.markResponse(&http.Response{StatusCode: http.StatusTooManyRequests,
+		Header: http.Header{"Retry-After": []string{"600"}}})
+	if !capped.Healthy(time.Now().Add(31 * time.Second)) {
+		t.Fatal("long Retry-After hints must be capped")
+	}
+}
+
+func TestManagedAccountPersistsConcurrencyLimit(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "seekops.db")
+	db, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(Config{PlatformAPIKey: "client-secret", AdminAPIKey: "admin-secret", DB: db})
+	create := httptest.NewRequest(http.MethodPost, "/admin/accounts",
+		strings.NewReader(`{"id":"limited","name":"Limited","api_key":"upstream-key","max_concurrent":5,"enabled":true}`))
+	create.Header.Set("X-Admin-Key", "admin-secret")
+	createRecorder := httptest.NewRecorder()
+	s.ServeHTTP(createRecorder, create)
+	if createRecorder.Code != http.StatusCreated || !strings.Contains(createRecorder.Body.String(), `"max_concurrent":5`) {
+		t.Fatalf("create status=%d body=%s", createRecorder.Code, createRecorder.Body.String())
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	restored := NewServer(Config{PlatformAPIKey: "client-secret", AdminAPIKey: "admin-secret", DB: reopened})
+	list := httptest.NewRequest(http.MethodGet, "/admin/accounts", nil)
+	list.Header.Set("X-Admin-Key", "admin-secret")
+	listRecorder := httptest.NewRecorder()
+	restored.ServeHTTP(listRecorder, list)
+	var accounts []AccountView
+	if err := json.Unmarshal(listRecorder.Body.Bytes(), &accounts); err != nil {
+		t.Fatalf("list body=%s err=%v", listRecorder.Body.String(), err)
+	}
+	if len(accounts) != 1 || accounts[0].MaxConcurrent != 5 {
+		t.Fatalf("restored accounts=%+v", accounts)
+	}
+}
+
 func TestProxyCapturesStreamingUsage(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)

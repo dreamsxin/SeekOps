@@ -445,6 +445,9 @@ function PriceSettings({ prices, onCreate, onDelete }: { prices: PriceRule[]; on
   const [hit, setHit] = useState("");
   const [miss, setMiss] = useState("");
   const [output, setOutput] = useState("");
+  const [peakHit, setPeakHit] = useState("");
+  const [peakMiss, setPeakMiss] = useState("");
+  const [peakOutput, setPeakOutput] = useState("");
   const [effectiveAt, setEffectiveAt] = useState(localDateTimeInput());
   const [busy, setBusy] = useState(false);
   const [deleting, setDeleting] = useState("");
@@ -457,15 +460,23 @@ function PriceSettings({ prices, onCreate, onDelete }: { prices: PriceRule[]; on
       setError("价格必须是大于或等于 0 的数字");
       return;
     }
+    const peaks = [peakHit, peakMiss, peakOutput].map((value) => (value.trim() === "" ? undefined : Number(value)));
+    if (peaks.some((value) => value !== undefined && (!Number.isFinite(value) || value < 0))) {
+      setError("高峰时段价格必须是大于或等于 0 的数字");
+      return;
+    }
     setBusy(true);
     setError("");
     setSaved(false);
     try {
-      await onCreate({ model: model.trim(), cache_hit_cny_per_million: values[0], cache_miss_cny_per_million: values[1], output_cny_per_million: values[2], effective_at: new Date(effectiveAt).toISOString() });
+      await onCreate({ model: model.trim(), cache_hit_cny_per_million: values[0], cache_miss_cny_per_million: values[1], output_cny_per_million: values[2], peak_cache_hit_cny_per_million: peaks[0], peak_cache_miss_cny_per_million: peaks[1], peak_output_cny_per_million: peaks[2], effective_at: new Date(effectiveAt).toISOString() });
       setSaved(true);
       setHit("");
       setMiss("");
       setOutput("");
+      setPeakHit("");
+      setPeakMiss("");
+      setPeakOutput("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存价格版本失败");
     } finally {
@@ -484,7 +495,8 @@ function PriceSettings({ prices, onCreate, onDelete }: { prices: PriceRule[]; on
       setDeleting("");
     }
   };
-  return <section className="panel settings-panel"><PanelHead title="模型价格版本" subtitle="每百万 Token / 人民币；新版本不会改写历史费用" /><form className="price-form" onSubmit={submit}><label>模型<input value={model} onChange={(event) => setModel(event.target.value)} required placeholder="deepseek-v4-flash 或 *" /></label><label>缓存命中输入<input type="number" min="0" step="0.0001" value={hit} onChange={(event) => setHit(event.target.value)} required placeholder="0.02" /></label><label>缓存未命中输入<input type="number" min="0" step="0.0001" value={miss} onChange={(event) => setMiss(event.target.value)} required placeholder="1.00" /></label><label>输出<input type="number" min="0" step="0.0001" value={output} onChange={(event) => setOutput(event.target.value)} required placeholder="2.00" /></label><label>生效时间<input type="datetime-local" value={effectiveAt} onChange={(event) => setEffectiveAt(event.target.value)} required /></label><button className="primary" disabled={busy}><Plus size={15} />{busy ? "正在保存" : "新增价格版本"}</button><p className="settings-note price-note"><code>*</code> 是未配置专属价格模型的默认规则。缺少匹配价格时，请求账本会显示“无法估算”，每日费用配额也不会累计该请求。</p>{error && <p className="form-error price-message">{error}</p>}{saved && <p className="form-success price-message">价格版本已保存，生效时间之后的新请求将使用它。</p>}</form><div className="table-wrap price-table"><table><thead><tr><th>模型 / 生效时间</th><th>缓存命中输入</th><th>缓存未命中输入</th><th>输出</th><th></th></tr></thead><tbody>{prices.map((rule) => <tr key={rule.id}><td><strong>{rule.model === "*" ? "全部模型（默认）" : rule.model}</strong><small>{rule.id === "price-default" ? "始终生效" : formatTime(rule.effective_at)} · <span className="mono">{rule.id}</span></small></td><td>¥ {rule.cache_hit_cny_per_million.toFixed(4)}</td><td>¥ {rule.cache_miss_cny_per_million.toFixed(4)}</td><td>¥ {rule.output_cny_per_million.toFixed(4)}</td><td><button className="icon-button small danger-icon" title="删除价格版本" disabled={deleting === rule.id} onClick={() => remove(rule)}><Trash2 size={15} /></button></td></tr>)}</tbody></table>{!prices.length && <Empty label="暂无价格版本，新请求费用将无法估算" />}</div></section>;
+  const formatRate = (offPeak: number, peak?: number) => `¥ ${offPeak.toFixed(4)} / ${peak === undefined ? "同价" : `¥ ${peak.toFixed(4)}`}`;
+  return <section className="panel settings-panel"><PanelHead title="模型价格版本" subtitle="每百万 Token / 人民币；分空闲与高峰两档，新版本不会改写历史费用" /><form className="price-form" onSubmit={submit}><label>模型<input value={model} onChange={(event) => setModel(event.target.value)} required placeholder="deepseek-flash 或 *" /></label><label>空闲 · 缓存命中输入<input type="number" min="0" step="0.0001" value={hit} onChange={(event) => setHit(event.target.value)} required placeholder="0.02" /></label><label>空闲 · 缓存未命中输入<input type="number" min="0" step="0.0001" value={miss} onChange={(event) => setMiss(event.target.value)} required placeholder="1.00" /></label><label>空闲 · 输出<input type="number" min="0" step="0.0001" value={output} onChange={(event) => setOutput(event.target.value)} required placeholder="4.00" /></label><label>高峰 · 缓存命中输入<input type="number" min="0" step="0.0001" value={peakHit} onChange={(event) => setPeakHit(event.target.value)} placeholder="0.04（留空同空闲）" /></label><label>高峰 · 缓存未命中输入<input type="number" min="0" step="0.0001" value={peakMiss} onChange={(event) => setPeakMiss(event.target.value)} placeholder="2.00（留空同空闲）" /></label><label>高峰 · 输出<input type="number" min="0" step="0.0001" value={peakOutput} onChange={(event) => setPeakOutput(event.target.value)} placeholder="8.00（留空同空闲）" /></label><label>生效时间<input type="datetime-local" value={effectiveAt} onChange={(event) => setEffectiveAt(event.target.value)} required /></label><button className="primary" disabled={busy}><Plus size={15} />{busy ? "正在保存" : "新增价格版本"}</button><p className="settings-note price-note"><code>*</code> 是未配置专属价格模型的默认规则。高峰时段为北京时间周一至周五 9:00-12:00、14:00-18:00，其余时间按空闲价计费；高峰价留空表示该模型不区分时段。缺少匹配价格时，请求账本会显示“无法估算”，每日费用配额也不会累计该请求。</p>{error && <p className="form-error price-message">{error}</p>}{saved && <p className="form-success price-message">价格版本已保存，生效时间之后的新请求将使用它。</p>}</form><div className="table-wrap price-table"><table><thead><tr><th>模型 / 生效时间</th><th>缓存命中输入（空闲/高峰）</th><th>缓存未命中输入（空闲/高峰）</th><th>输出（空闲/高峰）</th><th></th></tr></thead><tbody>{prices.map((rule) => <tr key={rule.id}><td><strong>{rule.model === "*" ? "全部模型（默认）" : rule.model}</strong><small>{rule.id === "price-default" ? "始终生效" : formatTime(rule.effective_at)} · <span className="mono">{rule.id}</span></small></td><td>{formatRate(rule.cache_hit_cny_per_million, rule.peak_cache_hit_cny_per_million)}</td><td>{formatRate(rule.cache_miss_cny_per_million, rule.peak_cache_miss_cny_per_million)}</td><td>{formatRate(rule.output_cny_per_million, rule.peak_output_cny_per_million)}</td><td><button className="icon-button small danger-icon" title="删除价格版本" disabled={deleting === rule.id} onClick={() => remove(rule)}><Trash2 size={15} /></button></td></tr>)}</tbody></table>{!prices.length && <Empty label="暂无价格版本，新请求费用将无法估算" />}</div></section>;
 }
 
 function Overview({ stats, accounts, usage }: { stats: Stats; accounts: Account[]; usage: RequestEvent[] }) {
@@ -563,7 +575,7 @@ function alertScopeLabel(scope: Alert["scope_type"]) { return scope === "account
 function alertStatusLabel(status: Alert["status"]) { return status === "open" ? "未处理" : status === "acknowledged" ? "已确认" : status === "silenced" ? "静默中" : "已恢复"; }
 
 function Accounts({ accounts, checkingAccount, onCreate, onEdit, onCheck, onTest, onToggle, onDelete }: { accounts: Account[]; checkingAccount: string; onCreate: () => void; onEdit: (account: Account) => void; onCheck: (account: Account) => Promise<void>; onTest: (account: Account) => void; onToggle: (account: Account) => Promise<void>; onDelete: (account: Account) => Promise<void> }) {
-  return <div className="panel"><PanelHead title="账号池" subtitle={`${accounts.length} 个上游账号`} action={<button className="primary" onClick={onCreate}><Server size={16} />添加账号</button>} /><div className="table-wrap account-table"><table><thead><tr><th>账号</th><th>状态</th><th>余额</th><th>权重 / 活跃</th><th>来源</th><th></th></tr></thead><tbody>{accounts.map((a) => <tr key={a.id}><td><strong>{a.name}</strong><small>{a.id} · {a.api_key_prefix || "无 Key"}</small><small className="account-models" title={a.models?.join(", ") || "支持全部模型"}>支持模型：{a.models?.length ? a.models.join(", ") : "全部"}</small></td><td><Status ok={a.healthy} pending={a.check_status === "unchecked" || a.check_status === "disabled"} label={accountStatusLabel(a)} /></td><td>{a.balances?.length ? a.balances.map((b) => <div key={b.currency} className="money">{b.currency} {b.total_balance}</div>) : <span className="muted">暂无快照</span>}{a.balance_updated_at && <small>检测 {formatTime(a.balance_updated_at)}</small>}{a.balance_error && <small className="danger-text">{a.balance_error}</small>}</td><td>{a.weight} / {a.active}</td><td><span className={`source-tag ${a.managed ? "managed" : "env"}`}>{a.managed ? "控制台" : "环境变量"}</span></td><td><div className="row-actions"><button className="icon-button small" title="检测余额" disabled={!a.enabled || checkingAccount === a.id} onClick={() => onCheck(a)}><RefreshCw className={checkingAccount === a.id ? "spin" : ""} size={15} /></button><button className="icon-button small" title="测试 API" disabled={!a.enabled} onClick={() => onTest(a)}><FlaskConical size={15} /></button>{a.managed && <><button className="icon-button small" title="编辑账号" onClick={() => onEdit(a)}><Pencil size={15} /></button><label className="switch" title={a.enabled ? "停用账号" : "启用账号"}><input type="checkbox" checked={a.enabled} onChange={() => onToggle(a)} /><span /></label><button className="icon-button small danger-icon" title="删除账号" onClick={() => onDelete(a)}><Trash2 size={15} /></button></>}</div></td></tr>)}</tbody></table>{!accounts.length && <Empty label="尚未配置上游账号" />}</div></div>;
+  return <div className="panel"><PanelHead title="账号池" subtitle={`${accounts.length} 个上游账号`} action={<button className="primary" onClick={onCreate}><Server size={16} />添加账号</button>} /><div className="table-wrap account-table"><table><thead><tr><th>账号</th><th>状态</th><th>余额</th><th>权重 / 活跃 / 上限</th><th>来源</th><th></th></tr></thead><tbody>{accounts.map((a) => <tr key={a.id}><td><strong>{a.name}</strong><small>{a.id} · {a.api_key_prefix || "无 Key"}</small><small className="account-models" title={a.models?.join(", ") || "支持全部模型"}>支持模型：{a.models?.length ? a.models.join(", ") : "全部"}</small></td><td><Status ok={a.healthy} pending={a.check_status === "unchecked" || a.check_status === "disabled"} label={accountStatusLabel(a)} /></td><td>{a.balances?.length ? a.balances.map((b) => <div key={b.currency} className="money">{b.currency} {b.total_balance}</div>) : <span className="muted">暂无快照</span>}{a.balance_updated_at && <small>检测 {formatTime(a.balance_updated_at)}</small>}{a.balance_error && <small className="danger-text">{a.balance_error}</small>}</td><td>{a.weight} / {a.active} / {a.max_concurrent ? a.max_concurrent : "不限"}</td><td><span className={`source-tag ${a.managed ? "managed" : "env"}`}>{a.managed ? "控制台" : "环境变量"}</span></td><td><div className="row-actions"><button className="icon-button small" title="检测余额" disabled={!a.enabled || checkingAccount === a.id} onClick={() => onCheck(a)}><RefreshCw className={checkingAccount === a.id ? "spin" : ""} size={15} /></button><button className="icon-button small" title="测试 API" disabled={!a.enabled} onClick={() => onTest(a)}><FlaskConical size={15} /></button>{a.managed && <><button className="icon-button small" title="编辑账号" onClick={() => onEdit(a)}><Pencil size={15} /></button><label className="switch" title={a.enabled ? "停用账号" : "启用账号"}><input type="checkbox" checked={a.enabled} onChange={() => onToggle(a)} /><span /></label><button className="icon-button small danger-icon" title="删除账号" onClick={() => onDelete(a)}><Trash2 size={15} /></button></>}</div></td></tr>)}</tbody></table>{!accounts.length && <Empty label="尚未配置上游账号" />}</div></div>;
 }
 
 function AccessConfig({ config }: { config: ClientConfig | null }) {
@@ -575,13 +587,13 @@ function AccessConfig({ config }: { config: ClientConfig | null }) {
     `curl ${config.base_url}/chat/completions \\`,
     `  -H "Authorization: Bearer $SEEKOPS_API_KEY" \\`,
     `  -H "Content-Type: application/json" \\`,
-    `  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"你好"}]}'`,
+    `  -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"你好"}]}'`,
   ].join("\n") : [
     `curl ${config.anthropic_base_url}/v1/messages \\`,
     `  -H "x-api-key: $SEEKOPS_API_KEY" \\`,
     `  -H "anthropic-version: 2023-06-01" \\`,
     `  -H "Content-Type: application/json" \\`,
-    `  -d '{"model":"deepseek-v4-flash","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}'`,
+    `  -d '{"model":"deepseek-flash","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}'`,
   ].join("\n");
   const copy = async (key: string, value: string) => {
     await navigator.clipboard.writeText(value);
@@ -650,12 +662,12 @@ function KeyModal({ keyItem, onClose, onSave, onRotate, onRevoke }: { keyItem: V
 }
 
 function accountPayload(account: Account, enabled = account.enabled): AccountInput {
-  return { id: account.id, name: account.name, api_key: "", base_url: account.base_url, weight: account.weight, models: account.models ?? [], enabled };
+  return { id: account.id, name: account.name, api_key: "", base_url: account.base_url, weight: account.weight, max_concurrent: account.max_concurrent, models: account.models ?? [], enabled };
 }
 
 function AccountTestModal({ account, onClose, onRun, onSync }: { account: Account; onClose: () => void; onRun: (mode: "models" | "chat", model?: string) => Promise<AccountTestResult>; onSync: (models: string[]) => Promise<Account> }) {
   const [mode, setMode] = useState<"models" | "chat">("models");
-  const [model, setModel] = useState(account.models?.[0] || "deepseek-chat");
+  const [model, setModel] = useState(account.models?.[0] || "deepseek-flash");
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [synced, setSynced] = useState(false);
@@ -699,6 +711,7 @@ function AccountModal({ account, onClose, onSave }: { account?: Account; onClose
   const [apiKey, setAPIKey] = useState("");
   const [baseURL, setBaseURL] = useState(account?.base_url ?? "https://api.deepseek.com");
   const [weight, setWeight] = useState(String(account?.weight ?? 1));
+  const [maxConcurrent, setMaxConcurrent] = useState(String(account?.max_concurrent ?? 0));
   const [models, setModels] = useState(account?.models?.join(", ") ?? "");
   const [enabled, setEnabled] = useState(account?.enabled ?? true);
   const [busy, setBusy] = useState(false);
@@ -708,14 +721,14 @@ function AccountModal({ account, onClose, onSave }: { account?: Account; onClose
     setBusy(true);
     setError("");
     try {
-      await onSave({ id: id.trim() || undefined, name: name.trim(), api_key: apiKey.trim(), base_url: baseURL.trim(), weight: Number(weight) || 1, models: models.split(",").map((item) => item.trim()).filter(Boolean), enabled });
+      await onSave({ id: id.trim() || undefined, name: name.trim(), api_key: apiKey.trim(), base_url: baseURL.trim(), weight: Number(weight) || 1, max_concurrent: Math.max(0, Number(maxConcurrent) || 0), models: models.split(",").map((item) => item.trim()).filter(Boolean), enabled });
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存账号失败");
     } finally {
       setBusy(false);
     }
   };
-  return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><div><h2>{account ? "编辑上游账号" : "添加上游账号"}</h2><p>{account ? "修改账号参数，API Key 留空则保持不变。" : "添加一个可参与请求转发和余额轮询的账号。"}</p></div><button className="icon-button" title="关闭" onClick={onClose}><X size={19} /></button></div><form onSubmit={submit} className="create-form"><div className="form-grid">{!account && <label>账号 ID<input value={id} onChange={(e) => setID(e.target.value)} placeholder="acct-prod" /></label>}<label>名称<input value={name} onChange={(e) => setName(e.target.value)} required placeholder="生产主账号" /></label><label>API Key<input type="password" value={apiKey} onChange={(e) => setAPIKey(e.target.value)} placeholder={account ? "留空保持不变" : "sk-..."} required={!account} autoComplete="new-password" /></label><label>Base URL<input value={baseURL} onChange={(e) => setBaseURL(e.target.value)} required placeholder="https://api.deepseek.com" /></label><label>权重<input type="number" min="1" max="1000" value={weight} onChange={(e) => setWeight(e.target.value)} /></label><label>支持模型<input value={models} onChange={(e) => setModels(e.target.value)} placeholder="留空表示全部模型" /></label></div><label className="check-row"><input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />启用账号</label>{error && <p className="form-error">{error}</p>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={busy}>{busy ? "正在保存" : "保存账号"}</button></div></form></div></div>;
+  return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><div><h2>{account ? "编辑上游账号" : "添加上游账号"}</h2><p>{account ? "修改账号参数，API Key 留空则保持不变。" : "添加一个可参与请求转发和余额轮询的账号。"}</p></div><button className="icon-button" title="关闭" onClick={onClose}><X size={19} /></button></div><form onSubmit={submit} className="create-form"><div className="form-grid">{!account && <label>账号 ID<input value={id} onChange={(e) => setID(e.target.value)} placeholder="acct-prod" /></label>}<label>名称<input value={name} onChange={(e) => setName(e.target.value)} required placeholder="生产主账号" /></label><label>API Key<input type="password" value={apiKey} onChange={(e) => setAPIKey(e.target.value)} placeholder={account ? "留空保持不变" : "sk-..."} required={!account} autoComplete="new-password" /></label><label>Base URL<input value={baseURL} onChange={(e) => setBaseURL(e.target.value)} required placeholder="https://api.deepseek.com" /></label><label>权重<input type="number" min="1" max="1000" value={weight} onChange={(e) => setWeight(e.target.value)} /></label><label>并发上限<input type="number" min="0" max="100000" value={maxConcurrent} onChange={(e) => setMaxConcurrent(e.target.value)} placeholder="0 表示不限制" /></label><label>支持模型<input value={models} onChange={(e) => setModels(e.target.value)} placeholder="留空表示全部模型" /></label></div><label className="check-row"><input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />启用账号</label>{error && <p className="form-error">{error}</p>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" disabled={busy}>{busy ? "正在保存" : "保存账号"}</button></div></form></div></div>;
 }
 
 function Usage({ events, summary, onApply, onExport }: { events: RequestEvent[]; summary: UsageSummary | null; onApply: (query: string) => void; onExport: (query: string) => Promise<void> }) {

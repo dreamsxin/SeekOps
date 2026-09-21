@@ -56,6 +56,39 @@ func TestProxyFailoverRetriesRetryableStatus(t *testing.T) {
 	}
 }
 
+func TestProxyFailoverRetriesPaymentRequired(t *testing.T) {
+	var drainedCalls, successfulCalls atomic.Int64
+	drained := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		drainedCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		fmt.Fprint(w, `{"error":{"message":"Insufficient Balance"}}`)
+	}))
+	defer drained.Close()
+	successful := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		successfulCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"model":"deepseek-flash","usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`)
+	}))
+	defer successful.Close()
+
+	server := NewServer(Config{PlatformAPIKey: "client-key", Accounts: []*Account{
+		{ID: "funded", APIKey: "funded-key", BaseURL: successful.URL},
+		{ID: "drained", APIKey: "drained-key", BaseURL: drained.URL},
+	}})
+	recorder := serveProxyRequest(server, `{"model":"deepseek-flash","messages":[]}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if drainedCalls.Load() != 1 || successfulCalls.Load() != 1 {
+		t.Fatalf("calls drained=%d successful=%d", drainedCalls.Load(), successfulCalls.Load())
+	}
+	stats := server.Recorder().Snapshot()
+	if len(stats.LastRequests) != 1 || stats.LastRequests[0].AccountID != "funded" || stats.LastRequests[0].Attempts != 2 {
+		t.Fatalf("last requests=%+v", stats.LastRequests)
+	}
+}
+
 func TestProxyFailoverRetriesNetworkError(t *testing.T) {
 	var successfulCalls atomic.Int64
 	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
